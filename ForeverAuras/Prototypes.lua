@@ -1204,7 +1204,34 @@ function WeakAuras.IsPlayerSpellOrOverridesAndBaseIsPlayerSpell(spell)
 end
 
 ---@private
+-- ForeverAuras: one answer per spell (and exactness) for the length of a
+-- load scan. Many displays load on the same Spell Known conditions, and a
+-- scan asked each of them again: for a rank the player does not know (the
+-- usual case) that is a name lookup and a spell-info lookup by name, both
+-- cold right after SPELLS_CHANGED (the lookup caches are cleared on it, and
+-- that event runs the scan), each lookup allocating. The scan opens and
+-- closes the memo (Private.SpellKnownMemo), so nothing is kept between
+-- scans and spell data arriving later is seen by the next one. The checks
+-- and the lookups behind them are counted for /fa phitch.
+local knownMemo, knownMemoOpen = {}, false
+function Private.SpellKnownMemo(open)
+  knownMemoOpen = open
+  wipe(knownMemo)
+end
+local IsSpellKnownForLoadRaw
 function WeakAuras.IsSpellKnownForLoad(spell, exact)
+  Private.HitchCount("spell known check")
+  if not knownMemoOpen or type(spell) ~= "number" then return IsSpellKnownForLoadRaw(spell, exact) end
+  local key = exact and -spell or spell
+  local known = knownMemo[key]
+  if known == nil then
+    Private.HitchCount("spell known lookup")
+    known = IsSpellKnownForLoadRaw(spell, exact) or false
+    knownMemo[key] = known
+  end
+  return known
+end
+function IsSpellKnownForLoadRaw(spell, exact)
   if spell == 0 or spell >= 2^31 then return false end
   local result = IsPlayerSpell(spell)
                  or IsSpellKnownOrOverridesAndBaseIsKnown(spell, false)
@@ -1217,7 +1244,7 @@ function WeakAuras.IsSpellKnownForLoad(spell, exact)
   if (spellName) then
     local otherSpell = select(7, Private.ExecEnv.GetSpellInfo(spellName))
     if otherSpell and otherSpell ~= spell then
-      return WeakAuras.IsSpellKnownForLoad(otherSpell)
+      return IsSpellKnownForLoadRaw(otherSpell)
     end
   else
     -- ForeverAuras: no name yet. Spell data loads lazily on this client, so

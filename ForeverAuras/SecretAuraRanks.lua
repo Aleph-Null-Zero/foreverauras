@@ -660,6 +660,25 @@ function Private.SameNameSpellIDs(id)
   end
 end
 
+-- ForeverAuras: every spell ID with this exact name, for a name typed into
+-- Name(s) (SecretAuraTriggerOptions.lua): the bundle first, else this
+-- client's scan cache, else a scan is queued (nil until it finishes, when
+-- the displays using the name are applied again, SecretAuraTrigger.lua).
+function Private.SpellIDsByName(name)
+  if type(name) ~= "string" or name == "" then return end
+  local bundled = Private.spellNameData and Private.spellNameData[name]
+  if bundled then return bundled end
+  local names = NameStore()
+  if not names then return end
+  local ids = names[name]
+  if ids then return ids end
+  if not queued[name] and not (scanning and scanning.wanted[name]) then
+    queued[name] = true
+    queue[#queue + 1] = name
+    Private.StartSameNameScan()
+  end
+end
+
 -- Called with the set of names whose scan just finished.
 function Private.OnSameNameScanned(listener)
   listeners[#listeners + 1] = listener

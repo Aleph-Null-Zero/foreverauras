@@ -182,7 +182,7 @@ function Editor.AddOptions(options, data, triggernum)
     options.matchesShowOn = {type = "select", name = L["Show On"], order = 71.1, width = WeakAuras.normalWidth,
       values = showOnValues,
       sorting = {"showOnActive", "showOnGained", "showOnMissing", "showAlways"},
-      desc = L["Aura(s) Gained: shows an aura only while it is new, for the seconds below."],
+      -- ForeverAuras 1.2.1 (Dan): no tooltip on the selector (it described Gained alone)
       get = function()
         local shown = display.RawShowOn(trigger)
         if shown == "showOnActive" and trigger.secretGained then return "showOnGained" end

@@ -700,7 +700,10 @@ local function GetSortedOptionsLists()
   for id, data in pairs(db.displays) do
     if(data.parent) then
     -- Do nothing; children will be added later
-  elseif(OptionsPrivate.Private.loaded[id]) then
+    -- ForeverAuras: standby displays (loaded == false) belong with the loaded
+    -- ones, as the final sort files them (SortDisplayButtons: ~= nil); taken
+    -- as unloaded here they were built under Not Loaded and moved afterwards.
+    elseif(OptionsPrivate.Private.loaded[id] ~= nil) then
       tinsert(to_sort, id);
     end
   end
@@ -716,7 +719,7 @@ local function GetSortedOptionsLists()
   for id, data in pairs(db.displays) do
     if(data.parent) then
     -- Do nothing; children will be added later
-    elseif not(OptionsPrivate.Private.loaded[id]) then
+    elseif OptionsPrivate.Private.loaded[id] == nil then
       tinsert(to_sort, id);
     end
   end
@@ -806,7 +809,10 @@ local function LayoutDisplayButtons(msg)
         WeakAuras.UpdateThumbnail(data);
 
         local button = displayButtons[data.id]
-        frame.buttonsScroll:AddChild(button);
+        -- ForeverAuras: under the Loaded heading from the start (before the
+        -- Not Loaded heading), not appended under Not Loaded until the final
+        -- sort moved it: the list flickered while it was built.
+        frame.buttonsScroll:AddChild(button, frame.unloadedButton);
         num = num + 1;
       end
 
@@ -927,6 +933,14 @@ function WeakAuras.ShowOptions(msg)
   end
 
   frame:Show();
+
+  -- ForeverAuras: tell auras the editor has opened (the counterpart of
+  -- FA_OPTIONS_CLOSED, OptionsFrame.lua): an aura that drives other displays
+  -- through load flags and spell lists can switch to its preview for every
+  -- display it manages, not only when it is picked itself (the "OPTIONS"
+  -- event reaches a picked aura alone). WeakAuras.IsOptionsOpen() is already
+  -- true inside the handlers.
+  OptionsPrivate.Private.ScanEvents("FA_OPTIONS_OPENED")
 
   if (OptionsPrivate.Private.mouseFrame) then
     OptionsPrivate.Private.mouseFrame:OptionsOpened();
@@ -2047,6 +2061,20 @@ end
 
 function WeakAuras.GetMoverSizerId()
   return frame.moversizer:GetCurrentId()
+end
+
+-- ForeverAuras: places the box again for the display it is showing, when it
+-- is showing one (a Modern Aura Group's row rectangle arrives a frame after
+-- the pick, SecretAuraFlow.lua). The current id alone is not enough: it is
+-- kept after the box is hidden, and setting it again showed a box for a
+-- display nobody had picked.
+function WeakAuras.RefreshMoverSizer(id)
+  -- Not while the box is being dragged: placing it again would put it back
+  -- on the group's anchor mid-drag; the release applies the latest bounds.
+  if frame and frame.mover and frame.mover.isMoving then return end
+  if frame and frame.moversizer and frame.moversizer:IsShown() and frame.moversizer:GetCurrentId() == id then
+    WeakAuras.SetMoverSizer(id)
+  end
 end
 
 local function AddDefaultSubRegions(data)

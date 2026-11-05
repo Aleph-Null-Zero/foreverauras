@@ -215,7 +215,11 @@ local function GetOptions(data, triggernum)
 
   }
   options.spellSelectionHeader = {type = "header", name = L["Spell Selection Filters"], order = 4.5}
-  local function SpellIDs(toggleKey, prefix, storageKey, title, inputName, order, Enabled, flag)
+  -- ForeverAuras: `names` makes the field Aura (Legacy)'s Name(s): a typed
+  -- name is resolved to a spell ID by the options' spell cache when it knows
+  -- it (CreateNameOptions), else kept as a name and resolved from the
+  -- client's spell data when the display is built (Display.GetSpellIDs).
+  local function SpellIDs(toggleKey, prefix, storageKey, title, inputName, order, Enabled, flag, names)
     options[toggleKey] = {
       type = "toggle", name = title, order = order, width = width - 0.2,
       get = function() return Enabled(trigger) end,
@@ -227,7 +231,7 @@ local function GetOptions(data, triggernum)
     }
     local size = #(trigger[storageKey] or {}) + 1
     OptionsPrivate.CreateAuraSpellOptions(options, data, triggernum, size,
-      true, false, prefix, order, flag, storageKey, inputName,
+      not names, false, prefix, order, flag, storageKey, inputName,
       nil,
       false, function() return Enabled(trigger) end)
     -- Unlike Legacy, these values are also sent to Blizzard's native filters.
@@ -235,17 +239,18 @@ local function GetOptions(data, triggernum)
       options[prefix .. i].validate = function(_, value)
         if value == "" then return true end
         local id = tonumber(value)
-        if not id or id <= 0 or id >= 2147483647 or id ~= math.floor(id) then
+        if not id then return names and true or L["Enter a positive whole-number Spell ID."] end
+        if id <= 0 or id >= 2147483647 or id ~= math.floor(id) then
           return L["Enter a positive whole-number Spell ID."]
         end
         return true
       end
     end
   end
-  -- Rank matching has independent storage, so old exact selections keep their meaning.
-  SpellIDs("useRankSpellIDs", "rankspellid", "auraRankSpellIDs", L["Spell ID(s) (All Ranks)"], L["Spell ID"], 4.95,
-    display.UsesRankSpellIDs, "secretUseRankSpellIDs")
-  options.useRankSpellIDs.desc = L["Enter a Spell ID to track all ranks of that spell."]
+  -- Name matching keeps its own storage (auraRankSpellIDs), so saved selections keep their meaning.
+  SpellIDs("useRankSpellIDs", "rankspellid", "auraRankSpellIDs", L["Name(s)"], L["Aura Name"], 4.95,
+    display.UsesRankSpellIDs, "secretUseRankSpellIDs", true)
+  options.useRankSpellIDs.desc = L["Enter an Aura Name or Spell ID. A Spell ID will match any spells with the same name."]
   -- Explain incomplete coverage without changing existing saved selections.
   local function UnsupportedRankIDs()
     local missing = {}
@@ -267,9 +272,7 @@ local function GetOptions(data, triggernum)
   }
   SpellIDs("useSpellIDs", "spellid", "auraspellids", L["Exact Spell ID(s)"], L["Exact Spell ID"], 6,
     display.UsesSpellIDs, "secretUseSpellIDs")
-  -- Same-name matching always applies (Display.GetSpellIDs): said here, so
-  -- "Exact" is not read as "these IDs only".
-  options.useSpellIDs.desc = L["Track auras with these spell IDs, and any spell with the same name (other ranks and server variants), as Aura (Legacy) matches by name."]
+  options.useSpellIDs.desc = L["Enter a Spell ID. Only auras with exactly this ID match; other ranks and spells with the same name do not."]
   -- Spell Lists (Display.SpellList) are set by importing a pack, not here: a
   -- trigger with secretSpellList shows a one-line note so the empty ID fields
   -- make sense, and keeps working as data.

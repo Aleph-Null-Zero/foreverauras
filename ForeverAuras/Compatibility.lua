@@ -65,6 +65,12 @@ do
     wipe(infoCache)
     wipe(nameCache)
   end)
+  -- ForeverAuras: /fa loadmem clears the caches as SPELLS_CHANGED does, to
+  -- measure the load scan that follows that event.
+  Private.ExecEnv.WipeSpellCaches = function()
+    wipe(infoCache)
+    wipe(nameCache)
+  end
 end
 
 if GetSpellTexture then

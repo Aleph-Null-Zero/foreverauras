@@ -100,6 +100,67 @@ end
 
 local missingTypes = {icon = true, aurabar = true, progresstexture = true, text = true, texture = true}
 Display.missingTypes = missingTypes
+-- ForeverAuras (combat-reload probe): instances whose list buttons still
+-- need their alpha set (ConfigureSingle, ApplyPendingListAlpha); weak.
+local alphaPending = setmetatable({}, {__mode = "k"})
+-- ForeverAuras (combat-reload probe): a layout write to an aura slot button
+-- (placed on the region after the client made it). In a build under
+-- restrictions the client has already restricted the button by then (seen
+-- in game: "ClearAllPoints on bad self" from a Remaining Time display), so
+-- the write runs under pcall and, refused, the display is marked to be
+-- applied again when the restrictions end (BlizzardAuraDisplay.lua); its
+-- slot keeps the placement its initializeFrame gave it meanwhile. Other
+-- builds write directly and raise as before. The regions waiting are kept
+-- in a set of their own (relayoutPending), so the restriction-end handler
+-- visits only them, not every active display (rc.4 review: with 120
+-- displays the earlier scan of all of them ran on every target, mouse-over
+-- and nameplate event).
+local relayoutPending = setmetatable({}, {__mode = "k"})
+local function SlotWrite(region, fn)
+  local native = region.blizzardAuraDisplay
+  if native and native.probeBuild then
+    local ok = pcall(fn)
+    if not ok then Display.NotePendingRelayout(region) end
+    return ok
+  end
+  fn()
+  return true
+end
+
+-- ForeverAuras (combat-reload probe): other files note a refused slot write
+-- here (SecretAuraFlow.lua, MeasureText).
+-- ForeverAuras (cell chain, dev.44 review): noted with a reason ("slot" by
+-- default; "chain" for the chain's own restricted repair), so the chain's
+-- can be withdrawn when it completes before the restrictions end
+-- (CancelPendingRelayout) without dropping another refusal's.
+function Display.NotePendingRelayout(region, reason)
+  local reasons = relayoutPending[region]
+  if type(reasons) ~= "table" then
+    -- A plain mark from an older writer is a slot refusal.
+    reasons = {slot = reasons == true or nil}
+    relayoutPending[region] = reasons
+  end
+  reasons[reason or "slot"] = true
+end
+function Display.CancelPendingRelayout(region, reason)
+  local reasons = relayoutPending[region]
+  if type(reasons) ~= "table" then return end
+  reasons[reason or "slot"] = nil
+  if not next(reasons) then relayoutPending[region] = nil end
+end
+
+-- ForeverAuras (combat-reload probe): hands over the regions whose slot
+-- layout was refused (SlotWrite) and forgets them; the caller applies each
+-- again. Called when the restrictions end (BlizzardAuraDisplay.lua).
+function Display.TakePendingRelayout()
+  if not next(relayoutPending) then return nil end
+  local regions = {}
+  for region in pairs(relayoutPending) do
+    relayoutPending[region] = nil
+    regions[#regions + 1] = region
+  end
+  return regions
+end
 
 local function NeedsMissing(trigger)
   local showOn = Display.ShowOn(trigger)
@@ -811,11 +872,20 @@ function Display.StyleEraser(native, data)
     eraser:Hide()
     return
   end
+  -- DISABLE blending must stay hidden while the container is parked outside its framebuffer.
+  -- Restyling or adding a record during editor retention must not reactivate it.
+  local instance = native.instance
+  if (instance and (instance.eraserMuted or instance.retainedMuted or instance.previewMuted))
+    or (Display.EditorRetaining and Display.EditorRetaining()) or (WeakAuras.IsOptionsOpen() and not InCombatLockdown()) then
+    if instance then instance.eraserRestorePending = true end
+    eraser:Hide()
+    return
+  end
   local width, height = Display.Dimensions(data)
   local margin = MissingMargin(data, width, height)
   eraser:ClearAllPoints()
-  eraser:SetPoint("TOPLEFT", native.button, "TOPLEFT", -margin, margin)
-  eraser:SetPoint("BOTTOMRIGHT", native.button, "BOTTOMRIGHT", margin, -margin)
+  eraser:SetPoint("TOPLEFT", Display.Box(native), "TOPLEFT", -margin, margin)
+  eraser:SetPoint("BOTTOMRIGHT", Display.Box(native), "BOTTOMRIGHT", margin, -margin)
   eraser:Show()
 end
 
@@ -863,6 +933,7 @@ local function EnsureMissing(single, region, data, trigger, instance)
     -- untrusted layout scripts (Blizzard_CustomAuraContainer). Everything inside
     -- the clip is created in place, never re-parented into it.
     local clip = CreateFrame("Frame", nil, region, "DisableUntrustedLayoutScriptsTemplate")
+    if Display.NoteAllocation then Display.NoteAllocation(region, clip) end
     Display.ClipChildren(clip)
     clip:EnableMouse(false)
     missing.container, missing.clip = container, clip
@@ -885,6 +956,7 @@ local function EnsureMissing(single, region, data, trigger, instance)
     local slot = instance.missingSlot
     if not slot then
       slot = CreateFrame("Frame", nil, region, "DisableUntrustedLayoutScriptsTemplate")
+      if Display.NoteAllocation then Display.NoteAllocation(region, slot) end
       slot:EnableMouse(false)
       -- On the pixel grid, like a display's start frame (SecretAuraFlow.lua).
       if slot.SetRoundLayoutToNearestPixel then slot:SetRoundLayoutToNearestPixel(true) end
@@ -904,6 +976,7 @@ local function EnsureMissing(single, region, data, trigger, instance)
     local stage = single.stage
     if not stage then
       stage = CreateFrame("Frame", nil, region)
+      if Display.NoteAllocation then Display.NoteAllocation(region, stage) end
       stage:EnableMouse(false)
       stage:SetFlattensRenderLayers(true)
       stage:SetIsFrameBuffer(true)
@@ -1038,38 +1111,82 @@ local function TextureMarkup(texture, width, height, left, right, top, bottom, c
 end
 
 -- One aura slot on the list's own container. It picks the first matching aura
--- by the same sort as the list, so both agree on which aura is shown. Its
--- widgets anchor inside the slot button, which is sized and placed on the
--- region at configuration time.
-local function EnsureSlot(single, instance, region, key, trigger, data, init)
+-- by the same sort as the list, so both agree on which aura is shown.
+--
+-- ForeverAuras: `setup(button, slot)` is the slot's whole construction: it
+-- places the button on the region and makes and arranges everything drawn in
+-- it (clip, artwork, swipe, borders, glows, texts). It runs inside the
+-- client's initializeFrame when the slot is made and again, directly, on
+-- every reconfiguration, so it creates its frames once (`slot.x = slot.x or
+-- ...`) and then only arranges them. The reason it is one function: probed
+-- in game (1.2.0-rc.7), a slot button made under aura restrictions is locked
+-- by the client the moment AddAuraSlot returns, together with every frame and
+-- font string under it, made in the callback or not: no CreateFrame with it
+-- as parent, no CreateFontString, no SetPoint, GetFrameLevel, Show, Hide or
+-- SetAlpha on it or its children. Only the duration bindings
+-- (SetDurationText, SetDurationCooldown and their Clear calls, taking those
+-- locked children as arguments) and the container's slot calls stay open.
+-- So everything else must happen inside the callback, before the lock, and
+-- a setup must not reach into another slot's frames either (the icon slot is
+-- locked by the time a Border or Text slot is made): what it needs from the
+-- icon (its box, its frame levels) is kept as plain numbers on `single`.
+-- Out of combat nothing is locked and the same code runs as before.
+--
+-- A slot that already exists in a build under restrictions (a pooled
+-- instance reused by a build in combat) cannot be set up again: it is left
+-- unused (so disabled below) and the display is applied again when the
+-- restrictions end (SlotWrite's pending set).
+local function EnsureSlot(single, instance, region, key, trigger, data, setup)
   local container = instance.container
   local filter, candidates = Display.FilterString(trigger), Display.CandidateFilters(data)
   single.slots = single.slots or {}
   local slot = single.slots[key]
   if not slot then
     slot = {}
+    -- The client calls initializeFrame through an error boundary of its own
+    -- (rc.9 review), so a failed setup is recorded here, not raised.
+    local setupOK, setupErr = false, "initializeFrame was not called"
     local ok, err = pcall(container.AddAuraSlot, container, key, filter, {
       candidateFilters = candidates,
       initializeFrame = function(button)
         -- Runs inside AddAuraSlot, before Blizzard restricts the button.
         slot.button = button
         button:EnableMouse(false)
-        button:SetAllPoints(Display.ContentAnchor(region))
-        if init then init(button, slot) end
+        button:ClearAllPoints()
+        setupOK, setupErr = pcall(setup, button, slot)
       end,
     })
-    if not ok or not slot.button then
-      Warn(data, L["Blizzard could not create the Remaining Time display: %s"]:format(tostring(err)))
+    -- A slot the client made is kept, whatever its setup did: the key is
+    -- taken, and an unused slot is disabled and blanked by ConfigureSingle.
+    if slot.button then single.slots[key] = slot end
+    if not ok or not slot.button or not setupOK then
+      Warn(data, L["Blizzard could not create the Remaining Time display: %s"]:format(tostring(ok and setupErr or err)))
+      Display.NoteSlotFailure(instance, "slot " .. tostring(key), ok and setupErr or err)
+      -- A build in combat tries the whole display again when the
+      -- restrictions end, as a refused layout write does (SlotWrite).
+      local native = region.blizzardAuraDisplay
+      if native and native.probeBuild then Display.NotePendingRelayout(region) end
       return
     end
-    single.slots[key] = slot
+    -- Reconfigure disabled, then enable with the current filters.
+    container:SetAuraSlotEnabled(key, false)
+  else
+    local native = region.blizzardAuraDisplay
+    if native and native.probeBuild then
+      -- Tried before the slot is disabled: a slot the client locked keeps
+      -- drawing what it drew, untouched, until the display is applied
+      -- again (rc.15 review: disabling it first switched off a working
+      -- measurement for the rest of the fight).
+      if not SlotWrite(region, function() slot.button:ClearAllPoints(); setup(slot.button, slot) end) then
+        slot.used = true
+        return slot
+      end
+    else
+      slot.button:ClearAllPoints()
+      setup(slot.button, slot)
+    end
+    container:SetAuraSlotEnabled(key, false)
   end
-  -- Reconfigure disabled, then enable with the current filters.
-  container:SetAuraSlotEnabled(key, false)
-  local width, height = Display.Dimensions(data)
-  slot.button:ClearAllPoints()
-  slot.button:SetSize(width, height)
-  slot.button:SetPoint("TOPLEFT", Display.ContentAnchor(region), "TOPLEFT")
   container:SetAuraSlotFilterString(key, filter)
   container:SetAuraSlotCandidateFilters(key, candidates)
   container:SetAuraSlotSortMethod(key, Display.SortOrder(data, trigger))
@@ -1087,12 +1204,11 @@ end
 -- text, so it is sized and placed in units of that text. The text lives in a
 -- frame scaled so that one of its units is one screen pixel: the artwork then
 -- has whole-pixel sizes and lands on the pixel grid, as a native icon does.
+-- ForeverAuras: called from the slot's setup only (see EnsureSlot).
 local function PixelFrame(slot, region, corner)
   local px = PixelsPerUnit(Display.ContentAnchor(region))
-  if not slot.pixel then
-    slot.pixel = CreateFrame("Frame", nil, slot.button)
-    slot.pixel:EnableMouse(false)
-  end
+  slot.pixel = slot.pixel or CreateFrame("Frame", nil, slot.button)
+  slot.pixel:EnableMouse(false)
   slot.pixel:SetScale(px and 1 / px or 1)
   slot.pixel:ClearAllPoints()
   -- From the button's corner on the pixel grid; centred, a 43-pixel icon in
@@ -1107,10 +1223,8 @@ end
 -- rendered width and height, in a plain invisible copy of the text, come
 -- closest to the pixels wanted. Returns the markup and its rendered height.
 local function FitMarkup(slot, frame, texture, w, h, left, right, top, bottom, color)
-  if not slot.probe then
-    slot.probe = frame:CreateFontString(nil, "ARTWORK")
-    slot.probe:SetAlpha(0)
-  end
+  slot.probe = slot.probe or frame:CreateFontString(nil, "ARTWORK")
+  slot.probe:SetAlpha(0)
   local probe = slot.probe
   -- Shown again after ReleaseSlotDrawing hid it (it stays at alpha 0).
   probe:Show()
@@ -1157,6 +1271,9 @@ end
 -- clip kept what Blizzard last drew into them, and a cleared binding leaves the
 -- text's last string in place. Everything it drew is blanked and hidden here;
 -- EnsureRemaining, Artwork and EnsureConditionGlow show it again when used.
+-- Each step runs under pcall: the frames of a slot made in combat are locked
+-- (see EnsureSlot) and refuse this until the restrictions end; a disabled
+-- slot draws nothing meanwhile, and the next configuration redoes the lot.
 local function ReleaseSlotDrawing(slot)
   local button = slot.button
   if button then
@@ -1165,271 +1282,329 @@ local function ReleaseSlotDrawing(slot)
   end
   for _, key in ipairs({"gate", "text", "probe"}) do
     local text = slot[key]
-    if text then text:SetText(""); text:Hide() end
+    if text then pcall(function() text:SetText(""); text:Hide() end) end
   end
-  if slot.cooldown then slot.cooldown:Clear(); slot.cooldown:Hide() end
+  if slot.cooldown then pcall(function() slot.cooldown:Clear(); slot.cooldown:Hide() end) end
   for _, key in ipairs({"art", "clip", "holder"}) do
-    if slot[key] then slot[key]:Hide() end
+    if slot[key] then pcall(slot[key].Hide, slot[key]) end
   end
   for _, entry in pairs(slot.borders or {}) do
-    if entry.border then entry.border:Hide() end
+    if entry.border then pcall(entry.border.Hide, entry.border) end
   end
+end
+
+-- ForeverAuras: a duration binding the client refused on a slot: reported
+-- on the aura and, in a build under restrictions, counted with the build's
+-- failures (ApplyInstance reads instance.lateFailed after ConfigureSingle),
+-- so "0 failed" means every binding took (rc.15 review).
+local function BindFailed(instance, data, what, err)
+  Warn(data, L["Blizzard refused the Remaining Time %s: %s"]:format(what, tostring(err)))
+  if instance.styleEarly then
+    instance.lateFailed = (instance.lateFailed or 0) + 1
+    instance.styleError = instance.styleError or (what .. ": " .. tostring(err))
+  end
+end
+-- ForeverAuras: a slot whose setup failed inside initializeFrame (EnsureSlot
+-- here, MeasureText in SecretAuraFlow.lua) is counted with the build's
+-- failures the same way, so a build with an incomplete Remaining Time part
+-- never reports "0 failed" (rc.50 review); the warning and the relayout
+-- request stay as they are.
+-- After ApplyInstance has reported, a probe build's finishing work (the row
+-- measurement, FinishApply) counts into instance.finishFailed instead, and
+-- the caller decides the build's success after it (BlizzardAuraDisplay.lua).
+function Display.NoteSlotFailure(instance, what, err)
+  if not instance then return end
+  if instance.styleEarly then
+    instance.lateFailed = (instance.lateFailed or 0) + 1
+    instance.styleError = instance.styleError or (what .. ": " .. tostring(err))
+  elseif instance.finishing then
+    instance.finishFailed = (instance.finishFailed or 0) + 1
+    instance.styleError = instance.styleError or (what .. ": " .. tostring(err))
+  end
+end
+
+-- ForeverAuras: the icon slot's box, as the other slots of the display take
+-- it: the same corner of the content anchor and the same (pixel-rounded)
+-- size, kept as numbers on `single` by the icon's setup so a slot made after
+-- the icon's button is locked (a build in combat) never has to read it.
+local function PlaceAsIcon(single, region, button)
+  local box = single.iconBox
+  button:SetPoint("TOPLEFT", Display.ContentAnchor(region), "TOPLEFT")
+  button:SetSize(box.width, box.height)
 end
 
 -- Remaining Time: the list keeps drawing the aura (its countdown and glow are
 -- limited to the range by Blizzard, see StyleRemainingList); this slot adds the
 -- display's icon as inline artwork whose opacity follows the same range.
 local remainingGateCurve
--- A Glow element turned on by a "Remaining Time < X" condition, on an Icon
--- with a Remaining Time window: its own aura slot, whose hidden text (the
--- same formatter gate as the icon's) is a block while fewer than X seconds
--- are left and empty otherwise; the clip hung on that text holds the glow,
--- centred on the icon's art. Exact for every rank, as the icon's window is.
-local function EnsureConditionGlow(single, instance, region, data, trigger, index, element, seconds, icon)
-  local key = "FAGlow" .. index
-  local slot = EnsureSlot(single, instance, region, key, trigger, data, function(button, me)
-    me.clip = CreateFrame("Frame", nil, button, "DisableUntrustedLayoutScriptsTemplate")
-    Display.ClipChildren(me.clip)
-    me.clip:SetClipsChildren(true)
-    me.holder = CreateFrame("Frame", nil, me.clip)
-    me.holder:EnableMouse(false)
-    me.gate = button:CreateFontString(nil, "BACKGROUND")
-  end)
-  if not slot or not slot.clip then return end
-  local width, height = Display.Dimensions(data)
-  local margin = Display.GlowMargin(width, height, element)
-  slot.button:ClearAllPoints()
-  slot.button:SetAllPoints(icon.button)
-  local size, fill, gateMargin = Display.GateFill(width + 2 * margin, height + 2 * margin)
-  local formatter = Display.GateFormatter(0, seconds, fill)
-  if not formatter then slot.used = false; return end
+local function RemainingGateCurve()
   if not remainingGateCurve then
     remainingGateCurve = C_CurveUtil.CreateColorCurve()
     remainingGateCurve:SetType(Enum.LuaCurveType.Step)
     remainingGateCurve:AddPoint(0, CreateColor(0, 0, 0, 0))
   end
-  local gate = slot.gate
-  gate:SetFont(STANDARD_TEXT_FONT, size, "")
-  gate:SetWordWrap(false)
-  gate:SetWidth(0)
-  gate:ClearAllPoints()
-  gate:SetJustifyH("LEFT")
-  -- The run of W's spans the glow's reach (margin) plus the gate's own margin.
-  gate:SetPoint("LEFT", slot.button, "LEFT", -margin - gateMargin, 0)
+  return remainingGateCurve
+end
+
+-- A Glow element turned on by a "Remaining Time < X" condition, on an Icon
+-- with a Remaining Time window: its own aura slot, whose hidden text (the
+-- same formatter gate as the icon's) is a block while fewer than X seconds
+-- are left and empty otherwise; the clip hung on that text holds the glow,
+-- centred on the icon's box. Exact for every rank, as the icon's window is.
+local function EnsureConditionGlow(single, instance, region, data, trigger, index, element, seconds)
+  local key = "FAGlow" .. index
+  local width, height = Display.Dimensions(data)
+  local margin = Display.GlowMargin(width, height, element)
+  local size, fill, gateMargin = Display.GateFill(width + 2 * margin, height + 2 * margin)
+  local formatter = Display.GateFormatter(0, seconds, fill)
+  if not formatter then return end
+  local slot = EnsureSlot(single, instance, region, key, trigger, data, function(button, me)
+    PlaceAsIcon(single, region, button)
+    -- Only the creation of each frame is guarded; its settings are written
+    -- every time, so a setup that failed part way (rc.15 and rc.17
+    -- reviews) is finished by the next one instead of skipping the rest.
+    me.clip = me.clip or CreateFrame("Frame", nil, button, "DisableUntrustedLayoutScriptsTemplate")
+    Display.ClipChildren(me.clip)
+    me.clip:SetClipsChildren(true)
+    me.holder = me.holder or CreateFrame("Frame", nil, me.clip)
+    me.holder:EnableMouse(false)
+    me.gate = me.gate or button:CreateFontString(nil, "BACKGROUND")
+    local gate = me.gate
+    gate:SetFont(STANDARD_TEXT_FONT, size, "")
+    gate:SetWordWrap(false)
+    gate:SetWidth(0)
+    gate:ClearAllPoints()
+    gate:SetJustifyH("LEFT")
+    -- The run of W's spans the glow's reach (margin) plus the gate's own margin.
+    gate:SetPoint("LEFT", button, "LEFT", -margin - gateMargin, 0)
+    gate:Show()
+    Display.AnchorGateClip(me.clip, gate, button, margin + gateMargin)
+    -- ForeverAuras: shown again after ReleaseSlotDrawing hid it.
+    me.clip:Show()
+    -- The holder is the icon's box (the button is), the glow centred on it.
+    me.holder:ClearAllPoints()
+    me.holder:SetAllPoints(button)
+    me.holder:Show()
+    me.glows = me.glows or {}
+    me.glows[index] = me.glows[index] or {}
+    Display.StyleElementGlow(me.glows[index], button, me.holder, me.holder, setmetatable({glow = true}, {__index = element}), width, height)
+    pcall(me.clip.SetFrameLevel, me.clip, single.iconCooldownLevel + 2)
+  end)
+  if not slot then return end
   pcall(slot.button.ClearDurationText, slot.button)
-  local ok, err = pcall(slot.button.SetDurationText, slot.button, gate, {
+  local ok, err = pcall(slot.button.SetDurationText, slot.button, slot.gate, {
     textFormat = {formatString = "{}", components = {{property = Enum.DurationTextBindingProperty.RemainingDuration, formatter = formatter}}},
-    textColor = {curve = remainingGateCurve, property = Enum.DurationTextBindingProperty.RemainingDuration},
+    textColor = {curve = RemainingGateCurve(), property = Enum.DurationTextBindingProperty.RemainingDuration},
   })
   if not ok then
-    Warn(data, "Blizzard refused the Remaining Time glow: " .. tostring(err))
+    BindFailed(instance, data, "glow", err)
     slot.used = false
     return
   end
-  gate:Show()
-  Display.AnchorGateClip(slot.clip, gate, slot.button, margin + gateMargin)
-  -- ForeverAuras: shown again after ReleaseSlotDrawing hid it.
-  slot.clip:Show()
-  slot.holder:ClearAllPoints()
-  slot.holder:SetAllPoints(icon.button)
-  slot.holder:Show()
-  slot.glows = slot.glows or {}
-  slot.glows[index] = slot.glows[index] or {}
-  Display.StyleElementGlow(slot.glows[index], slot.button, slot.holder, icon.art, setmetatable({glow = true}, {__index = element}), width, height)
-  pcall(slot.clip.SetFrameLevel, slot.clip, icon.cooldown:GetFrameLevel() + 2)
   instance.container:SetAuraSlotEnabled(key, true)
+  slot.enabledApplied = true   -- (dev.92) ConfigureSingle writes the disable once
 end
 
 local function EnsureRemaining(single, instance, region, data, trigger, op, x)
-  local icon = EnsureSlot(single, instance, region, SLOT_ICON, trigger, data)
-  if not icon then return false end
   local width, height = Display.Dimensions(data)
-  local color = data.color or {1, 1, 1, 1}
-  local left, right, top, bottom = Display.IconTexCoords(data)
-  -- The icon and its Border elements are real frames, drawn exactly as on a
-  -- native button (the same border code, rounded to pixels), inside a clip
-  -- that Blizzard's timer opens: a hidden text that is a large block of
-  -- letters inside the Remaining Time window and empty outside it sizes the
-  -- clip (as the swipe's and the gates' clips are). Nothing is drawn as
-  -- texture markup, whose placement in a text is not exact to the pixel.
-  if not icon.clip then
-    icon.clip = CreateFrame("Frame", nil, icon.button, "DisableUntrustedLayoutScriptsTemplate")
-    Display.ClipChildren(icon.clip)
-    icon.art = CreateFrame("Frame", nil, icon.clip, "DisableUntrustedLayoutScriptsTemplate")
-    icon.art:EnableMouse(false)
-    if icon.art.SetRoundLayoutToNearestPixel then icon.art:SetRoundLayoutToNearestPixel(true) end
-    icon.tex = icon.art:CreateTexture(nil, "ARTWORK")
-    icon.tex:SetAllPoints(icon.art)
-    -- The swipe lives on the icon's frame, under the borders (made after it),
-    -- as an Icon's cooldown is under its border.
-    icon.cooldown = CreateFrame("Cooldown", nil, icon.art, "CooldownFrameTemplate")
-    icon.cooldown:SetAllPoints(icon.art)
-    icon.cooldown:SetDrawBling(false)
-    icon.cooldown:SetHideCountdownNumbers(true)
-    icon.gate = icon.button:CreateFontString(nil, "BACKGROUND")
-    icon.borders = {}
-  end
   if not (C_StringUtil and C_StringUtil.CreateNumericRuleFormatter and Enum.DurationTextBindingProperty) then return false end
   local lower, upper = Display.RemainingRange(trigger)
   local size, fill, margin = Display.GateFill(width, height)
   local formatter = lower and Display.GateFormatter(lower, upper, fill)
   if not formatter then return false end
-  if not remainingGateCurve then
-    remainingGateCurve = C_CurveUtil.CreateColorCurve()
-    remainingGateCurve:SetType(Enum.LuaCurveType.Step)
-    remainingGateCurve:AddPoint(0, CreateColor(0, 0, 0, 0))
-  end
-  local gate, clip, art = icon.gate, icon.clip, icon.art
-  gate:SetFont(STANDARD_TEXT_FONT, size, "")
-  gate:SetWordWrap(false)
-  gate:SetWidth(0)
-  -- The clip's origin stays on the button's pixel grid: its left, top and
-  -- bottom are the button's with a whole-pixel margin, and only its right
-  -- edge follows the hidden text (empty, the clip ends before the button;
-  -- filled, well past it). A clip hung on a vertically centred text sits
-  -- at a fraction of a pixel, and what it holds was drawn a pixel off.
-  local gatePx = PixelsPerUnit(icon.button)
-  local gateMargin = gatePx and math.ceil(margin * gatePx) / gatePx or margin
-  -- A display on its own can sit between pixels; the clip's corner is moved
-  -- by that fraction onto a whole pixel (as the Missing clip is).
-  local function GateSnap()
-    local snapX, snapY, placed = 0, 0, true
-    if gatePx then
-      local anchorFrame = Display.ContentAnchor(region)
-      local ok, left, top = pcall(function() return anchorFrame:GetLeft(), anchorFrame:GetTop() end)
-      if ok and type(left) == "number" and type(top) == "number" and not issecretvalue(left) and not issecretvalue(top) then
-        snapX = (math.floor(left * gatePx + 0.5) - left * gatePx) / gatePx
-        snapY = (math.floor(top * gatePx + 0.5) - top * gatePx) / gatePx
-      elseif ok and left == nil then
-        placed = false
-      end
-    end
-    return snapX, snapY, placed
-  end
-  local snapX, snapY, placed = GateSnap()
-  gate:ClearAllPoints()
-  gate:SetJustifyH("LEFT")
-  gate:SetPoint("TOPLEFT", icon.button, "TOPLEFT", -gateMargin + snapX, gateMargin + snapY)
-  icon.button:ClearDurationText()
-  -- A refused binding would leave the display empty: report it on the aura.
-  local okIcon, iconErr = pcall(icon.button.SetDurationText, icon.button, gate, {
-    textFormat = {formatString = "{}", components = {{property = Enum.DurationTextBindingProperty.RemainingDuration, formatter = formatter}}},
-    textColor = {curve = remainingGateCurve, property = Enum.DurationTextBindingProperty.RemainingDuration},
-  })
-  if not okIcon then
-    Warn(data, "Blizzard refused the Remaining Time icon: " .. tostring(iconErr))
-    return false
-  end
-  gate:Show()
-  clip:ClearAllPoints()
-  local function AnchorGateClip(sx, sy)
-    gate:ClearAllPoints()
-    gate:SetPoint("TOPLEFT", icon.button, "TOPLEFT", -gateMargin + sx, gateMargin + sy)
-    clip:ClearAllPoints()
-    clip:SetPoint("TOPLEFT", icon.button, "TOPLEFT", -gateMargin + sx, gateMargin + sy)
-    clip:SetPoint("BOTTOMLEFT", icon.button, "BOTTOMLEFT", -gateMargin + sx, -gateMargin + sy)
-    clip:SetPoint("RIGHT", gate, "RIGHT")
-  end
-  AnchorGateClip(snapX, snapY)
-  -- ForeverAuras: shown again after ReleaseSlotDrawing hid it.
-  clip:Show()
-  -- At login the display has no place yet: snapped again a frame later.
-  if not placed then
-    local tries = 0
-    local function Retry()
-      tries = tries + 1
-      if not icon.used then return end
-      local sx, sy, ok = GateSnap()
-      AnchorGateClip(sx, sy)
-      if not ok and tries < 5 then C_Timer.After(0, Retry) end
-    end
-    C_Timer.After(0, Retry)
-  end
-  -- The slot button is the box: on the row's start frame, rounded to pixels
-  -- like a native button (BuildButton), sized in whole pixels (36 units on a
-  -- 1.2 group is 43.2 pixels: 43). The icon fills it.
-  local px = PixelsPerUnit(icon.button)
-  if icon.button.SetRoundLayoutToNearestPixel then pcall(icon.button.SetRoundLayoutToNearestPixel, icon.button, true) end
-  icon.button:ClearAllPoints()
-  icon.button:SetPoint("TOPLEFT", Display.ContentAnchor(region), "TOPLEFT")
-  if px then
-    icon.button:SetSize(math.max(1, math.floor(width * px + 0.5)) / px, math.max(1, math.floor(height * px + 0.5)) / px)
-  else
-    icon.button:SetSize(width, height)
-  end
-  art:ClearAllPoints()
-  art:SetAllPoints(icon.button)
-  icon.tex:SetSnapToPixelGrid(false)
-  icon.tex:SetTexelSnappingBias(0)
-  icon.tex:SetTexture(Display.SingleIcon(data))
-  icon.tex:SetTexCoord(left, right, top, bottom)
-  icon.tex:SetVertexColor(color[1] or 1, color[2] or 1, color[3] or 1, color[4] or 1)
-  icon.tex:SetDesaturated(data.desaturate == true)
-  art:Show()
-  -- The swipe: Blizzard fills it from the aura's duration.
-  local cooldown = icon.cooldown
-  pcall(icon.button.ClearDurationCooldown, icon.button)
-  if data.cooldown ~= false then
-    cooldown:SetDrawSwipe(data.cooldownSwipe ~= false)
-    cooldown:SetDrawEdge(data.cooldownEdge == true)
-    cooldown:SetReverse(data.inverse == true)
-    cooldown:SetSwipeColor(unpack(data.blizzardAuraDisplay and data.blizzardAuraDisplay.swipeColor or {0, 0, 0, 0.8}))
-    cooldown:Show()
-    pcall(icon.button.SetDurationCooldown, icon.button, cooldown)
-  else
-    cooldown:Hide()
-  end
-  -- Border elements, with the native buttons' own border code.
-  for _, entry in pairs(icon.borders) do if entry.border then entry.border:Hide() end end
-  for index, element in ipairs(data.subRegions or {}) do
-    if element.type == "subborder" and element.border_visible ~= false and not Display.IsDetachedElement(data, element) then
-      icon.borders[index] = icon.borders[index] or {}
-      Display.StyleBorderFrame(icon.borders[index], art, art, width, height, element, Display.FlowGroup(data) ~= nil)
-      icon.borders[index].border:SetAlpha(element.border_alpha or 1)
-      -- Above the swipe, as an Icon's border is above its cooldown.
-      pcall(icon.borders[index].border.SetFrameLevel, icon.borders[index].border, cooldown:GetFrameLevel() + 1)
-      icon.borders[index].border:Show()
-    end
-  end
-  -- Glow elements, inside the same clip: Blizzard's formatter opens it at
-  -- exactly x seconds, whatever the aura's total duration. (The list button's
-  -- window glow, TimedGlowHolder, needs that total, which an "All Ranks"
-  -- selection cannot give: ranks differ, and the aura's rank is secret.)
-  -- Present conditions that turn a glow on apply, as on the live button.
-  icon.glows = icon.glows or {}
-  for _, entry in pairs(icon.glows) do Display.ClearElementGlow(entry) end
+  local color = data.color or {1, 1, 1, 1}
+  local left, right, top, bottom = Display.IconTexCoords(data)
   -- A glow turned on by a "Remaining Time < X" condition is drawn by a slot
-  -- of its own (below), whose gate opens at X; any other condition that
-  -- turns a glow on counts as on, as on the live button.
+  -- of its own (EnsureConditionGlow), whose gate opens at X; any other
+  -- condition that turns a glow on counts as on, as on the live button.
   local onAlways, onBelow = {}, {}
   for _, condition in ipairs(data.conditions or {}) do
     local check = condition.check
     for _, change in ipairs(condition.changes or {}) do
       local glowIndex = tonumber((change.property or ""):match("^sub%.(%d+)%.glow$"))
       if glowIndex and change.value == true and not condition.linked and not Display.IsDetachedProperty(data, change.property) then
-        local x = Display.RemainingBelowCheck(data, check)
-        if x then
-          onBelow[glowIndex] = math.max(onBelow[glowIndex] or 0, x)
+        local glowX = Display.RemainingBelowCheck(data, check)
+        if glowX then
+          onBelow[glowIndex] = math.max(onBelow[glowIndex] or 0, glowX)
         else
           onAlways[glowIndex] = true
         end
       end
     end
   end
-  for index, element in ipairs(data.subRegions or {}) do
-    if element.type == "subglow" and not Display.IsDetachedElement(data, element) then
-      if element.glow or onAlways[index] then
-        icon.glows[index] = icon.glows[index] or {}
-        Display.StyleElementGlow(icon.glows[index], icon.button, art, art, setmetatable({glow = true}, {__index = element}), width, height)
-        local holder = icon.glows[index].nativeGlow and icon.glows[index].nativeGlow.holder
-        if holder then pcall(holder.SetFrameLevel, holder, cooldown:GetFrameLevel() + 2) end
-      elseif onBelow[index] then
-        EnsureConditionGlow(single, instance, region, data, trigger, index, element, onBelow[index], icon)
+  -- The slot button is the box: on the row's start frame, rounded to pixels
+  -- like a native button (BuildButton), sized in whole pixels (36 units on a
+  -- 1.2 group is 43.2 pixels: 43). The icon fills it. Everything drawn in it
+  -- is made and arranged here, in the slot's setup (see EnsureSlot).
+  local icon = EnsureSlot(single, instance, region, SLOT_ICON, trigger, data, function(button, me)
+    local px = PixelsPerUnit(button)
+    if button.SetRoundLayoutToNearestPixel then pcall(button.SetRoundLayoutToNearestPixel, button, true) end
+    button:SetPoint("TOPLEFT", Display.ContentAnchor(region), "TOPLEFT")
+    local boxW, boxH = width, height
+    if px then boxW, boxH = math.max(1, math.floor(width * px + 0.5)) / px, math.max(1, math.floor(height * px + 0.5)) / px end
+    button:SetSize(boxW, boxH)
+    single.iconBox = {width = boxW, height = boxH}
+    -- The icon and its Border elements are real frames, drawn exactly as on a
+    -- native button (the same border code, rounded to pixels), inside a clip
+    -- that Blizzard's timer opens: a hidden text that is a large block of
+    -- letters inside the Remaining Time window and empty outside it sizes the
+    -- clip (as the swipe's and the gates' clips are). Nothing is drawn as
+    -- texture markup, whose placement in a text is not exact to the pixel.
+    -- Only the creation of each frame is guarded (see EnsureConditionGlow).
+    me.clip = me.clip or CreateFrame("Frame", nil, button, "DisableUntrustedLayoutScriptsTemplate")
+    Display.ClipChildren(me.clip)
+    me.art = me.art or CreateFrame("Frame", nil, me.clip, "DisableUntrustedLayoutScriptsTemplate")
+    me.art:EnableMouse(false)
+    if me.art.SetRoundLayoutToNearestPixel then me.art:SetRoundLayoutToNearestPixel(true) end
+    me.tex = me.tex or me.art:CreateTexture(nil, "ARTWORK")
+    me.tex:ClearAllPoints()
+    me.tex:SetAllPoints(me.art)
+    -- The swipe lives on the icon's frame, under the borders (made after it),
+    -- as an Icon's cooldown is under its border.
+    me.cooldown = me.cooldown or CreateFrame("Cooldown", nil, me.art, "CooldownFrameTemplate")
+    me.cooldown:ClearAllPoints()
+    me.cooldown:SetAllPoints(me.art)
+    me.cooldown:SetDrawBling(false)
+    me.cooldown:SetHideCountdownNumbers(true)
+    me.gate = me.gate or button:CreateFontString(nil, "BACKGROUND")
+    me.borders = me.borders or {}
+    local gate, clip, art, cooldown = me.gate, me.clip, me.art, me.cooldown
+    gate:SetFont(STANDARD_TEXT_FONT, size, "")
+    gate:SetWordWrap(false)
+    gate:SetWidth(0)
+    -- The clip's origin stays on the button's pixel grid: its left, top and
+    -- bottom are the button's with a whole-pixel margin, and only its right
+    -- edge follows the hidden text (empty, the clip ends before the button;
+    -- filled, well past it). A clip hung on a vertically centred text sits
+    -- at a fraction of a pixel, and what it holds was drawn a pixel off.
+    local gateMargin = px and math.ceil(margin * px) / px or margin
+    -- A display on its own can sit between pixels; the clip's corner is moved
+    -- by that fraction onto a whole pixel (as the Missing clip is).
+    local function GateSnap()
+      local snapX, snapY, placed = 0, 0, true
+      if px then
+        local anchorFrame = Display.ContentAnchor(region)
+        local ok, anchorLeft, anchorTop = pcall(function() return anchorFrame:GetLeft(), anchorFrame:GetTop() end)
+        if ok and type(anchorLeft) == "number" and type(anchorTop) == "number" and not issecretvalue(anchorLeft) and not issecretvalue(anchorTop) then
+          snapX = (math.floor(anchorLeft * px + 0.5) - anchorLeft * px) / px
+          snapY = (math.floor(anchorTop * px + 0.5) - anchorTop * px) / px
+        elseif ok and anchorLeft == nil then
+          placed = false
+        end
       end
+      return snapX, snapY, placed
+    end
+    local function AnchorGateClip(sx, sy)
+      gate:ClearAllPoints()
+      gate:SetJustifyH("LEFT")
+      gate:SetPoint("TOPLEFT", button, "TOPLEFT", -gateMargin + sx, gateMargin + sy)
+      clip:ClearAllPoints()
+      clip:SetPoint("TOPLEFT", button, "TOPLEFT", -gateMargin + sx, gateMargin + sy)
+      clip:SetPoint("BOTTOMLEFT", button, "BOTTOMLEFT", -gateMargin + sx, -gateMargin + sy)
+      clip:SetPoint("RIGHT", gate, "RIGHT")
+    end
+    local snapX, snapY, placed = GateSnap()
+    AnchorGateClip(snapX, snapY)
+    gate:Show()
+    -- ForeverAuras: shown again after ReleaseSlotDrawing hid it.
+    clip:Show()
+    -- At login the display has no place yet: snapped again a frame later.
+    -- Locked frames (a slot made in combat) refuse the re-anchoring; the
+    -- display is then applied again when the restrictions end.
+    if not placed then
+      local tries = 0
+      local function Retry()
+        tries = tries + 1
+        if not me.used then return end
+        local sx, sy, ok = GateSnap()
+        if not pcall(AnchorGateClip, sx, sy) then
+          -- Noted whatever the build's state by now (a finished probe build
+          -- has dropped its flag, rc.9 review): the set is read when the
+          -- restrictions end, which is the only time a refusal can happen.
+          Display.NotePendingRelayout(region)
+          return
+        end
+        if not ok and tries < 5 then C_Timer.After(0, Retry) end
+      end
+      C_Timer.After(0, Retry)
+    end
+    art:ClearAllPoints()
+    art:SetAllPoints(button)
+    me.tex:SetSnapToPixelGrid(false)
+    me.tex:SetTexelSnappingBias(0)
+    me.tex:SetTexture(Display.SingleIcon(data))
+    me.tex:SetTexCoord(left, right, top, bottom)
+    me.tex:SetVertexColor(color[1] or 1, color[2] or 1, color[3] or 1, color[4] or 1)
+    me.tex:SetDesaturated(data.desaturate == true)
+    art:Show()
+    -- The swipe: Blizzard fills it from the aura's duration (bound below).
+    if data.cooldown ~= false then
+      cooldown:SetDrawSwipe(data.cooldownSwipe ~= false)
+      cooldown:SetDrawEdge(data.cooldownEdge == true)
+      cooldown:SetReverse(data.inverse == true)
+      cooldown:SetSwipeColor(unpack(data.blizzardAuraDisplay and data.blizzardAuraDisplay.swipeColor or {0, 0, 0, 0.8}))
+      cooldown:Show()
+    else
+      cooldown:Hide()
+    end
+    -- The frame levels the other slots of the display build on (PlaceAsIcon).
+    single.iconLevel = button:GetFrameLevel()
+    single.iconCooldownLevel = cooldown:GetFrameLevel()
+    -- Border elements, with the native buttons' own border code.
+    for _, entry in pairs(me.borders) do if entry.border then entry.border:Hide() end end
+    for index, element in ipairs(data.subRegions or {}) do
+      if element.type == "subborder" and element.border_visible ~= false and not Display.IsDetachedElement(data, element) then
+        me.borders[index] = me.borders[index] or {}
+        Display.StyleBorderFrame(me.borders[index], art, art, width, height, element, Display.FlowGroup(data) ~= nil)
+        me.borders[index].border:SetAlpha(element.border_alpha or 1)
+        -- Above the swipe, as an Icon's border is above its cooldown.
+        pcall(me.borders[index].border.SetFrameLevel, me.borders[index].border, single.iconCooldownLevel + 1)
+        me.borders[index].border:Show()
+      end
+    end
+    -- Glow elements, inside the same clip: Blizzard's formatter opens it at
+    -- exactly x seconds, whatever the aura's total duration. (The list button's
+    -- window glow, TimedGlowHolder, needs that total, which an "All Ranks"
+    -- selection cannot give: ranks differ, and the aura's rank is secret.)
+    -- Present conditions that turn a glow on apply, as on the live button.
+    me.glows = me.glows or {}
+    for _, entry in pairs(me.glows) do Display.ClearElementGlow(entry) end
+    for index, element in ipairs(data.subRegions or {}) do
+      if element.type == "subglow" and not Display.IsDetachedElement(data, element) and (element.glow or onAlways[index]) then
+        me.glows[index] = me.glows[index] or {}
+        Display.StyleElementGlow(me.glows[index], button, art, art, setmetatable({glow = true}, {__index = element}), width, height)
+        local holder = me.glows[index].nativeGlow and me.glows[index].nativeGlow.holder
+        if holder then pcall(holder.SetFrameLevel, holder, single.iconCooldownLevel + 2) end
+      end
+    end
+  end)
+  if not icon then return false end
+  -- The bindings: the only calls a locked slot button still takes.
+  pcall(icon.button.ClearDurationText, icon.button)
+  -- A refused binding would leave the display empty: report it on the aura.
+  local okIcon, iconErr = pcall(icon.button.SetDurationText, icon.button, icon.gate, {
+    textFormat = {formatString = "{}", components = {{property = Enum.DurationTextBindingProperty.RemainingDuration, formatter = formatter}}},
+    textColor = {curve = RemainingGateCurve(), property = Enum.DurationTextBindingProperty.RemainingDuration},
+  })
+  if not okIcon then
+    BindFailed(instance, data, "icon", iconErr)
+    return false
+  end
+  pcall(icon.button.ClearDurationCooldown, icon.button)
+  if data.cooldown ~= false then
+    local okSwipe, swipeErr = pcall(icon.button.SetDurationCooldown, icon.button, icon.cooldown)
+    if not okSwipe then BindFailed(instance, data, "swipe", swipeErr) end
+  end
+  -- Glows turned on by a "Remaining Time < X" condition: slots of their own.
+  for index, element in ipairs(data.subRegions or {}) do
+    if element.type == "subglow" and not Display.IsDetachedElement(data, element)
+      and not (element.glow or onAlways[index]) and onBelow[index] then
+      EnsureConditionGlow(single, instance, region, data, trigger, index, element, onBelow[index])
     end
   end
   instance.container:SetAuraSlotEnabled(SLOT_ICON, true)
-  local level = icon.button:GetFrameLevel()
+  if single.slots and single.slots[SLOT_ICON] then single.slots[SLOT_ICON].enabledApplied = true end   -- (dev.92)
+  local level = single.iconLevel
   -- The swipe is drawn on the icon's frame above; the separate swipe slot
   -- of earlier versions is left unused, which turns it off.
   -- Elements listed before the Background draw below the icon, as they do on
@@ -1441,33 +1616,39 @@ local function EnsureRemaining(single, instance, region, data, trigger, op, x)
   -- One piece of artwork drawn by Blizzard's timer like the icon: a texture
   -- element, or one edge of a Border element.
   local function Artwork(key, index, texture, w, h, point, relative, ox, oy, tint, alpha, below)
-    local slot = EnsureSlot(single, instance, region, key, trigger, data)
-    if not slot then return end
     -- The slot button is placed in units; the artwork inside it in pixels,
     -- from the corner the button is anchored by (a corner of the display's
-    -- box, which is on the pixel grid), or the top-left one.
+    -- box, which is on the pixel grid), or the top-left one. The pixel size
+    -- is settled before the slot exists, so its placement is final from the
+    -- client's callback on.
     local corner = (point:find("TOP") or point:find("BOTTOM")) and (point:find("LEFT") or point:find("RIGHT")) and point or "TOPLEFT"
-    local frame, scale = PixelFrame(slot, region, corner)
+    local scale = PixelsPerUnit(Display.ContentAnchor(region)) or 1
     w, h = math.max(1, math.floor(w * scale + 0.5)), math.max(1, math.floor(h * scale + 0.5))
-    slot.button:ClearAllPoints()
-    slot.button:SetSize(w / scale, h / scale)
-    slot.button:SetPoint(point, Display.ContentAnchor(region), relative, ox, oy)
-    pcall(slot.button.SetFrameLevel, slot.button, below and math.max(0, level - 1) or level + index)
-    slot.text = slot.text or frame:CreateFontString(nil, "ARTWORK")
-    slot.text:SetWordWrap(false)
-    slot.text:SetFont(STANDARD_TEXT_FONT, 12, "")
-    slot.button:ClearDurationText()
-    local markup, rendered = FitMarkup(slot, frame, texture, w, h, 0, 1, 0, 1, tint)
-    AnchorArtwork(slot.text, frame, corner, w, h)
-    local ok = pcall(slot.button.SetDurationText, slot.button, slot.text, {
+    local markup
+    local slot = EnsureSlot(single, instance, region, key, trigger, data, function(button, me)
+      button:SetSize(w / scale, h / scale)
+      button:SetPoint(point, Display.ContentAnchor(region), relative, ox, oy)
+      pcall(button.SetFrameLevel, button, below and math.max(0, level - 1) or level + index)
+      local frame = PixelFrame(me, region, corner)
+      me.text = me.text or frame:CreateFontString(nil, "ARTWORK")
+      me.text:SetWordWrap(false)
+      me.text:SetFont(STANDARD_TEXT_FONT, 12, "")
+      markup = FitMarkup(me, frame, texture, w, h, 0, 1, 0, 1, tint)
+      AnchorArtwork(me.text, frame, corner, w, h)
+      me.text:Show()
+    end)
+    if not slot or not markup then return end
+    pcall(slot.button.ClearDurationText, slot.button)
+    local ok, err = pcall(slot.button.SetDurationText, slot.button, slot.text, {
       textFormat = {formatString = markup, components = {}},
       textColor = {curve = RemainingCurve(op, x, tint[1] or 1, tint[2] or 1, tint[3] or 1, (tint[4] or 1) * alpha),
         property = Enum.DurationTextBindingProperty.RemainingDuration},
     })
     if ok then
-      slot.text:Show()
       instance.container:SetAuraSlotEnabled(key, true)
+      slot.enabledApplied = true   -- (dev.95, Astra's dev.93 review) the disable memo re-armed on every accepted enable
     else
+      BindFailed(instance, data, "artwork", err)
       slot.used = false
     end
   end
@@ -1501,34 +1682,39 @@ local function EnsureRemaining(single, instance, region, data, trigger, op, x)
     if literal and literal ~= "" then
       local key = SLOT_TEXT .. index
       local slot = EnsureSlot(single, instance, region, key, trigger, data, function(button, me)
+        PlaceAsIcon(single, region, button)
         for _, area in ipairs({"inner", "outer"}) do
-          me[area] = CreateFrame("Frame", nil, button)
+          me[area] = me[area] or CreateFrame("Frame", nil, button)
+          me[area]:ClearAllPoints()
           me[area]:SetPoint("CENTER", button, "CENTER")
           me[area]:EnableMouse(false)
         end
-        me.text = button:CreateFontString(nil, "OVERLAY")
-      end)
-      if slot and slot.text then
-        slot.button:ClearAllPoints()
-        slot.button:SetAllPoints(icon.button)
-        pcall(slot.button.SetFrameLevel, slot.button, level + index)
-        slot.inner:SetSize(width * 0.8, height * 0.8)
-        slot.outer:SetSize(width * 1.1, height * 1.1)
-        Display.StyleText(slot.text, {button = slot.button, inner = slot.inner, outer = slot.outer},
+        me.text = me.text or button:CreateFontString(nil, "OVERLAY")
+        pcall(button.SetFrameLevel, button, level + index)
+        me.inner:SetSize(width * 0.8, height * 0.8)
+        me.outer:SetSize(width * 1.1, height * 1.1)
+        Display.StyleText(me.text, {button = button, inner = me.inner, outer = me.outer},
           Display.TextSettings(element), "text", 18, "CENTER", 0, 0)
-        slot.text:SetAlpha(element.text_alpha or 1)
-        slot.text:SetWidth(element.text_automaticWidth == "Fixed" and (element.text_fixedWidth or 200) or 0)
-        slot.text:SetWordWrap(element.text_wordWrap ~= "Elide")
-        slot.text:SetNonSpaceWrap(element.text_wordWrap ~= "Elide")
-        slot.text:SetText("")
+        me.text:SetAlpha(element.text_alpha or 1)
+        me.text:SetWidth(element.text_automaticWidth == "Fixed" and (element.text_fixedWidth or 200) or 0)
+        me.text:SetWordWrap(element.text_wordWrap ~= "Elide")
+        me.text:SetNonSpaceWrap(element.text_wordWrap ~= "Elide")
+        me.text:SetText("")
+        me.text:Show()
+      end)
+      if slot then
         pcall(slot.button.ClearDurationText, slot.button)
-        local color = Display.DurationColorCondition(data, element.text_color, "sub." .. index .. ".text_color", {op, x})
-        local ok = color ~= nil and pcall(slot.button.SetDurationText, slot.button, slot.text,
-          {textFormat = {formatString = literal, components = {}}, textColor = color})
+        local textColor = Display.DurationColorCondition(data, element.text_color, "sub." .. index .. ".text_color", {op, x})
+        local ok, err = false, "no duration colour curve"
+        if textColor ~= nil then
+          ok, err = pcall(slot.button.SetDurationText, slot.button, slot.text,
+            {textFormat = {formatString = literal, components = {}}, textColor = textColor})
+        end
         if ok then
-          slot.text:Show()
           instance.container:SetAuraSlotEnabled(key, true)
+          slot.enabledApplied = true   -- (dev.95) the disable memo re-armed on every accepted enable
         else
+          BindFailed(instance, data, "text", err)
           slot.used = false
         end
       end
@@ -1788,7 +1974,7 @@ function Display.TimedGlowHolder(native, data, index, frame)
     late.clip = CreateFrame("Frame", nil, Display.ElementHolder(native), "DisableUntrustedLayoutScriptsTemplate")
     late.clip:SetClipsChildren(true)
     late.holder = CreateFrame("Frame", nil, late.clip)
-    late.holder:SetAllPoints(native.button)
+    late.holder:SetAllPoints(Display.Box(native))
     native.lateGlow = late
   end
   local width, height = Display.Dimensions(data)
@@ -1801,7 +1987,7 @@ function Display.TimedGlowHolder(native, data, index, frame)
     -- as the whole sprite sheet instead of frame by frame.
     late.exact, late.margin = x, margin
     late.clip:ClearAllPoints()
-    late.clip:SetAllPoints(native.button)
+    late.clip:SetAllPoints(Display.Box(native))
     late.clip:SetFrameLevel(frame:GetFrameLevel() + 1)
     late.clip:Show()
     return late.holder
@@ -1812,12 +1998,12 @@ function Display.TimedGlowHolder(native, data, index, frame)
   late.clip:ClearAllPoints()
   if above then
     -- Open from the icon's left edge while more than x seconds are left.
-    late.bar:SetPoint("LEFT", native.button, "LEFT", -margin - x * k, 0)
+    late.bar:SetPoint("LEFT", Display.Box(native), "LEFT", -margin - x * k, 0)
     late.clip:SetPoint("TOPLEFT", late.bar, "TOPLEFT", x * k, 0)
     late.clip:SetPoint("BOTTOMRIGHT", late.bar:GetStatusBarTexture(), "BOTTOMRIGHT")
   else
     -- Open towards the icon's right edge once fewer than x seconds are left.
-    late.bar:SetPoint("LEFT", native.button, "RIGHT", margin - x * k, 0)
+    late.bar:SetPoint("LEFT", Display.Box(native), "RIGHT", margin - x * k, 0)
     late.clip:SetPoint("TOPLEFT", late.bar:GetStatusBarTexture(), "TOPRIGHT")
     late.clip:SetPoint("BOTTOMRIGHT", late.bar, "BOTTOMLEFT", x * k, 0)
   end
@@ -1841,6 +2027,7 @@ function Display.StyleRemainingList(native, data)
   native.remainingHidesIcon = true
   native.button:ClearIcon(); native.icon:Hide()
   native.button:ClearDurationCooldown(); native.cooldown:Hide()
+  if native.countdownTextHolder then native.countdownTextHolder:Hide(); native.countdownDefaultNumbers = nil end
   native.button:ClearApplicationCount(); native.button:ClearSpellName()
   native.border:Hide()
   for index, element in ipairs(data.subRegions or {}) do
@@ -2097,11 +2284,18 @@ function Display.StackFilterProblem(data, trigger)
     return L["Stack Count can't anchor to unit frames or nameplates."]
   end
   -- Without data: Remaining Time on any display type needs the clip too.
-  if Display.IsSingle(trigger) then
+  -- ForeverAuras (cell chain, dev.55): except a Remaining Time LIST (bars,
+  -- textures, texts) with Stack Count >= n in an opted-in row, which the
+  -- chain draws together (ChainAllowsConjunction, as for Total Duration).
+  if Display.IsSingle(trigger) and not (Display.ChainAllowsConjunction and Display.ChainAllowsConjunction(data, trigger)) then
     return L["Stack Count only works with Show On: Aura(s) Found, without Remaining Time."]
   end
   -- Both filters need the one clip around the button.
-  if Display.GateRange(data, trigger) then
+  -- ForeverAuras (cell chain, dev.40 review): except where the chain draws
+  -- them together, a Stack Count >= n with a Total Duration = / >= on a
+  -- Found list in an opted-in row (SecretAuraChain.lua,
+  -- ChainAllowsConjunction reads no gate reader: no recursion).
+  if Display.GateRange(data, trigger) and not (Display.ChainAllowsConjunction and Display.ChainAllowsConjunction(data, trigger)) then
     return L["Stack Count can't be combined with Total Duration = or >=."]
   end
   if not (C_AuraContainerUtil and C_AuraContainerUtil.ProcessCustomAuraButtonApplicationBarOptions) then
@@ -2233,8 +2427,46 @@ Display.GateFill, Display.PlaceGateText, Display.AnchorGateClip = GateFill, Plac
 
 -- Stack Count "=": the hidden stack text decides the clip, so every drawn
 -- aura has exactly n stacks. Returns true when drawn.
+-- ForeverAuras (dev.56): whether the display shows a %s stack text (the
+-- button's one application-count binding is its; a gate that takes the
+-- binding for an unknown count cannot keep it: SecretAuraChain.lua).
+function Display.UsesStackText(data)
+  if not (data and Display.TextKind) then return false end
+  -- Decided ONCE from the settings and their condition plan, the same for
+  -- construction, styling, finishing and the editor (dev.57, Astra's dev.56
+  -- review): a %s text that a condition can show is allocated and bound
+  -- before combat whatever its current visibility (PrepareConditionAppearance
+  -- marks it visible for the styling), so it needs the binding; a hidden %s
+  -- text no condition touches does not.
+  -- (Read, not copied: the same predicate the preparation uses,
+  -- Display.ConditionShowsElement; Astra's dev.57 note.)
+  if data.regionType == "text" and Display.TextKind(data.displayText) == "stack" then return true end
+  for index, element in ipairs(data.subRegions or {}) do
+    if element.type == "subtext" and Display.TextKind(element.text_text) == "stack"
+      and (element.text_visible ~= false or (Display.ConditionShowsElement and Display.ConditionShowsElement(data, index))) then
+      return true
+    end
+  end
+  return false
+end
+-- The %s text lost its binding to the gate. The count is known (an exact
+-- gate), so it is written as plain text with the display's stack conditions
+-- applied. Shared with the chain's = n cell (SecretAuraChain.lua, dev.56).
+local function HandOffStackText(native, data, n)
+  for index, element in ipairs(data.subRegions or {}) do
+    if element.type == "subtext" and Display.TextKind(element.text_text) == "stack" then
+      local entry = native.sharedElements and native.sharedElements[index]
+      if entry and entry.text then entry.text:SetText(Display.StackTextFor(data, "sub." .. index .. ".text_color", n)) end
+    end
+  end
+  if native.mainText and data.regionType == "text" and Display.TextKind(data.displayText) == "stack" then
+    native.mainText:SetText(Display.StackTextFor(data, "color", n))
+  end
+end
+Display.HandOffStackText = HandOffStackText
 local function StyleExactStackGate(native, data, n)
   local button, clip = native.button, native.gateClip
+  local box = Display.Box(native)
   local width, height = Display.Dimensions(data)
   local size, fill, margin = GateFill(width, height)
   -- Open at exactly n; integers only, so the range n..n closes again at n + 1.
@@ -2249,7 +2481,7 @@ local function StyleExactStackGate(native, data, n)
     text:SetFont(STANDARD_TEXT_FONT, size, "")
     text:SetWordWrap(false)
     text:SetWidth(0)
-    PlaceGateText(text, button, margin)
+    PlaceGateText(text, box, margin)
     -- Always invisible: only its size matters. Blizzard only sets its text.
     text:SetTextColor(0, 0, 0, 0)
     text:SetAlpha(0)
@@ -2262,18 +2494,8 @@ local function StyleExactStackGate(native, data, n)
   end
   text:Show()
   Display.ClipChildren(clip)
-  AnchorGateClip(clip, text, button, margin)
-  -- The %s text lost its binding to the gate. The count is known, so it is
-  -- written as plain text with the display's stack conditions applied.
-  for index, element in ipairs(data.subRegions or {}) do
-    if element.type == "subtext" and Display.TextKind(element.text_text) == "stack" then
-      local entry = native.sharedElements and native.sharedElements[index]
-      if entry and entry.text then entry.text:SetText(Display.StackTextFor(data, "sub." .. index .. ".text_color", n)) end
-    end
-  end
-  if native.mainText and data.regionType == "text" and Display.TextKind(data.displayText) == "stack" then
-    native.mainText:SetText(Display.StackTextFor(data, "color", n))
-  end
+  AnchorGateClip(clip, text, box, margin)
+  HandOffStackText(native, data, n)
   return true
 end
 
@@ -2330,6 +2552,19 @@ local function StyleStackGate(native, data, trigger)
     return false
   end
   return true
+end
+
+-- ForeverAuras (cell chain, dev.40 review): the ordinary Stack Count gate's
+-- parts released outright (StyleStackGate with a nil trigger resolves the
+-- configured filter and would build the bar again beside the chain's).
+-- The bar's binding is cleared where the client allows it; the chain's own
+-- SetApplicationBar replaces it either way.
+local function ReleaseStackGate(native)
+  if native.stackGateText then native.stackGateText:Hide() end
+  if native.stackGate then
+    pcall(native.button.ClearApplicationBar, native.button)
+    native.stackGate:Hide()
+  end
 end
 
 -- Width of a run of n W's in the gate font, measured on a hidden text.
@@ -2390,40 +2625,203 @@ end
 -- display (TimedGlowHolder): no filter uses the gate text, so it is bound to the time
 -- left and is a block while fewer than X seconds remain, empty otherwise; the
 -- glow's clip hangs on it. The button's own clip is left to the stack gate.
-local function StyleGlowGate(native, data)
+-- ForeverAuras 1.2.1 (dev.115, Astra's secondary-binding route): a timed chain (Total Duration or Remaining
+-- Time cell) keeps the button's one duration-text binding for the cell, so its "Remaining Time < X" glow
+-- gets a duration-text binding of the ADDON's own (C_DurationUtil.CreateDurationTextBinding) on the gate
+-- text, fed the same aura's live duration object through the button's duration bar (late.bar, bound with
+-- SetDurationBar; GetTimerDuration hands the object out without reading a value). Owned per record:
+-- disabled before every restyle, when the condition leaves, at retirement and cleanup (ClearDurationText
+-- does not reach it); a failed disable keeps the owner for the next attempt. Nothing of the cell's binding
+-- is touched; a refusal hides the glow's clip and says so.
+Display.GlowGateViaBinding = C_DurationUtil ~= nil and type(C_DurationUtil.CreateDurationTextBinding) == "function"
+function Display.DescribeSecretError(err)
+  if issecretvalue(err) then return "secret error" end
+  local ok, text = pcall(tostring, err)
+  return ok and text or "unprintable error"
+end
+function Display.DisableGlowBinding(native, suspended)
+  local owner = native.glowBinding
+  if not owner or not owner.binding then return true end
+  -- Quiet retains a fully configured binding for cheap reactivation. Restyle,
+  -- removal and failure invalidate it, so they can never revive an old glow.
+  owner.resumePending = suspended and owner.ready == true or nil
+  if not suspended then owner.ready = nil end
+  local ok, err = pcall(owner.binding.SetEnabled, owner.binding, false)
+  owner.cleanupPending = (not ok) or nil
+  owner.armed = false
+  return ok, err
+end
+function Display.ResumeGlowBinding(native)
+  local owner = native.glowBinding
+  if not owner or not owner.resumePending then return true end
+  if not owner.ready or not owner.binding then owner.resumePending = nil; return true end
+  -- Native assignments can change while quiet, when the hook deliberately
+  -- forwards nothing. Re-read the receiver once on this lifecycle transition;
+  -- never inspect duration numbers and never poll it between transitions.
+  local ok, duration = pcall(function() return owner.receiver:GetTimerDuration() end)
+  local err
+  if not ok then err = duration
+  elseif issecretvalue(duration) then ok, err = false, "the duration object reference is secret"
+  elseif duration == nil then ok, err = false, "no duration object"
+  else ok, err = pcall(owner.binding.SetDuration, owner.binding, duration) end
+  if ok then ok, err = pcall(owner.binding.SetEnabled, owner.binding, true) end
+  if ok then
+    owner.armed, owner.resumePending, owner.cleanupPending, owner.resumeError = true, nil, nil, nil
+  else
+    owner.resumeError = Display.DescribeSecretError(err)
+  end
+  return ok, err
+end
+-- (the caller sets native.glowGateViaBinding for the route on the addon's own binding; the header is kept
+-- as the lifecycle fixtures cut it)
+local function WriteGlowGate(native, data, viaBinding)
   local late, gate, button = native.lateGlow, native.gateText, native.button
+  -- Geometry (the text's place, the clip's height) follows the visual box
+  -- (Display.Box: a Grid member's offset box); the text itself stays the
+  -- button's, and the binding is the button's.
+  local box = Display.Box(native)
   local width, height = Display.Dimensions(data)
   -- The run of W's spans the glow's reach (margin) plus the gate's own margin.
   local size, fill, gateMargin = GateFill(width + 2 * late.margin, height + 2 * late.margin)
   local formatter, err = GateFormatter(0, late.exact, fill)
   local ok = formatter ~= nil
+  local step
   if ok then
     gate:SetFont(STANDARD_TEXT_FONT, size, "")
     gate:SetWordWrap(false)
     gate:SetWidth(0)
     gate:ClearAllPoints()
     gate:SetJustifyH("LEFT")
-    gate:SetPoint("LEFT", button, "LEFT", -late.margin - gateMargin, 0)
+    gate:SetPoint("LEFT", box, "LEFT", -late.margin - gateMargin, 0)
     -- Always transparent: only its size matters.
     if not invisibleCurve then
       invisibleCurve = C_CurveUtil.CreateColorCurve()
       invisibleCurve:SetType(Enum.LuaCurveType.Step)
       invisibleCurve:AddPoint(0, CreateColor(0, 0, 0, 0))
     end
-    ok, err = pcall(button.SetDurationText, button, gate, {
-      textFormat = {formatString = "{}", components = {{property = Enum.DurationTextBindingProperty.RemainingDuration, formatter = formatter}}},
-      textColor = {curve = invisibleCurve, property = Enum.DurationTextBindingProperty.RemainingDuration},
-    })
+    local components = {{property = Enum.DurationTextBindingProperty.RemainingDuration, formatter = formatter}}
+    if viaBinding then
+      -- the glow's clip is anchored BEFORE the binding is attached (the proposal's order)
+      AnchorGateClip(late.clip, gate, box, late.margin + gateMargin)
+      local owner = native.glowBinding or {}
+      native.glowBinding = owner
+      ok, err = Display.DisableGlowBinding(native)
+      step = "disable the earlier glow binding"
+      if ok then
+        step = "configure the glow binding"
+        ok, err = pcall(function()
+          if not owner.binding then owner.binding = C_DurationUtil.CreateDurationTextBinding() end
+          local binding = owner.binding
+          binding:SetEnabled(false)
+          binding:SetFontString(gate)
+          binding:SetTextFormat("{}", components)
+          binding:SetZeroDurationText("")
+          binding:SetExpiredText("")
+          binding:SetUpdateInterval(0)   -- the engine's binding update, no Lua OnUpdate
+          binding:SetTextColorCurve(invisibleCurve, Enum.DurationTextBindingProperty.RemainingDuration)
+        end)
+      end
+      -- the receiver: the icon's transparent late.bar, bound to the aura's time (a visual bar keeps its own)
+      local receiver
+      if ok then
+        local usesVisibleBar = data.regionType == "aurabar"
+          or (data.regionType == "progresstexture" and not (data.blizzardAuraDisplay and data.blizzardAuraDisplay.staticProgress))
+        if usesVisibleBar and native.bar then
+          receiver = native.bar
+        else
+          receiver = late.bar
+          step = "bind the glow's duration receiver"
+          ok, err = pcall(button.SetDurationBar, button, late.bar, {direction = Enum.StatusBarTimerDirection.RemainingTime})
+        end
+      end
+      local duration
+      if ok then
+        step = "read the duration object"
+        ok, duration = pcall(receiver.GetTimerDuration, receiver)
+        -- A secret reference must not reach even the nil comparison in an error message.
+        if not ok then err = duration
+        elseif issecretvalue(duration) then ok, err = false, "the duration object reference is secret"
+        elseif duration == nil then ok, err = false, "no duration object" end
+      end
+      if ok then
+        step = "attach the duration object"
+        ok, err = pcall(owner.binding.SetDuration, owner.binding, duration)
+      end
+      if ok then
+        step = "enable the glow binding"
+        ok, err = pcall(owner.binding.SetEnabled, owner.binding, true)
+        owner.armed = ok or nil
+      end
+      -- A native assignment may occur after styling or while this binding is
+      -- paused. Forward later receiver assignments while armed, and re-read
+      -- once when resuming. Getter identity alone does not establish liveness;
+      -- delivery through the native wrapper still needs an observed hook call.
+      -- The hook is installed once and does no per-frame polling.
+      if ok and not receiver.faGlowConduit then
+        local conduit = {}
+        local okH, errH = pcall(hooksecurefunc, receiver, "SetTimerDuration", function(_, object)
+          local current = conduit.owner
+          -- (dev.119, Astra's dev.118 review) the call is reported whether or not the owner is armed, so a
+          -- hook that fires while the glow is paused is still seen under /fa cells debug
+          conduit.calls = (conduit.calls or 0) + 1
+          if Display.BuildReport and conduit.calls <= 3 then
+            Display.BuildReport(("%s: the receiver's SetTimerDuration called by the client (%d; owner %s)"):format(tostring(current and current.id), conduit.calls,
+              current and (current.armed and "armed" or "paused") or "none"))
+          end
+          if not (current and current.armed and current.binding and current.receiver == receiver) then return end
+          if issecretvalue(object) or object == nil then return end
+          local okF, errF = pcall(current.binding.SetDuration, current.binding, object)
+          if okF then
+            current.forwarded = (current.forwarded or 0) + 1
+            if Display.BuildReport and current.forwarded <= 2 then Display.BuildReport(("%s: the glow's duration object forwarded by the hook (%d)"):format(tostring(current.id), current.forwarded)) end
+          elseif Display.BuildReport then
+            Display.BuildReport(("%s: the hook's forward was refused: %s"):format(tostring(current.id), Display.DescribeSecretError(errF)))
+          end
+        end)
+        if okH then receiver.faGlowConduit = conduit
+        else step = "hook the glow's duration receiver"; ok, err = false, errH end
+      end
+      if ok then
+        owner.id, owner.receiver = data.id, receiver
+        receiver.faGlowConduit.owner = owner
+        if Display.BuildReport then Display.BuildReport(("%s: glow binding attached (duration object; hook armed)"):format(tostring(data.id))) end
+      end
+    else
+      step = "bind the glow text"
+      ok, err = pcall(button.SetDurationText, button, gate, {
+        textFormat = {formatString = "{}", components = components},
+        textColor = {curve = invisibleCurve, property = Enum.DurationTextBindingProperty.RemainingDuration},
+      })
+    end
   end
   if not ok then
-    Warn(data, "Blizzard refused the Remaining Time glow: " .. tostring(err))
-    gate:Hide()
+    Warn(data, "Blizzard refused the Remaining Time glow" .. (step and (" (" .. step .. ")") or "") .. ": " .. Display.DescribeSecretError(err))
+    if viaBinding then Display.DisableGlowBinding(native) end
+    pcall(gate.Hide, gate)
+    pcall(late.clip.Hide, late.clip)
     return false
   end
   gate:Show()
-  AnchorGateClip(late.clip, gate, button, late.margin + gateMargin)
+  if not viaBinding then AnchorGateClip(late.clip, gate, box, late.margin + gateMargin) end
   late.clip:Show()
+  if viaBinding then native.glowBinding.ready = true end
   return true
+end
+
+
+-- Geometry and final visibility writes can refuse too. Clear the transient route
+-- on failure, and quiet the owned binding on every raised exit.
+local function StyleGlowGate(native, data)
+  local viaBinding = native.glowGateViaBinding
+  local ok, result = pcall(WriteGlowGate, native, data, viaBinding)
+  if ok and result then return result end
+  native.glowGateViaBinding = nil
+  if ok then return result end
+  if viaBinding then Display.DisableGlowBinding(native) end
+  if native.gateText then pcall(function() native.gateText:Hide() end) end
+  if native.lateGlow then pcall(function() native.lateGlow.clip:Hide() end) end
+  Warn(data, "Blizzard refused the Remaining Time glow: " .. Display.DescribeSecretError(result))
+  return false
 end
 
 -- The %p text lost its binding to the gate, so it is hidden and, when
@@ -2431,10 +2829,11 @@ end
 -- place; the numbers start at `minimum` seconds of total duration.
 local function HandOffCountdown(native, data, numbers, minimum)
   local button = native.button
-  local countdown, settings, prefix
+  local countdown, settings, prefix, property, countdownFrame
   if native.mainText and data.regionType == "text" and Display.TextKind(data.displayText) == "duration" then
     native.mainText:Hide()
-    countdown, prefix = data, "displayText_format_p_time_"
+    countdownFrame = native.elementFrames and native.elementFrames.sharedBase
+    countdown, prefix, property = data, "displayText_format_p_time_", "color"
     settings = {textFont = data.font, textSize = data.fontSize, textColor = data.color, textOutline = data.outline,
       textJustify = data.justify, textShadowColor = data.shadowColor, textShadowX = data.shadowXOffset, textShadowY = data.shadowYOffset}
   end
@@ -2443,7 +2842,8 @@ local function HandOffCountdown(native, data, numbers, minimum)
       local entry = native.sharedElements and native.sharedElements[index]
       if entry and entry.text then entry.text:Hide() end
       if element.text_visible ~= false and not countdown then
-        countdown, settings, prefix = element, Display.TextSettings(element), "text_text_format_p_time_"
+        countdown, settings, prefix, property = element, Display.TextSettings(element), "text_text_format_p_time_", "sub." .. index .. ".text_color"
+        countdownFrame = native.elementFrames and native.elementFrames["shared" .. index]
       end
     end
   end
@@ -2456,8 +2856,6 @@ local function HandOffCountdown(native, data, numbers, minimum)
       cooldown:SetAllPoints(button)
     end
     if data.regionType ~= "icon" or data.cooldown == false then
-      -- Above every element frame (ElementFrame levels: button + index * 3 + 3).
-      cooldown:SetFrameLevel(button:GetFrameLevel() + #(data.subRegions or {}) * 3 + 6)
       cooldown:SetDrawSwipe(false)
       cooldown:SetDrawEdge(false)
     end
@@ -2473,21 +2871,113 @@ local function HandOffCountdown(native, data, numbers, minimum)
     cooldown:SetMinimumCountdownDuration(minimum * 1000)
     -- The numbers take the %p text's font, colour, position and time format.
     local numbers = cooldown:GetCountdownFontString()
-    if numbers then Display.StyleText(numbers, native, settings, "text", 18, "CENTER", 0, 0) end
+    local holder = native.countdownTextHolder
+    if not numbers or not holder or not countdownFrame then error("countdown text layer was not prepared", 0) end
+    holder:SetFrameLevel(countdownFrame:GetFrameLevel())
+    Display.StyleText(numbers, native, settings, "text", 18, "CENTER", 0, 0)
     local format = countdown[prefix .. "format"]
     cooldown:SetCountdownFormatter(nil)
-    if format ~= nil and format ~= -1 and Private.GetDurationTextFormatter then
-      pcall(cooldown.SetCountdownFormatter, cooldown, Private.GetDurationTextFormatter(countdown[prefix .. "legacy_floor"] and 0 or 99,
-        countdown[prefix .. "dynamic_threshold"] or 3, countdown[prefix .. "precision"] or 1, format == -2, format))
+    -- ForeverAuras 1.2.1 (Astra's editor review 2): the text's Remaining Time conditions ride on the
+    -- numbers' formatter (Display.CountdownConditionStyle); a condition the formatter cannot carry, or a
+    -- formatter the client rejects, is said in the editor instead of silently showing an unconditioned
+    -- countdown
+    local textStyle, unsupported
+    if Display.CountdownConditionStyle and property then textStyle, unsupported = Display.CountdownConditionStyle(data, property) end
+    local problem
+    if textStyle and (format == nil or format == -1) then
+      problem = L["This display's countdown is drawn by the game's cooldown numbers (a packed row): its Remaining Time conditions need a Time Format other than the default."]
+    elseif unsupported then
+      problem = L["This display's countdown is drawn by the game's cooldown numbers (a packed row): its Remaining Time conditions can only colour the text (opaque colours) or hide it, with < or >= in seconds (%s)."]:format(tostring(unsupported))
     end
+    if format ~= nil and format ~= -1 and Private.GetDurationTextFormatter then
+      local okF, errF = pcall(cooldown.SetCountdownFormatter, cooldown, Private.GetDurationTextFormatter(countdown[prefix .. "legacy_floor"] and 0 or 99,
+        countdown[prefix .. "dynamic_threshold"] or 3, countdown[prefix .. "precision"] or 1, format == -2, format, textStyle))
+      if not okF and textStyle then
+        problem = L["Blizzard refused the countdown formatter carrying this display's Remaining Time conditions: %s"]:format(tostring(errF))
+      end
+    end
+    if data.uid and Private.AuraWarnings and Private.AuraWarnings.UpdateWarning and not native.preview then
+      Private.AuraWarnings.UpdateWarning(data.uid, "blizzard_aura_countdown_conditions", problem and "warning" or nil, problem)
+    end
+    native.countdownDefaultNumbers = nil
+    holder:Show()
     button:SetDurationCooldown(cooldown)
   end
 end
+
+Display.HandOffCountdown = HandOffCountdown
 
 -- Called at the end of StyleAppearance for every live list button.
 function Display.StyleDurationGate(native, data)
   if native.preview or not native.gateClip then return end
   local clip, gate, button = native.gateClip, native.gateText, native.button
+  -- ForeverAuras (cell chain, SecretAuraChain.lua): a filtered list in an
+  -- opted-in row is chained instead: this record's cell length and artwork
+  -- visibility come from one bound element; the ordinary gate text, stack
+  -- bar and measuring slot are not used. The chain is measured once per
+  -- apply on the first record. A refused write or measurement is handed to
+  -- the chain's failure contract (NoteChainFailure, dev.40 review: raised
+  -- in a probe build, counted and a bounded re-apply asked for otherwise);
+  -- a record past the batch is hidden (NoteChainOverflow). A stack-only
+  -- chain keeps its "Remaining Time < X" glow condition (StyleGlowGate on
+  -- the translated box, inside the cell's clip) and countdown hand-off.
+  local spec = Display.FlowChain and native.region and Display.FlowChain(data)
+  if spec then
+    local region, owner, instance = native.region, native.region.blizzardAuraDisplay, native.instance
+    if native.record and native.record > (Display.CHAIN_RECORDS or 10) then
+      if Display.NoteChainOverflow then Display.NoteChainOverflow(region, native) end
+      return
+    end
+    ReleaseStackGate(native)
+    gate:Hide()
+    local calib, why = owner and owner.chainCalib, nil
+    if not calib then calib, why = Display.ChainCalibrate(region, data, owner or native); if owner then owner.chainCalib = calib end end
+    local ok, err = calib ~= nil, why
+    if ok then
+      local previous = instance and native.record and native.record > 1 and instance.buttons[native.record - 1] or nil
+      ok, err = Display.StyleChainLink(native, region, data, spec, calib, previous)
+    end
+    if not ok then
+      -- This record too (it may not be in the instance's list yet).
+      Display.NoteChainFailure(region, instance, "link", err, native)
+      return
+    end
+    -- ForeverAuras (dev.56): a = n cell took the count binding; the known
+    -- count is written to the display's %s texts as the ordinary gate does.
+    if spec.count and spec.stackKind == "exactly" then HandOffStackText(native, data, spec.stacks) end
+    if spec.duration then
+      HandOffCountdown(native, data, true, spec.duration.lower)
+      -- (dev.115) a timed chain's "Remaining Time < X" glow on the addon's own binding (StyleGlowGate)
+      if native.lateGlow and native.lateGlow.exact and Display.GlowGateViaBinding then native.glowGateViaBinding = true; StyleGlowGate(native, data); native.glowGateViaBinding = nil end
+    elseif spec.remaining then
+      -- ForeverAuras (dev.55): a Remaining Time list (bars, textures,
+      -- texts): the countdown numbers as the ordinary remaining gate's.
+      HandOffCountdown(native, data, true, 0)
+      if native.lateGlow and native.lateGlow.exact and Display.GlowGateViaBinding then native.glowGateViaBinding = true; StyleGlowGate(native, data); native.glowGateViaBinding = nil end
+    else
+      native.cooldown:SetUseAuraDisplayTime(false); native.cooldown:SetMinimumCountdownDuration(0); native.cooldown:SetCountdownFormatter(nil)
+      if native.lateGlow and native.lateGlow.exact and StyleGlowGate(native, data) then
+        HandOffCountdown(native, data, true, 0)
+      end
+    end
+    -- A record the client adds after the apply (a raised frame count; not
+    -- in the instance's list yet, unlike a record styled again by an
+    -- apply): the member's end moves to it. ApplyInstance finishes the
+    -- apply's own.
+    if instance and instance.applied and native.record and instance.buttons[native.record] ~= native and Display.FinishChain then
+      local okEnd, whyEnd = Display.FinishChain(region, instance, calib, native)
+      if not okEnd then
+        Display.NoteChainFailure(region, instance, "end", whyEnd, native)
+      elseif Display.CompleteChain then
+        -- Whole outside an apply: the end is published to the followers and
+        -- the failure state closed here, if the followers take it
+        -- (dev.43/44 reviews); the incoming record is part of the transaction.
+        Display.CompleteChain(region, instance, native)
+      end
+    end
+    return
+  end
+  local box = Display.Box(native)
   local trigger = Display.GetTrigger(data)
   local width, height = Display.Dimensions(data)
   local lower, upper = Display.DurationGate(data, trigger)
@@ -2538,7 +3028,7 @@ function Display.StyleDurationGate(native, data)
     gate:SetWordWrap(false)
     -- No fixed width: the text's own width follows what the formatter writes.
     gate:SetWidth(0)
-    PlaceGateText(gate, button, margin)
+    PlaceGateText(gate, box, margin)
     -- Always transparent: only its size matters.
     if not invisibleCurve then
       invisibleCurve = C_CurveUtil.CreateColorCurve()
@@ -2563,11 +3053,11 @@ function Display.StyleDurationGate(native, data)
   if combined then
     -- Gate: open from the display's edge once the text is wider than the
     -- glow's part alone. Glow: once it is wider than the gate's part alone.
-    AnchorEdgeClip(clip, gate, button, margin, -1.5 * combined.unit)
-    AnchorEdgeClip(late.clip, gate, button, margin, -2.5 * combined.unit)
+    AnchorEdgeClip(clip, gate, box, margin, -1.5 * combined.unit)
+    AnchorEdgeClip(late.clip, gate, box, margin, -2.5 * combined.unit)
     late.clip:Show()
   else
-    AnchorGateClip(clip, gate, button, margin)
+    AnchorGateClip(clip, gate, box, margin)
     -- A glow that could not share the text stays hidden rather than always on.
     if late and late.exact then
       late.clip:Hide()
@@ -2625,8 +3115,13 @@ function Display.ConfigureSingle(instance, region, data, index)
   -- Parts no longer configured stop matching auras.
   for key, slot in pairs(single.slots or {}) do
     if not slot.used then
-      pcall(instance.container.SetAuraSlotEnabled, instance.container, key, false)
-      for _, entry in pairs(slot.glows or {}) do Display.ClearElementGlow(entry) end
+      -- (dev.92, Astra's dev.90 review) the disable is written once per slot: the client refreshes the whole
+      -- container on every SetAuraSlotEnabled, even to the state the slot already has (the list's buttons
+      -- handed out again); a slot enabled again (EnsureSlot) starts afresh
+      if slot.enabledApplied ~= false and pcall(instance.container.SetAuraSlotEnabled, instance.container, key, false) then slot.enabledApplied = false end
+      -- ForeverAuras: under pcall, as ReleaseSlotDrawing: a slot made in
+      -- combat is locked until the restrictions end.
+      for _, entry in pairs(slot.glows or {}) do pcall(Display.ClearElementGlow, entry) end
       -- ForeverAuras: what the slot last drew is cleared too (see ReleaseSlotDrawing).
       ReleaseSlotDrawing(slot)
     end
@@ -2635,14 +3130,66 @@ function Display.ConfigureSingle(instance, region, data, index)
   -- buttons made invisible. Otherwise the list draws (Remaining Time styles it).
   local listDraws = not isSingle or Display.ShowOn(trigger) ~= "showOnMissing"
   single.listDisabled = not listDraws
-  if instance.slotMain then
-    instance.container:SetAuraSlotEnabled("Auras", listDraws)
-  else
-    instance.container:SetAuraGroupEnabled("Auras", listDraws)
+  -- ForeverAuras (dev.90): the enabled state is written only when it changes
+  -- (the client resets every aura's button on that write, even to the same
+  -- value; a chained member's cells then show the same auras in another
+  -- order). Recorded after the write went through; a container made new
+  -- starts afresh (a new instance, a new single table).
+  if single.listEnabledApplied ~= listDraws or single.listEnabledOn ~= instance.container then
+    if instance.slotMain then
+      instance.container:SetAuraSlotEnabled("Auras", listDraws)
+    else
+      instance.container:SetAuraGroupEnabled("Auras", listDraws)
+    end
+    single.listEnabledApplied, single.listEnabledOn = listDraws, instance.container
   end
+  -- ForeverAuras (combat-reload probe): in a probe build (a display first
+  -- built under restrictions) a button the client has already restricted
+  -- refuses this; the list is disabled above and draws nothing meanwhile,
+  -- so the alpha is set when the restrictions end (ApplyPendingListAlpha,
+  -- kept pending until it succeeds). Other builds raise as before.
+  local probe = region.blizzardAuraDisplay and region.blizzardAuraDisplay.probeBuild
+  -- ForeverAuras (dev.85, Dan's combat re-entry): an ORDINARY build under
+  -- restrictions too (a display built again while they returned, its old
+  -- buttons forbidden by then: "calling 'SetAlpha' on bad self" from the
+  -- reserve loop, the reserve then set aside and retried). The refused
+  -- alpha is kept pending the same way and set when restrictions end.
+  local guarded = probe or InCombatLockdown() or (C_Secrets and C_Secrets.ShouldAurasBeSecret())
+  alphaPending[instance] = nil
   for _, button in ipairs(instance.buttons or {}) do
     -- A flashing button rests at alpha 0 (BlizzardAuraDisplay.lua, StyleFlash).
-    button.button:SetAlpha((listDraws and not Display.FlashRests(button)) and 1 or 0)
+    local alpha = (listDraws and not Display.FlashRests(button)) and 1 or 0
+    if guarded then
+      if not pcall(button.button.SetAlpha, button.button, alpha) then alphaPending[instance] = true end
+    else
+      button.button:SetAlpha(alpha)
+    end
+  end
+end
+
+-- ForeverAuras (combat-reload probe): an instance discarded by a stopped
+-- build needs no repair (AbandonProbeBuild, BlizzardAuraDisplay.lua); an
+-- unloaded instance kept for reuse keeps its pending repair.
+function Display.CancelPendingListAlpha(instance)
+  alphaPending[instance] = nil
+end
+
+-- ForeverAuras (combat-reload probe): the list buttons' alpha a probe build
+-- could not set (above): only the instances that still need it are kept
+-- (alphaPending), and one stays pending until every button took the alpha.
+function Display.ApplyPendingListAlpha()
+  for instance in pairs(alphaPending) do
+    local single = instance.single
+    if not single then
+      alphaPending[instance] = nil
+    else
+      local listDraws = not single.listDisabled
+      local done = true
+      for _, button in ipairs(instance.buttons or {}) do
+        if not pcall(button.button.SetAlpha, button.button, (listDraws and not Display.FlashRests(button)) and 1 or 0) then done = false end
+      end
+      if done then alphaPending[instance] = nil end
+    end
   end
 end
 
@@ -2764,6 +3311,25 @@ function Display.RefreshSingleStatus(instance)
   end
 end
 
+-- Content-only counterpart of RefreshSingle. It is also used when the
+-- main container is busy, so Missing/Always never keeps the old target's
+-- presence width after the live icon has already moved to the new target.
+function Display.RefreshSingleContent(instance, unit, shown, force)
+  local missing = instance.single and instance.single.missing
+  if not missing or not missing.active then return 0, 0 end
+  local accepted, refused = 0, 0
+  if not missing.erased then
+    accepted, refused = Display.RequestBoundAuraRefresh(missing.container, missing.boundUnit, unit, shown, force)
+  end
+  for _, key in ipairs({"presence", "flowShadow"}) do
+    if missing[key] and missing[key .. "Active"] then
+      local a, r = Display.RequestBoundAuraRefresh(missing[key], missing[key .. "BoundUnit"], unit, shown, force)
+      accepted, refused = accepted + a, refused + r
+    end
+  end
+  return accepted, refused
+end
+
 -- force: the unit behind the token can have changed (RefreshUnits): a shown
 -- container is enabled and refreshed again even when it stayed enabled.
 function Display.RefreshSingle(instance, unit, shown, force)
@@ -2779,7 +3345,10 @@ function Display.RefreshSingle(instance, unit, shown, force)
   local missing = instance.single and instance.single.missing
   if not missing or not missing.active then return end
   local container = missing.container
-  if Locked(container) or Locked(missing.clip) then return end
+  if Locked(container) or Locked(missing.clip) then
+    Display.RefreshSingleContent(instance, unit, shown, force)
+    return false -- keep the full unit refresh pending until layout is writable
+  end
   -- Hiding keeps the bound unit, like the aura list container, so showing the
   -- same unit again does not rebind it.
   if unit and missing.boundUnit ~= unit then
@@ -2801,6 +3370,7 @@ function Display.RefreshSingle(instance, unit, shown, force)
   if container:IsShown() ~= shown then container:SetShown(shown) end
   if enable then container:SetEnabled(shown) end
   -- The Modern Aura Group spacing and centring shadow follow the same unit.
+  local deferred = false
   for _, key in ipairs({"presence", "flowShadow"}) do
     local follower = missing[key]
     if follower and missing[key .. "Active"] and not Locked(follower) then
@@ -2813,6 +3383,9 @@ function Display.RefreshSingle(instance, unit, shown, force)
       local followerEnable = follower.faEnabled ~= shown
       if followerEnable then follower:SetEnabled(shown) end
       if shown and (followerEnable or force) then follower:UpdateAllAuras() end
+    elseif follower and missing[key .. "Active"] then
+      Display.RequestBoundAuraRefresh(follower, missing[key .. "BoundUnit"], unit, shown, force)
+      deferred = true
     end
   end
   -- A disabled container keeps its last width; the clip must not show then.
@@ -2833,6 +3406,7 @@ function Display.RefreshSingle(instance, unit, shown, force)
   -- ForeverAuras: veiled across loading screens (MissingAlpha).
   missing.clip:SetAlpha(MissingAlpha(missing, instance))
   if shown and refresh then container:UpdateAllAuras(); Private.HitchCount("UpdateAllAuras") end
+  if deferred then return false end
 end
 
 learnEvents:SetScript("OnEvent", Private.Profiled("aura (modern) - learning", learnEvents:GetScript("OnEvent")))
@@ -2841,17 +3415,50 @@ learnEvents:SetScript("OnEvent", Private.Profiled("aura (modern) - learning", le
 -- print as such. Everything goes to chat, so a report can be pasted.
 function Display.PrintDebug(id)
   local function Fmt(value)
-    if value == nil then return "nil" end
     if issecretvalue(value) then return "<secret>" end
+    if value == nil then return "nil" end
     if type(value) == "number" then return string.format("%.1f", value) end
     return tostring(value)
   end
+  local function Read(ok, value) if not ok then return "unreadable" end return Fmt(value) end
   local function Say(...) print("|cff88ccffFA modern|r " .. table.concat({...}, " ")) end
+  local function Present(value)
+    if issecretvalue(value) then return "<secret>" end
+    return Fmt(value ~= nil)
+  end
+  -- Method lookup is protected too: even indexing a forbidden frame may
+  -- raise. Refuse a secret handle or forbidden state before any other read.
+  local function Access(frame, method, field, ...)
+    if issecretvalue(frame) then return false end
+    if frame == nil then return true, nil end
+    return pcall(function(...)
+      local check = frame.IsForbidden
+      if issecretvalue(check) then error("unreadable", 0) end
+      if type(check) == "function" then
+        local forbidden = check(frame)
+        if issecretvalue(forbidden) or forbidden then error("unreadable", 0) end
+      end
+      if field then return frame[method] end
+      local read = frame[method]
+      if issecretvalue(read) or type(read) ~= "function" then error("unreadable", 0) end
+      return read(frame, ...)
+    end, ...)
+  end
+  local function Get(frame, method, ...) return Access(frame, method, false, ...) end
+  local function R(frame, method, ...) return Read(Get(frame, method, ...)) end
+  local function Field(frame, name) return Access(frame, name, true) end
+  local function Pack(...) return {n = select("#", ...), ...} end
+  local function Objects(frame, method)
+    if not issecretvalue(frame) and frame == nil then return {n = 1, true} end
+    local values = Pack(Get(frame, method))
+    if not values[1] then return nil end
+    return values
+  end
   local data = id and WeakAuras.GetData(id)
   if not data then Say("no aura named", tostring(id)); return end
   local entry = Private.regions[id]
   local region = entry and entry.region
-  Say(id, "loaded", Fmt(Private.loaded[id]), "region", Fmt(region ~= nil), "shown", Fmt(region and region:IsShown()))
+  Say(id, "loaded", Fmt(Private.loaded[id]), "region", Present(region), "shown", R(region, "IsShown"))
   local trigger = Display.GetTrigger(data)
   if not trigger then Say("no Aura (Modern) trigger"); return end
   Say("showOn", Fmt(Display.ShowOn(trigger)), "unit", Fmt(trigger.unit), "list key", Fmt(trigger.secretSpellList))
@@ -2863,68 +3470,88 @@ function Display.PrintDebug(id)
       Say("list", trigger.secretSpellList, "is NOT set")
     end
   end
-  Say("ids used", table.concat(Display.GetSpellIDs(trigger, true), ","), "icon", Fmt(Display.SingleIcon(data)))
-  local native = region and region.blizzardAuraDisplay
+  Say("ids used", table.concat(Display.GetSpellIDs(trigger, true), ","), "icon", Read(pcall(Display.SingleIcon, data)))
+  local okNative, native = Field(region, "blizzardAuraDisplay")
+  if not okNative or issecretvalue(native) then Say("native display unreadable"); return end
   if not native then Say("no native display"); return end
   Say("native active", Fmt(native.active), "instances", Fmt(native.instances and #native.instances))
   for index, instance in ipairs(native.instances or {}) do
     local single = instance.single
     local missing = single and single.missing
-    Say("instance", index, "container", Fmt(instance.container and instance.container:GetWidth()), "x", Fmt(instance.container and instance.container:GetHeight()),
-      "shown", Fmt(instance.container and instance.container:IsShown()))
+    local c = instance.container
+    Say("instance", index, "container", R(c, "GetWidth"), "x", R(c, "GetHeight"), "shown", R(c, "IsShown"), "buttons", Fmt(#(instance.buttons or {})), "client buttons", R(c, "GetAuraGroupFrameCount", "Auras"))
+    local okP, parent = Get(c, "GetParent")
+    local parentName = "unreadable"
+    if okP and not issecretvalue(parent) then
+      parentName = parent == region and "region" or (single and single.stage and parent == single.stage) and "missing stage" or parent == nil and "none" or "other"
+    elseif okP then parentName = "<secret>" end
+    Say(" container unit", Fmt(instance.boundUnit), "enabled", Read(Field(c, "faEnabled")), "parent", parentName, "visible", R(c, "IsVisible"), "alpha", R(c, "GetAlpha"), "left", R(c, "GetLeft"), "top", R(c, "GetTop"), "list disabled", Fmt(single and single.listDisabled), "alpha pending", Fmt(alphaPending[instance]), "instance visible", Fmt(instance.visible), "anchored", Fmt(instance.anchored))
+    if single and single.stage then Say(" missing stage visible", R(single.stage, "IsVisible"), "alpha", R(single.stage, "GetAlpha")) end
     if missing then
-      local c, clip = missing.container, missing.clip
+      local presence, clip = missing.container, missing.clip
       Say(" missing active", Fmt(missing.active), "erased", Fmt(missing.erased), "failed", Fmt(single.missingFailed))
-      Say(" presence container", Fmt(c and c:GetWidth()), "x", Fmt(c and c:GetHeight()), "left", Fmt(c and c:GetLeft()), "top", Fmt(c and c:GetTop()), "shown", Fmt(c and c:IsShown()))
-      Say(" clip", Fmt(clip and clip:GetWidth()), "x", Fmt(clip and clip:GetHeight()), "left", Fmt(clip and clip:GetLeft()), "top", Fmt(clip and clip:GetTop()), "shown", Fmt(clip and clip:IsShown()))
+      Say(" presence container", R(presence, "GetWidth"), "x", R(presence, "GetHeight"), "left", R(presence, "GetLeft"), "top", R(presence, "GetTop"), "shown", R(presence, "IsShown"))
+      Say(" clip", R(clip, "GetWidth"), "x", R(clip, "GetHeight"), "left", R(clip, "GetLeft"), "top", R(clip, "GetTop"), "shown", R(clip, "IsShown"))
       local sample = missing.native and missing.native.button
       local icon = missing.native and missing.native.icon
-      Say(" sample", Fmt(sample and sample:GetWidth()), "left", Fmt(sample and sample:GetLeft()), "top", Fmt(sample and sample:GetTop()), "alpha", Fmt(sample and sample:GetAlpha()), "texture", Fmt(icon and icon:GetTexture()))
-      for n = 1, (c and c.GetNumChildren and c:GetNumChildren() or 0) do
-        local child = select(n, c:GetChildren())
-        Say("  presence child", n, Fmt(child:GetWidth()), "x", Fmt(child:GetHeight()), "shown", Fmt(child:IsShown()))
-      end
+      Say(" sample", R(sample, "GetWidth"), "left", R(sample, "GetLeft"), "top", R(sample, "GetTop"), "alpha", R(sample, "GetAlpha"), "texture", R(icon, "GetTexture"))
+      local children = Objects(presence, "GetChildren")
+      if children then
+        for n = 2, children.n do
+          local child = children[n]
+          Say("  presence child", n - 1, R(child, "GetWidth"), "x", R(child, "GetHeight"), "shown", R(child, "IsShown"))
+        end
+      else Say("  presence children unreadable") end
     end
   end
-  Say("region", Fmt(region:GetWidth()), "x", Fmt(region:GetHeight()), "left", Fmt(region:GetLeft()), "top", Fmt(region:GetTop()), "scale", Fmt(region:GetEffectiveScale()))
-  -- Every font string under the display that carries text: what draws it,
-  -- where it hangs and whether it is visible, for a text that stays behind.
-  -- The font strings this file and SecretAuraAppearance.lua make are named by
-  -- their part, so a stale text can be told from a live binding.
+  Say("region", R(region, "GetWidth"), "x", R(region, "GetHeight"), "left", R(region, "GetLeft"), "top", R(region, "GetTop"), "scale", R(region, "GetEffectiveScale"))
   local labels = {}
-  local function Label(object, label) if object then labels[object] = label end end
+  local function Label(object, label)
+    if not issecretvalue(object) and object ~= nil then labels[object] = label end
+  end
   local function LabelNative(owner, prefix)
     if not owner then return end
     Label(owner.mainText, prefix .. " main text")
     Label(owner.gateText, prefix .. " gate")
-    local cooldown = owner.cooldown
-    if cooldown and cooldown.GetCountdownFontString then
-      local okN, numbers = pcall(cooldown.GetCountdownFontString, cooldown)
-      if okN then Label(numbers, prefix .. " cooldown numbers") end
-    end
-    for index, element in pairs(owner.sharedElements or {}) do
-      Label(element.text, prefix .. " element " .. tostring(index))
-    end
+    local okN, numbers = Get(owner.cooldown, "GetCountdownFontString")
+    if okN then Label(numbers, prefix .. " cooldown numbers") end
+    for index, element in pairs(owner.sharedElements or {}) do Label(element.text, prefix .. " element " .. tostring(index)) end
   end
   for index, instance in ipairs(native.instances or {}) do
     for n, button in ipairs(instance.buttons or {}) do
       LabelNative(button, "list button " .. index .. "." .. n)
-      -- Which list buttons the client is drawing: a released one that still
-      -- shows would be a text left behind.
-      local okS, shown = pcall(button.button.IsShown, button.button)
-      local okA, alpha = pcall(button.button.GetAlpha, button.button)
-      -- A secret shown state cannot be compared, only reported.
-      if okS and (issecretvalue(shown) or shown == true) then
-        Say(" list button", index .. "." .. n, "shown", Fmt(shown), "alpha", Fmt(okA and alpha))
+      local okS, shown = Get(button.button, "IsShown")
+      if not okS or issecretvalue(shown) or shown == true then
+        Say(" list button", index .. "." .. n, "shown", Read(okS, shown), "alpha", R(button.button, "GetAlpha"), "icon shown", R(button.icon, "IsShown"), "texture", R(button.icon, "GetTexture"), "gate clip", R(button.gateClip, "GetWidth"), "x", R(button.gateClip, "GetHeight"), "styled", Fmt(button.styledEarly ~= nil or button.styledAt ~= nil))
+        local box = button.box
+        local boxText = "unreadable"
+        if not issecretvalue(box) then
+          if box == nil then boxText = "none"
+          else boxText = "visible " .. R(box, "IsVisible") .. " left " .. R(box, "GetLeft") .. " top " .. R(box, "GetTop") .. " size " .. R(box, "GetWidth") .. "x" .. R(box, "GetHeight") .. " points " .. R(box, "GetNumPoints") end
+        end
+        Say("  button visible", R(button.button, "IsVisible"), "left", R(button.button, "GetLeft"), "top", R(button.button, "GetTop"), "width", R(button.button, "GetWidth"), "box", boxText)
       end
     end
+    local flow = native.flow
+    if flow then Say(" flow remain", Present(flow.remain), "shadow remain", Present(flow.shadowRemain)) end
+    for key, slot in pairs(instance.flowRemainSlots or {}) do
+      Say(" measure", tostring(key), "complete", Fmt(slot.complete), "shown", R(slot.button, "IsShown"), "text", R(slot.text, "GetText"), "back", Fmt(slot.back))
+    end
     for key, slot in pairs(instance.single and instance.single.slots or {}) do
-      local okS, shown = pcall(slot.button.IsShown, slot.button)
-      Say(" slot", tostring(key), "used", Fmt(slot.used), "shown", Fmt(okS and shown))
+      Say(" slot", tostring(key), "used", Fmt(slot.used), "shown", R(slot.button, "IsShown"))
+      local function Frame(name, frame)
+        if not issecretvalue(frame) and frame == nil then return end
+        Say("  " .. name, "visible", R(frame, "IsVisible"), "size", R(frame, "GetWidth"), "x", R(frame, "GetHeight"), "level", R(frame, "GetFrameLevel"), "alpha", R(frame, "GetAlpha"), "points", R(frame, "GetNumPoints"))
+      end
+      Frame("button", slot.button)
+      Frame("clip", slot.clip); Frame("art", slot.art); Frame("cooldown", slot.cooldown)
+      Frame("holder", slot.holder); Frame("pixel", slot.pixel); Frame("gate", slot.gate); Frame("text", slot.text)
+      for index, item in pairs(slot.borders or {}) do Frame("border " .. index, item.border) end
+      for index, item in pairs(slot.glows or {}) do Frame("glow " .. index, item.nativeGlow and item.nativeGlow.holder) end
     end
     local single = instance.single
     for key, slot in pairs(single and single.slots or {}) do
-      local used = slot.used and "" or " (unused)"
+      local used = issecretvalue(slot.used) and " (usage secret)" or slot.used and "" or " (unused)"
       Label(slot.gate, "slot " .. tostring(key) .. " gate" .. used)
       Label(slot.text, "slot " .. tostring(key) .. " artwork" .. used)
       Label(slot.probe, "slot " .. tostring(key) .. " probe" .. used)
@@ -2932,35 +3559,43 @@ function Display.PrintDebug(id)
     end
     if single and single.missing then LabelNative(single.missing.native, "missing sample") end
   end
-  for index, sample in ipairs(region.secretAuraSamples or {}) do LabelNative(sample, "preview sample " .. index) end
-  for index, frame in ipairs(region.subRegions or {}) do Label(frame.text, "WA element " .. index) end
+  local okSamples, samples = Field(region, "secretAuraSamples")
+  for index, sample in ipairs(okSamples and not issecretvalue(samples) and samples or {}) do LabelNative(sample, "preview sample " .. index) end
+  local okParts, parts = Field(region, "subRegions")
+  for index, frame in ipairs(okParts and not issecretvalue(parts) and parts or {}) do
+    local okText, text = Field(frame, "text")
+    if okText then Label(text, "WA element " .. index) end
+  end
   local count = 0
   local function Walk(frame, path, depth)
     if depth > 8 or count > 40 then return end
-    local okR, regions = pcall(function() return {frame:GetRegions()} end)
-    for _, object in ipairs(okR and regions or {}) do
-      local okT, kind = pcall(object.GetObjectType, object)
-      if okT and kind == "FontString" then
-        local okS, text = pcall(object.GetText, object)
-        -- A Blizzard aura button's text can be secret: reported, not read.
-        if okS and issecretvalue(text) then text = "<secret text>" end
-        if okS and type(text) == "string" and text ~= "" then
-          count = count + 1
-          local okV, visible = pcall(object.IsVisible, object)
-          local okA, alpha = pcall(object.GetAlpha, object)
-          local okL, left, top = pcall(function() return object:GetLeft(), object:GetTop() end)
-          if okL and (issecretvalue(left) or issecretvalue(top)) then left, top = "<secret>", "<secret>" end
-          Say(" text", string.format("%q", text), "is", labels[object] or "unknown", "at", path, "visible", Fmt(okV and visible),
-            "alpha", Fmt(okA and alpha), "left", Fmt(okL and left), "top", Fmt(okL and top))
-        end
+    local regions = Objects(frame, "GetRegions")
+    if regions then
+      for index = 2, regions.n do
+        local object = regions[index]
+        local okT, kind = Get(object, "GetObjectType")
+        if okT and not issecretvalue(kind) and kind == "FontString" then
+          local okS, text = Get(object, "GetText")
+          if okS and issecretvalue(text) then text = "<secret text>" end
+          if okS and type(text) == "string" and text ~= "" then
+            count = count + 1
+            Say(" text", string.format("%q", text), "is", labels[object] or "unknown", "at", path, "visible", R(object, "IsVisible"), "alpha", R(object, "GetAlpha"), "left", R(object, "GetLeft"), "top", R(object, "GetTop"))
+          elseif not okS then Say(" text unreadable at", path) end
+        elseif not okT or issecretvalue(kind) then Say(" region type unreadable at", path) end
       end
-    end
-    local okC, children = pcall(function() return {frame:GetChildren()} end)
-    for index, child in ipairs(okC and children or {}) do
-      local okN, name = pcall(child.GetDebugName, child)
-      if not okN or type(name) ~= "string" or issecretvalue(name) then name = nil end
-      local okF, faKind = pcall(function() return child.faEnabled ~= nil and "container" or nil end)
-      Walk(child, path .. "/" .. (name and name:match("[^.]+$") or (okF and faKind) or tostring(index)), depth + 1)
+    else Say(" regions unreadable at", path) end
+    local children = Objects(frame, "GetChildren")
+    if not children then Say(" children unreadable at", path); return end
+    for index = 2, children.n do
+      local child = children[index]
+      if issecretvalue(child) then Say(" child unreadable at", path)
+      elseif child ~= nil then
+        local okN, name = Get(child, "GetDebugName")
+        if not okN or issecretvalue(name) or type(name) ~= "string" then name = nil end
+        local okF, enabled = Field(child, "faEnabled")
+        local faKind = okF and not issecretvalue(enabled) and enabled ~= nil and "container" or nil
+        Walk(child, path .. "/" .. (name and name:match("[^.]+$") or faKind or tostring(index - 1)), depth + 1)
+      end
     end
   end
   Walk(region, "region", 0)

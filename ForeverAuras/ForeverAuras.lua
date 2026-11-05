@@ -87,7 +87,8 @@ do
     return ...
   end
   local function TimedCallback(func)
-    if type(func) ~= "function" then return func end
+    -- Keep the stop callback outside the capture it ends.
+    if type(func) ~= "function" or func == WeakAuras.StopProfile then return func end
     return function(...)
       if not Private.handlerTiming then return func(...) end
       Private.StartProfileSystem("timer callback")
@@ -225,6 +226,7 @@ function Private.PrintHelp()
   print(L["/wa pstart - Start profiling. Optionally include a duration in seconds after which profiling automatically stops. To profile the next combat/encounter, pass a \"combat\" or \"encounter\" argument."])
   print(L["/wa pstop - Finish profiling"])
   print(L["/wa pprint - Show the results from the most recent profiling"])
+  print(L["/wa pfocus <aura name> - Break that aura's time down in the next profile (no name: clear)"])
   -- Listed with the other profiling commands; plain text, not localized yet.
   print("/wa unloadall - Unload every aura until the next /reload (nothing is saved)")
   print("/wa unloadgroup <text> - Unload every group or aura whose name contains text until the next /reload (nothing is saved)")
@@ -252,6 +254,9 @@ function SlashCmdList.WeakAuras(input)
     WeakAuras.StopProfile();
   elseif msg == "pprint" then
     WeakAuras.PrintProfile();
+  elseif msg == "pfocus" then
+    -- ForeverAuras (dev.99): "/fa pfocus <aura name>" breaks one aura's time down in the next profile.
+    WeakAuras.ProfileFocus(input:match("^%s*%S+%s+(.-)%s*$"))
   elseif msg == "phitch" then
     -- Hitch capture: per-frame breakdown of slow frames, optional threshold in ms.
     -- "/fa phitch login [ms] [seconds]" arms it for the next reload instead.
@@ -259,6 +264,26 @@ function SlashCmdList.WeakAuras(input)
       WeakAuras.ArmLoginHitchCapture(args[2], args[3])
     else
       WeakAuras.ToggleHitchCapture(args[1])
+    end
+  elseif msg == "cells" then
+    -- ForeverAuras 1.2.0: row cells are on for every supported row; the
+    -- subcommands below are diagnostics (combat fallback, Centered shadow
+    -- chains, build reports), kept in the saved variables.
+    ForeverAurasSaved = ForeverAurasSaved or {}
+    if args[1] == "fallback" then
+      -- ForeverAuras (dev.70): under aura restrictions a chained display is built as one spot and chained when they end.
+      ForeverAurasSaved.rowCellsFallback = (args[2] == "on") or nil
+      print(L["Row cells combat fallback (one spot while restricted, chained when restrictions end) is %s (/fa cells fallback on|off; applies to the next build)."]:format(ForeverAurasSaved.rowCellsFallback and L["on"] or L["off"]))
+    elseif args[1] == "shadows" then
+      -- ForeverAuras (dev.76): the shadow chains of a Centered row on or off (a diagnostic switch; applies after /reload).
+      ForeverAurasSaved.rowCellsNoShadowChains = (args[2] == "off") or nil
+      print(L["Row cells shadow chains (Centered rows) are %s (/fa cells shadows on|off; applies after /reload)."]:format(ForeverAurasSaved.rowCellsNoShadowChains and L["off"] or L["on"]))
+    elseif args[1] == "debug" then
+      -- ForeverAuras (dev.64): build reports to chat (a build stopped in combat and why), no reload needed.
+      ForeverAurasSaved.rowCellsDebug = (args[2] == "on") or nil
+      print(L["Row cells build reports are %s (/fa cells debug on|off)."]:format(ForeverAurasSaved.rowCellsDebug and L["on"] or L["off"]))
+    else
+      print(L["Row cells are enabled automatically for supported Modern Aura Group rows."])
     end
   elseif msg == "unloadgroup" then
     -- Session-only: unload the top-level groups matching the rest of the line.
@@ -274,6 +299,12 @@ function SlashCmdList.WeakAuras(input)
     WeakAuras.ToggleMinimap();
   elseif msg == "loadtime" then
     Private.PrintLoadProfile()
+  elseif msg == "loadmem" then
+    -- ForeverAuras: "/fa loadmem [event]" runs one load scan as the event
+    -- would (SPELLS_CHANGED by default, with the spell lookup caches cleared
+    -- as that event clears them) and prints the displays whose load
+    -- conditions took the most time and Lua memory, with their conditions.
+    Private.PrintLoadAllocation(args[1])
   elseif msg == "help" then
     Private.PrintHelp();
   elseif msg == "cdmsetup" then
@@ -286,6 +317,28 @@ function SlashCmdList.WeakAuras(input)
     -- ForeverAuras: "/fa cdm <aura id>" prints a CDM trigger's state and
     -- what Blizzard's viewer frames and the unit's auras say, for bug reports.
     if Private.PrintCDMDebug then Private.PrintCDMDebug(input:match("^%s*%S+%s+(.-)%s*$")) end
+  elseif msg == "grid" or msg == "gridreset" or msg == "gridrebuild" then
+    -- ForeverAuras (development): "/fa grid <group>" prints a Grid's build
+    -- state; "/fa gridreset <group>" forgets it so the next build is fresh;
+    -- "/fa gridrebuild <group>" lays it out again now (SecretAuraGrid.lua).
+    -- For the combat construction tests.
+    local id = input:match("^%s*%S+%s+(.-)%s*$")
+    local Grid = Private.BlizzardAuraDisplay
+    if msg == "grid" and Grid.PrintGrid then Grid.PrintGrid(id)
+    elseif msg == "gridreset" and Grid.ResetGrid then Grid.ResetGrid(id)
+    elseif Grid.RebuildGridNow then Grid.RebuildGridNow(id) end
+  elseif msg == "carriermarks" then
+    -- ForeverAuras (development): "/fa carriermarks <group>" marks the row's
+    -- real frames with coloured squares; "/fa carriermarks off" removes them.
+    local id = input:match("^%s*%S+%s+(.-)%s*$")
+    local Flow = Private.BlizzardAuraDisplay
+    if id == "off" and Flow.UnmarkCarriers then Flow.UnmarkCarriers()
+    elseif Flow.MarkCarriers then Flow.MarkCarriers(id) end
+  elseif msg == "carriers" then
+    -- ForeverAuras (development): "/fa carriers <group>" prints the
+    -- independent-carriers state of a Modern Aura Group (SecretAuraFlow.lua).
+    local id = input:match("^%s*%S+%s+(.-)%s*$")
+    if Private.BlizzardAuraDisplay.PrintCarriers then Private.BlizzardAuraDisplay.PrintCarriers(id) end
   elseif msg == "spec" then
     -- Specialization detection report (PlayerSpecialization.lua).
     Private.PrintSpecialization()
@@ -1579,6 +1632,11 @@ function WeakAuras.IsPaused()
 end
 
 function Private.Pause()
+  -- ForeverAuras (dev.92): the live aura containers are retained through the
+  -- editor (BlizzardAuraDisplay.lua, Display.EditorRetention): the pause and
+  -- the unload-and-load of the resume would disable them, and the client then
+  -- hands their auras' buttons out again in another order.
+  if Private.BlizzardAuraDisplay and Private.BlizzardAuraDisplay.EditorRetention then Private.BlizzardAuraDisplay.EditorRetention(true) end
   -- The editor shows every display's samples: none stays faded for a missing
   -- unit (Private.SetRegionUnitGone, Aura (Modern) displays).
   for _, entry in pairs(Private.regions) do
@@ -1789,6 +1847,128 @@ local sessionUnloaded = false
 -- Set by /fa unloadgroup: auras kept unloaded until the next /reload.
 local sessionExcluded = {}
 
+-- ForeverAuras: regions made ahead of time. A display that could load on
+-- this character but does not load now (one loading in combat, say) has
+-- its region made at the moment it loads, inside the load scan: on the
+-- first pull of a session that was about half of the combat-start frame
+-- (1.2.0 profiling: "load: ensure regions" 7 ms of the 15 ms scan, the
+-- second pull 5 ms). Such displays are noted here and their regions made
+-- out of combat, a little per frame, so the first pull pays like the second.
+-- Displays set aside by /fa unloadgroup are left alone (they are excluded
+-- to measure without them). A failure is reported like one in the load
+-- scan would be (the error handler), and the half-made regions it left
+-- are dropped, so the load that follows makes them again from nothing
+-- instead of finding a frame and skipping the rest (rc.38 review).
+local prewarm, prewarmFrame = {}, nil
+local PREWARM_BUDGET = 2 -- ms per frame
+local function DropHalfMadeRegions(ids)
+  for _, id in ipairs(ids) do
+    local entry = Private.regions[id]
+    if entry then
+      if entry.region then
+        pcall(Private.BlizzardAuraDisplay.Release, entry.region)
+        pcall(entry.region.Hide, entry.region)
+        pcall(Private.UpdateCombatHideDriver, entry.region)
+      end
+      Private.regions[id] = nil
+    end
+  end
+end
+local function PrewarmOne(id)
+  -- The regions EnsureRegion will make: the display's and its parents'
+  -- without one (its own walk), noted first to drop them on a failure.
+  local made, walk = {}, id
+  while walk do
+    local data = WeakAuras.GetData(walk)
+    if not data then break end
+    made[#made + 1] = walk
+    walk = data.parent
+    if WeakAuras.GetRegion(walk) then break end
+  end
+  local ok, err = pcall(Private.EnsureRegion, id)
+  if not ok then
+    DropHalfMadeRegions(made)
+    geterrorhandler()(("ForeverAuras: %s could not be prepared: %s"):format(tostring(id), tostring(err)))
+  end
+end
+local function PrewarmRegions()
+  if not next(prewarm) then prewarmFrame:Hide() return end
+  if InCombatLockdown() then
+    -- Nothing to do in combat: the frame stops until the fight ends.
+    prewarmFrame:Hide()
+    prewarmFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
+    return
+  end
+  if Private.IsOptionsProcessingPaused() then return end
+  local started = debugprofilestop()
+  for id in pairs(prewarm) do
+    prewarm[id] = nil
+    if WeakAuras.GetData(id) and not WeakAuras.GetRegion(id) and loaded[id] == false
+      and not sessionExcluded[id] and not sessionUnloaded then
+      Private.StartProfileSystem("load: prewarm regions")
+      PrewarmOne(id)
+      Private.StopProfileSystem("load: prewarm regions")
+    end
+    if debugprofilestop() - started > PREWARM_BUDGET then return end
+  end
+  prewarmFrame:Hide()
+end
+local function QueuePrewarm(id)
+  if sessionExcluded[id] or sessionUnloaded then return end
+  prewarm[id] = true
+  if not prewarmFrame then
+    prewarmFrame = CreateFrame("Frame")
+    prewarmFrame:SetScript("OnUpdate", PrewarmRegions)
+    prewarmFrame:SetScript("OnEvent", function(self)
+      self:UnregisterEvent("PLAYER_REGEN_ENABLED")
+      self:Show()
+    end)
+  end
+  if not InCombatLockdown() then prewarmFrame:Show() else prewarmFrame:RegisterEvent("PLAYER_REGEN_ENABLED") end
+end
+
+-- ForeverAuras: /fa loadmem. While set, the scan below records each
+-- display's load-condition time and allocation here.
+Private.loadAllocation = nil
+function Private.PrintLoadAllocation(event)
+  -- Slash arguments arrive lowercased; event names are uppercase.
+  event = event and event:upper() or "SPELLS_CHANGED"
+  if not loadEvents[event] then prettyPrint(("No display loads on %s."):format(event)) return end
+  if event == "SPELLS_CHANGED" and Private.ExecEnv.WipeSpellCaches then Private.ExecEnv.WipeSpellCaches() end
+  Private.loadAllocation = {}
+  collectgarbage("stop")
+  local started, memStart = debugprofilestop(), collectgarbage("count")
+  -- The scan reports its own errors through the error handler; one is
+  -- noted here too, so a partial summary is not printed as a whole one.
+  local scanError
+  local handler = geterrorhandler()
+  seterrorhandler(function(err) scanError = scanError or err; return handler(err) end)
+  local ok, err = pcall(Private.ScanForLoads, nil, event)
+  seterrorhandler(handler)
+  local total, memTotal = debugprofilestop() - started, collectgarbage("count") - memStart
+  collectgarbage("restart")
+  local rows = Private.loadAllocation
+  Private.loadAllocation = nil
+  if not ok or scanError then prettyPrint("Load scan failed: " .. tostring(ok and scanError or err)) return end
+  local count, condTime, condMem = 0, 0, 0
+  for _, row in pairs(rows) do count = count + 1; condTime = condTime + row.ms; condMem = condMem + row.kb end
+  prettyPrint(("%s scan: %d displays checked, conditions %.1f ms / %.0f KB, whole scan %.1f ms / %.0f KB")
+    :format(event, count, condTime, condMem, total, memTotal))
+  local list = {}
+  for id, row in pairs(rows) do list[#list + 1] = {id = id, ms = row.ms, kb = row.kb} end
+  table.sort(list, function(a, b) return a.kb > b.kb end)
+  for i = 1, math.min(12, #list) do
+    local row = list[i]
+    local data = WeakAuras.GetData(row.id)
+    local used = {}
+    for key, value in pairs(data and data.load or {}) do
+      if type(key) == "string" and key:sub(1, 4) == "use_" and value then used[#used + 1] = key:sub(5) end
+    end
+    table.sort(used)
+    print(("  %s: %.2f ms, %.0f KB | %s"):format(row.id, row.ms, row.kb, table.concat(used, ", ")))
+  end
+end
+
 local function scanForLoadsImpl(toCheck, event, arg1, ...)
   if Private.IsOptionsProcessingPaused() or unloadingAllDisplays or sessionUnloaded then
     return;
@@ -1891,19 +2071,37 @@ local function scanForLoadsImpl(toCheck, event, arg1, ...)
 
   -- Profiling breakdown of a load scan (no cost unless profiling runs).
   Private.StartProfileSystem("load: conditions")
+  -- ForeverAuras: Spell Known answers are shared across this scan
+  -- (Prototypes.lua). The pass is protected so the memo is closed however
+  -- it ends; an error is raised again afterwards (rc.40 review: a failing
+  -- condition left the memo open, and a stale answer served until the next
+  -- scan).
+  Private.SpellKnownMemo(true)
+  local conditionsOk, conditionsErr = pcall(function()
   for id in pairs(toCheck) do
     local data = WeakAuras.GetData(id)
     if (data and not data.controlledChildren) then
       local loadFunc = loadFuncs[id];
       local loadOpt = loadFuncsForOptions[id];
+      -- ForeverAuras: /fa loadmem measures each display's conditions.
+      local rowStart, rowMem
+      if Private.loadAllocation then rowStart, rowMem = debugprofilestop(), collectgarbage("count") end
       shouldBeLoaded = not sessionExcluded[id] and loadFunc and loadFunc("ScanForLoads_Auras", inCombat, alive, inEncounter, warmodeActive, inPetBattle, vehicle, vehicleUi, dragonriding, mounted, addonRestrictionsActive, specId, player, realm, guild, race, faction, playerLevel, effectiveLevel, role, position, group, groupSize, raidMemberType, zone, zoneId, zonegroupId, instanceId, minimapText, encounter_id, size, difficulty, difficultyIndex, affixes)
       couldBeLoaded =  loadOpt and loadOpt("ScanForLoads_Auras",   inCombat, alive, inEncounter, warmodeActive, inPetBattle, vehicle, vehicleUi, dragonriding, mounted, addonRestrictionsActive, specId, player, realm, guild, race, faction, playerLevel, effectiveLevel, role, position, group, groupSize, raidMemberType, zone, zoneId, zonegroupId, instanceId, minimapText, encounter_id, size, difficulty, difficultyIndex, affixes)
+      if Private.loadAllocation then
+        -- Measured before the row's own table is made (rc.42 review).
+        local rowMs, rowKB = debugprofilestop() - rowStart, collectgarbage("count") - rowMem
+        Private.loadAllocation[id] = {ms = rowMs, kb = rowKB}
+      end
 
       if(shouldBeLoaded and not loaded[id]) then
         changed = changed + 1;
         toLoad[id] = true;
         -- ForeverAuras: timed apart from the load functions, to tell a slow
-        -- load condition from the regions built for auras loading now.
+        -- load condition from the regions built for auras loading now; both
+        -- counted for /fa phitch ("display loaded", "region created").
+        Private.HitchCount("display loaded")
+        if not WeakAuras.GetRegion(id) then Private.HitchCount("region created") end
         Private.StartProfileSystem("load: ensure regions")
         Private.EnsureRegion(id)
         Private.StopProfileSystem("load: ensure regions")
@@ -1915,6 +2113,7 @@ local function scanForLoadsImpl(toCheck, event, arg1, ...)
       if((loaded[id] or runtimeActiveDisplays[id]) and not shouldBeLoaded) then
         toUnload[id] = true;
         changed = changed + 1;
+        Private.HitchCount("display unloaded")
         for parent in Private.TraverseParents(data) do
           parentsToCheck[parent.id] = true
         end
@@ -1923,12 +2122,17 @@ local function scanForLoadsImpl(toCheck, event, arg1, ...)
         loaded[id] = true;
       elseif(couldBeLoaded) then
         loaded[id] = false;
+        -- ForeverAuras: its region is made ahead of time (PrewarmRegions).
+        if not WeakAuras.GetRegion(id) then QueuePrewarm(id) end
       else
         loaded[id] = nil;
       end
     end
   end
+  end)
+  Private.SpellKnownMemo(false)
   Private.StopProfileSystem("load: conditions")
+  if not conditionsOk then error(conditionsErr, 0) end
 
   if(changed > 0 and not paused) then
     -- Dynamic groups holding the displays that load or unload sort and
@@ -2252,6 +2456,9 @@ function Private.Resume()
   unloadingAllDisplays = false
 
   Private.ResumeAllDynamicGroups(suspended)
+  -- ForeverAuras (dev.92): the retention ends once the displays are loaded
+  -- again; the retained containers of those not loaded again are quieted now.
+  if Private.BlizzardAuraDisplay and Private.BlizzardAuraDisplay.EditorRetention then Private.BlizzardAuraDisplay.EditorRetention(false) end
   if not ok then error(err, 0) end
 end
 

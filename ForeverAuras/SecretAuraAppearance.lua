@@ -263,7 +263,7 @@ end
 
 -- window (optional) is the trigger's Remaining Time filter; it hides the
 -- countdown outside that time range through the same native colour curve.
-local function BindText(button, text, value, config, prefix, data, baseColor, property, window)
+local function BindText(button, text, value, config, prefix, data, baseColor, property, window, preview)
   local kind = Display.TextKind(value)
   -- The trigger's Remaining Time limits every countdown of the display.
   -- Icons only: other display types use the Remaining Time gate.
@@ -296,17 +296,46 @@ local function BindText(button, text, value, config, prefix, data, baseColor, pr
         config[prefix .. "p_time_dynamic_threshold"] or 3, config[prefix .. "p_time_precision"] or 1, format == -2, format)}
     end
     local color = Display.DurationColorCondition(data, baseColor, property, window)
+    local refused
     if color then
       options = options or {}
       options.textColor = color
       -- An older client may expose the enums before accepting the binding option.
       -- Preserve the countdown if it rejects color registration.
-      if pcall(button.SetDurationText, button, text, options) then return end
+      local ok, err = pcall(button.SetDurationText, button, text, options)
+      if ok then
+        -- Cleared by a live button only: the editor's sample binds too, and
+        -- must not clear a live refusal (rc.19 review).
+        if window and not preview then Private.AuraWarnings.UpdateWarning(data.uid, "blizzard_aura_countdown", nil) end
+        if not preview then Private.AuraWarnings.UpdateWarning(data.uid, "blizzard_aura_text_condition", nil) end
+        return
+      end
+      refused = err
       options.textColor = nil
+      -- ForeverAuras 1.2.1 (Astra's editor review): a text whose Remaining Time conditions the client
+      -- refused to bind is rebound without them below; that was silent, so a condition looked accepted
+      -- and did nothing. Said in the editor, with the client's reason.
+      if not window and not preview then
+        Private.AuraWarnings.UpdateWarning(data.uid, "blizzard_aura_text_condition", "warning",
+          L["Blizzard refused this text's Remaining Time conditions: %s. The text is shown without them."]:format(tostring(refused)))
+      end
     end
     -- A time-limited countdown without its curve would show outside the range:
-    -- leave it unbound (empty) instead.
-    if window then text:SetText(""); return end
+    -- left unbound (empty). A binding the client refused is also reported:
+    -- in a build under restrictions it is raised, so the build counts it
+    -- (Style runs under pcall there, rc.17 review) instead of a blank
+    -- countdown passing as "0 failed"; an ordinary build keeps running with
+    -- the blank text and a warning on the aura (rc.18 review). A client
+    -- without the curve at all keeps the quiet blank.
+    if window then
+      text:SetText("")
+      if refused and not preview then
+        local message = "the client refused the Remaining Time countdown binding: " .. tostring(refused)
+        if InCombatLockdown() or C_Secrets.ShouldAurasBeSecret() then error(message) end
+        Private.AuraWarnings.UpdateWarning(data.uid, "blizzard_aura_countdown", "warning", L["Blizzard refused the Remaining Time countdown: %s"]:format(tostring(refused)))
+      end
+      return
+    end
     button:SetDurationText(text, options)
   elseif kind == "stack" then
     local formatter = Display.StackTextCondition(data, property)
@@ -334,7 +363,7 @@ local function Area(native, data, name)
   if data.regionType == "aurabar" and name == "bar" then return native.bar, native.barWidth, native.barHeight end
   if data.regionType == "aurabar" and data.icon and name == "icon" then return native.icon, native.iconSize, native.iconSize end
   local width, height = Display.Dimensions(data)
-  return native.button, width, height
+  return Display.Box(native), width, height
 end
 
 -- BackdropTemplate installs resize scripts and reads frame geometry. Native aura
@@ -429,13 +458,24 @@ end
 Display.StyleBorderFrame = StyleBorder
 
 function Display.StyleAppearance(native, data, ElementFrame, StyleText, StyleGlow)
+  -- Stop the private writer before clearing or changing its target elements.
+  -- Refusal leaves the current construction intact for the normal apply retry.
+  if native.glowBinding and Display.DisableGlowBinding then
+    local ok, err = Display.DisableGlowBinding(native)
+    if not ok then error("Could not disable the Remaining Time glow before restyling: " .. Display.DescribeSecretError(err)) end
+  end
   local button = native.button
+  -- Artwork hangs from the box (Display.Box): the button, or a Grid member's offset box.
+  local box = Display.Box(native)
   local width, height = Display.Dimensions(data)
   -- Whole pixels for the box only in a Modern Aura Group (see BuildButton in
   -- BlizzardAuraDisplay.lua); a display of its own, or one in a Dynamic
   -- Group, keeps the exact size its neighbours have.
   if button.SetRoundLayoutToNearestPixel then pcall(button.SetRoundLayoutToNearestPixel, button, Display.FlowGroup(data) ~= nil) end
   button:SetSize(width, height)
+  -- ForeverAuras (independent carriers): the box is placed on the row, not
+  -- over the button, so it carries the display's size itself.
+  if native.carrier and native.box then native.box:SetSize(width, height) end
   native.inner:SetSize(width * 0.8, height * 0.8)
   native.outer:SetSize(width * 1.1, height * 1.1)
   button:ClearDurationText()
@@ -456,6 +496,7 @@ function Display.StyleAppearance(native, data, ElementFrame, StyleText, StyleGlo
   -- button's cooldown is reset here so a restyle that no longer hands the
   -- countdown to it leaves no stale number; what still applies is set again
   -- below. Samples keep their swipe (their OnUpdate renews it).
+  if native.countdownTextHolder then native.countdownTextHolder:Hide(); native.countdownDefaultNumbers = nil end
   if not native.preview then
     local cooldown = native.cooldown
     cooldown:Clear()
@@ -479,10 +520,12 @@ function Display.StyleAppearance(native, data, ElementFrame, StyleText, StyleGlo
   if native.progressBackground then native.progressBackground:Hide() end
   if native.plainTexture then native.plainTexture.texture:Hide() end
   if native.mainText then native.mainText:Hide() end
-  for _, entry in pairs(native.sharedElements or {}) do
+  for index, entry in pairs(native.sharedElements or {}) do
     if entry.glow then StyleGlow(entry, {blizzardAuraDisplay = {glow = false}}) end
-    -- Glow elements (SecretAuraGlow.lua) are rebuilt below when still configured.
-    Display.ClearElementGlow(entry)
+    -- Preserve unchanged native animation registrations. Removed or replaced
+    -- elements are retired now; remaining glows compare their full build key below.
+    local element = data.subRegions and data.subRegions[index]
+    if not element or element.type ~= "subglow" then Display.ClearElementGlow(entry) end
   end
   -- The timed glow's clip and its gate text binding are rebuilt below when still configured.
   if native.lateGlow then native.lateGlow.clip:Hide(); native.lateGlow.exact = nil end
@@ -493,7 +536,7 @@ function Display.StyleAppearance(native, data, ElementFrame, StyleText, StyleGlo
   -- Masque measures the frame it skins whenever it can read its size.
   base:SetSize(width, height)
   base:SetFrameLevel(button:GetFrameLevel() + 1); base:Show()
-  native.icon:ClearAllPoints(); native.icon:SetAllPoints(button)
+  native.icon:ClearAllPoints(); native.icon:SetAllPoints(box)
   native.icon:SetDesaturated(data.desaturate == true)
   Display.StyleIconTexCoords(native, data)
   native.icon:SetVertexColor(unpack(data.regionType == "aurabar" and data.icon_color or data.color or {1, 1, 1, 1}))
@@ -520,7 +563,7 @@ function Display.StyleAppearance(native, data, ElementFrame, StyleText, StyleGlo
     if not native.plainTexture then native.plainTexture = Private.TextureBase.create(base) end
     local plain = native.plainTexture
     plain.texture:ClearAllPoints()
-    plain.texture:SetAllPoints(button)
+    plain.texture:SetAllPoints(box)
     Private.TextureBase.modify(plain, {
       canRotate = data.rotate,
       desaturate = data.desaturate == true,
@@ -535,7 +578,7 @@ function Display.StyleAppearance(native, data, ElementFrame, StyleText, StyleGlo
   elseif data.regionType == "aurabar" then
     if not native.bar or (native.progressTexture and native.bar == native.progressTexture.bar) then native.bar = CreateFrame("StatusBar", nil, base) end
     local bar = native.bar
-    bar:ClearAllPoints(); bar:SetAllPoints(button)
+    bar:ClearAllPoints(); bar:SetAllPoints(box)
     bar:SetStatusBarTexture(data.textureSource == "LSM" and Media:Fetch("statusbar", data.texture or "Blizzard") or data.textureInput or "Interface\\Buttons\\WHITE8X8")
     bar:SetStatusBarColor(unpack(data.barColor or {1, 0, 0, 1}))
     local vertical = (data.orientation or "HORIZONTAL"):find("VERTICAL", 1, true) ~= nil
@@ -552,9 +595,9 @@ function Display.StyleAppearance(native, data, ElementFrame, StyleText, StyleGlo
       local first = data.icon_side == "LEFT"
       local side = vertical and (first and "BOTTOM" or "TOP") or (first and "LEFT" or "RIGHT")
       local size = vertical and width or height
-      native.icon:ClearAllPoints(); native.icon:SetSize(size, size); native.icon:SetPoint(side, button, side)
-      bar:ClearAllPoints(); bar:SetPoint("TOPLEFT", button, "TOPLEFT", side == "LEFT" and size or 0, side == "TOP" and -size or 0)
-      bar:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", side == "RIGHT" and -size or 0, side == "BOTTOM" and size or 0)
+      native.icon:ClearAllPoints(); native.icon:SetSize(size, size); native.icon:SetPoint(side, box, side)
+      bar:ClearAllPoints(); bar:SetPoint("TOPLEFT", box, "TOPLEFT", side == "LEFT" and size or 0, side == "TOP" and -size or 0)
+      bar:SetPoint("BOTTOMRIGHT", box, "BOTTOMRIGHT", side == "RIGHT" and -size or 0, side == "BOTTOM" and size or 0)
     end
     button:SetDurationBar(bar, {direction = data.inverse and Enum.StatusBarTimerDirection.ElapsedTime or Enum.StatusBarTimerDirection.RemainingTime})
     bar:Show()
@@ -566,7 +609,7 @@ function Display.StyleAppearance(native, data, ElementFrame, StyleText, StyleGlo
       textJustify = data.justify, textShadowColor = data.shadowColor, textShadowX = data.shadowXOffset, textShadowY = data.shadowYOffset}, "text", 18, "CENTER", 0, 0)
     native.mainText:Show()
     TextLayout(native.mainText, data.automaticWidth, data.fixedWidth, data.wordWrap)
-    BindText(button, native.mainText, data.displayText, data, "displayText_format_", data, data.color, "color")
+    BindText(button, native.mainText, data.displayText, data, "displayText_format_", data, data.color, "color", nil, native.preview)
   end
   for index, element in ipairs(data.subRegions or {}) do
     if not Display.IsDetachedElement(data, element) then
@@ -591,7 +634,7 @@ function Display.StyleAppearance(native, data, ElementFrame, StyleText, StyleGlo
         entry.text:SetAlpha(element.text_alpha or 1)
         TextLayout(entry.text, element.text_automaticWidth, element.text_fixedWidth, element.text_wordWrap)
         entry.text:Show()
-        BindText(button, entry.text, element.text_text, element, "text_text_format_", data, element.text_color, "sub." .. index .. ".text_color")
+        BindText(button, entry.text, element.text_text, element, "text_text_format_", data, element.text_color, "sub." .. index .. ".text_color", nil, native.preview)
       elseif element.type == "subborder" then
         -- Every Border element is drawn (one frame per element), not only the first.
         if element.border_visible ~= false then
@@ -608,10 +651,12 @@ function Display.StyleAppearance(native, data, ElementFrame, StyleText, StyleGlo
         -- Blizzard shows during the window (SecretAuraConditions.lua).
         if holder == nil then holder = Display.PandemicGlowHolder(native, data, index, frame) end
         if holder == nil then
-          Display.StyleElementGlow(entry, button, frame, entry.glowAnchor, element, entry.glowWidth, entry.glowHeight)
+          Display.StyleElementGlow(entry, button, frame, entry.glowAnchor, element, entry.glowWidth, entry.glowHeight, not native.preview)
         elseif holder then
           Display.StyleElementGlow(entry, button, holder, entry.glowAnchor,
-            setmetatable({glow = true}, {__index = element}), entry.glowWidth, entry.glowHeight)
+            setmetatable({glow = true}, {__index = element}), entry.glowWidth, entry.glowHeight, not native.preview)
+        else
+          Display.ClearElementGlow(entry)
         end
       elseif element.type == "subcdmdispelborder" and element.dispelVisible ~= false then
         -- Geometry follows a normal frame; Blizzard owns the four textures' type tint.
@@ -619,7 +664,7 @@ function Display.StyleAppearance(native, data, ElementFrame, StyleText, StyleGlo
         local anchor = entry.dispelAnchor
         anchor:ClearAllPoints(); anchor:Show()
         if element.anchor_mode == "point" then
-          local point, target = element.anchor_point or "CENTER", button
+          local point, target = element.anchor_point or "CENTER", box
           if point:sub(1, 6) == "INNER_" then target = native.inner; point = point:sub(7)
           elseif point:sub(1, 6) == "OUTER_" then target = native.outer; point = point:sub(7) end
           anchor:SetSize(element.width or 32, element.height or 32)
@@ -644,7 +689,7 @@ function Display.StyleAppearance(native, data, ElementFrame, StyleText, StyleGlo
             texture:SetPoint("BOTTOMRIGHT", target, "BOTTOMRIGHT", (element.xOffset or 0) / 2, -(element.yOffset or 0) / 2)
           else
             local point = element.anchor_point or "TOPLEFT"
-            local target = button
+            local target = box
             if point:sub(1, 6) == "INNER_" then target = native.inner; point = point:sub(7)
             elseif point:sub(1, 6) == "OUTER_" then target = native.outer; point = point:sub(7) end
             texture:SetSize(element.width or 16, element.height or 16)
@@ -659,7 +704,7 @@ function Display.StyleAppearance(native, data, ElementFrame, StyleText, StyleGlo
         texture:ClearAllPoints()
         if element.anchor_mode == "point" then
           local point = element.anchor_point or "CENTER"
-          local target = button
+          local target = box
           if point:sub(1, 6) == "INNER_" then target = native.inner; point = point:sub(7)
           elseif point:sub(1, 6) == "OUTER_" then target = native.outer; point = point:sub(7) end
           texture:SetSize(element.width or 32, element.height or 32)
@@ -679,6 +724,13 @@ function Display.StyleAppearance(native, data, ElementFrame, StyleText, StyleGlo
         texture:Show()
       end
     end
+  end
+  if native.countdownTextHolder then
+    -- Default cooldown numbers keep their ordinary layer. A duration-gate
+    -- handoff below replaces it with the selected text element's layer.
+    native.countdownTextHolder:SetFrameLevel(native.cooldown:GetFrameLevel())
+    native.countdownDefaultNumbers = data.regionType == "icon" and data.cooldown ~= false or nil
+    if native.countdownDefaultNumbers and data.cooldownTextDisabled == false then native.countdownTextHolder:Show() end
   end
   -- Preview frames evaluate public samples; live frames register native rules.
   Display.StyleNativeConditionIndicators(native, data)
