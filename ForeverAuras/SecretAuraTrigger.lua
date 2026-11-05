@@ -348,6 +348,12 @@ if Private.OnSameNameScanned then
         local name = Private.SpellNameOf(id)
         if name and names[name] then return true end
       end
+      -- ForeverAuras: a name typed into Name(s) that this scan resolved.
+      if Display.UsesRankSpellIDs(trigger) then
+        for _, value in ipairs(trigger.auraRankSpellIDs or {}) do
+          if type(value) == "string" and names[value] then return true end
+        end
+      end
       return false
     end)
   end)
@@ -426,7 +432,7 @@ function Trigger.GetTriggerDescription(data, triggernum, lines)
   if op then showOn = showOn .. L[", remaining %s %s s"]:format(op, seconds) end
   lines[#lines + 1] = {L["Show On"], showOn}
   -- Describe both modes without relabelling existing exact selections.
-  lines[#lines + 1] = {L["Spell IDs (All Ranks)"], SpellIDSummary(trigger.auraRankSpellIDs, Display.UsesRankSpellIDs(trigger))}
+  lines[#lines + 1] = {L["Name(s)"], SpellIDSummary(trigger.auraRankSpellIDs, Display.UsesRankSpellIDs(trigger))}
   lines[#lines + 1] = {L["Exact Spell IDs"], SpellIDSummary(trigger.auraspellids, Display.UsesSpellIDs(trigger))}
 end
 

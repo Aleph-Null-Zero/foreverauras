@@ -33,13 +33,21 @@ end
 function Display.ClearElementGlow(entry)
   local glow = entry and entry.nativeGlow
   if not glow then return end
-  for _, group in ipairs(glow.groups) do
-    if glow.button and glow.button.RemoveAuraShownAnimation then pcall(glow.button.RemoveAuraShownAnimation, glow.button, group) end
-    group:Stop()
+  glow.ready = nil
+  local failure
+  local function Clear(method, object, ...)
+    local ok, err = pcall(method, object, ...)
+    if not ok then failure = failure or err end
   end
-  for _, texture in ipairs(glow.textures) do texture:Hide() end
-  for _, frame in ipairs(glow.frames) do frame:Hide() end
-  if glow.holder then glow.holder:Hide() end
+  for _, group in ipairs(glow.groups) do
+    if glow.button and glow.button.RemoveAuraShownAnimation then Clear(glow.button.RemoveAuraShownAnimation, glow.button, group) end
+    Clear(group.Stop, group)
+  end
+  for _, texture in ipairs(glow.textures) do Clear(texture.Hide, texture) end
+  for _, frame in ipairs(glow.frames) do Clear(frame.Hide, frame) end
+  if glow.holder then Clear(glow.holder.Hide, glow.holder) end
+  -- Retain the owner on a refused cleanup so the next pass can retry it.
+  if failure then error(failure, 0) end
   entry.nativeGlow = nil
   entry.keptGlow = glow
 end
@@ -256,10 +264,67 @@ end
 
 -- Builds element's glow inside parent, centred on anchor (w x h).
 -- button: the aura button (or a sample frame) that plays the animations.
-function Display.StyleElementGlow(entry, button, parent, anchor, element, w, h)
-  Display.ClearElementGlow(entry)
-  if not element.glow then return end
+-- Registration alone does not start an animation on an already shown native
+-- button. Start the new groups, then let its native visibility pass stop every
+-- empty record. Reapply only the existing icon binding; when there is none,
+-- use an invisible, button-owned scratch texture and remove that binding again.
+-- This never reads aura visibility or replaces a duration/count binding.
+local function RegisterGlow(glow, synchronize)
+  local button = glow.button
+  local temporaryIcon = false
+  local ok, err = pcall(function()
+    for _, group in ipairs(glow.groups) do button:AddAuraShownAnimation(group) end
+    if synchronize and #glow.groups > 0 then
+      local icon = button:GetIcon()
+      if issecretvalue and issecretvalue(icon) then error("glow icon binding is unreadable") end
+      -- A previous cleanup may have been refused. Only retire our own
+      -- temporary binding; appearance may already have installed a new icon.
+      if button.faGlowSyncBindingPending then
+        if icon == button.faGlowSyncBindingPending then button:ClearIcon(); icon = nil end
+        button.faGlowSyncBindingPending = nil
+      end
+      if not icon then
+        icon = button.faGlowSyncTexture
+        if not icon then
+          icon = button:CreateTexture(nil, "BACKGROUND")
+          button.faGlowSyncTexture = icon
+        end
+        if not button.faGlowSyncTextureReady then
+          icon:SetAlpha(0)
+          icon:Hide()
+          button.faGlowSyncTextureReady = true
+        end
+        temporaryIcon = true
+        button.faGlowSyncBindingPending = icon
+      end
+      for _, group in ipairs(glow.groups) do group:Play() end
+      button:SetIcon(icon)
+      if temporaryIcon then button:ClearIcon(); temporaryIcon = false; button.faGlowSyncBindingPending = nil end
+    end
+    glow.ready = true
+  end)
+  if not ok then
+    -- A setter can fail after accepting its input. Restore the previously
+    -- empty icon binding and keep failed new artwork quiet before reporting.
+    local restored, restoreErr = true
+    if temporaryIcon then
+      restored, restoreErr = pcall(button.ClearIcon, button)
+      if restored then button.faGlowSyncBindingPending = nil end
+    end
+    local cleared, clearErr = pcall(Display.ClearElementGlow, glow.entry)
+    if not restored then err = tostring(err) .. "; icon cleanup: " .. tostring(restoreErr) end
+    if not cleared then err = tostring(err) .. "; glow cleanup: " .. tostring(clearErr) end
+    error(err, 0)
+  end
+end
+
+function Display.StyleElementGlow(entry, button, parent, anchor, element, w, h, synchronize)
+  if not element.glow then Display.ClearElementGlow(entry); return end
   local key = GlowKey(button, parent, anchor, element, w, h)
+  -- Keep an unchanged native registration running. A full restyle also
+  -- restores its parent frames, so no animation or registration write is needed.
+  if entry.nativeGlow and entry.nativeGlow.ready and entry.nativeGlow.key == key then return end
+  Display.ClearElementGlow(entry)
   local kept = entry.keptGlow
   if kept and kept.key == key then
     -- Unchanged settings: show and register the existing pieces again.
@@ -267,7 +332,7 @@ function Display.StyleElementGlow(entry, button, parent, anchor, element, w, h)
     if kept.holder then kept.holder:Show() end
     for _, frame in ipairs(kept.frames) do frame:Show() end
     for _, texture in ipairs(kept.textures) do texture:Show() end
-    for _, group in ipairs(kept.groups) do button:AddAuraShownAnimation(group) end
+    RegisterGlow(kept, synchronize)
     return
   end
   -- Changed settings: the old pieces go to the pools (Recycle) and are
@@ -316,8 +381,12 @@ function Display.StyleElementGlow(entry, button, parent, anchor, element, w, h)
     ants:SetSize(gw * 1.2, gh * 1.2)
     ants:SetTexture(ANTS)
     Tint(ants, element)
-    -- 22 frames; at frequency 0.25 one lap takes about 0.2 s.
-    FlipBook(glow, ants, 5, 5, 22, 0.055 / math.max(0.01, math.abs(frequency)), 48)
+    -- 22 frames. ForeverAuras 1.2.1 (dev.116, Dan's "twice as fast"): the ordinary glow (LibCustomGlow)
+    -- steps its ants through TextureUtil.AnimateTexCoords, which advances one frame only once more than
+    -- its throttle (0.01 s at frequency 0.25) has passed and then discards the elapsed time, so a lap
+    -- takes about 0.3 s at 60 to 300 FPS, not the nominal 0.22 s. The native flipbook keeps exact time, so
+    -- it is given the lap the ordinary glow actually shows: 0.075 s per 0.25 of frequency.
+    FlipBook(glow, ants, 5, 5, 22, 0.075 / math.max(0.01, math.abs(frequency)), 48)
   else
     -- Pixel Glow and Autocast Shine: pieces travelling around the rectangle.
     local pixel = kind == "Pixel"
@@ -377,5 +446,5 @@ function Display.StyleElementGlow(entry, button, parent, anchor, element, w, h)
     end
   end
   FinishPaths(glow)
-  for _, group in ipairs(glow.groups) do button:AddAuraShownAnimation(group) end
+  RegisterGlow(glow, synchronize)
 end

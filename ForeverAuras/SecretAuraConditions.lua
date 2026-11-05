@@ -178,7 +178,7 @@ function Display.PandemicGlowHolder(native, data, index, frame)
     native.pandemicGlowFrames[index] = holder
   end
   holder:ClearAllPoints()
-  holder:SetAllPoints(native.button)
+  holder:SetAllPoints(Display.Box(native))
   holder:SetFrameLevel(frame:GetFrameLevel() + 1)
   -- Hidden until the window (or the preview sample) shows it.
   holder:Hide()
@@ -363,7 +363,7 @@ function Display.DurationColorCondition(data, baseColor, property, window)
     for _, rule in ipairs(rules) do
       if Matches(value, rule) then
         if rule.channel == "color" then color = rule.value
-        elseif rule.channel == "visible" then visible = rule.value ~= false end
+        elseif rule.channel == "visible" then visible = rule.value and true or false end
       end
     end
     if window and not Display.InRemainingWindow(value, window[1], window[2]) then visible = false end
@@ -373,6 +373,44 @@ function Display.DurationColorCondition(data, baseColor, property, window)
   end
   return {curve = curve, property = bindingProperty}
 end
+-- ForeverAuras 1.2.1 (Astra's editor review 2): the Remaining Time conditions
+-- of a %p text whose countdown is handed to the cooldown's numbers
+-- (SecretAuraSingle.lua HandOffCountdown): the numbers' formatter draws the
+-- colour (an inline colour code) or hides the digits (an empty format) over
+-- each stretch of remaining time (DurationText.lua, Styled), since the
+-- button's one duration-text binding is the row cell's gate. Only
+-- Remaining Time in seconds with < or >=, opaque colours and on/off
+-- visibility; anything else returns nil and the reason, and the display
+-- says so in the editor rather than pretending.
+function Display.CountdownConditionStyle(data, property)
+  local rules = NumericRules(data, property)
+  if #rules == 0 then return end
+  local style = {conds = {}, baseVisible = BaseTextVisible(data, property)}
+  local key = {tostring(style.baseVisible)}
+  for _, rule in ipairs(rules) do
+    if rule.kind ~= "faAuraRemaining" then return nil, "other time property" end
+    local code, visible
+    if rule.channel == "color" then
+      local color = Color(rule.value, {1, 1, 1, 1})
+      local r, g, b = color:GetRGB()
+      local a = color.a
+      if a == nil then a = select(4, color:GetRGBA()) end
+      if a ~= 1 then return nil, "partial alpha" end
+      code = ("|cff%02x%02x%02x"):format(math.floor(r * 255 + 0.5), math.floor(g * 255 + 0.5), math.floor(b * 255 + 0.5))
+    elseif rule.channel == "visible" then
+      visible = rule.value and true or false
+    end
+    local lo, hi
+    if rule.op == "<" then lo, hi = -math.huge, rule.threshold
+    elseif rule.op == ">=" then lo, hi = rule.threshold, math.huge
+    else return nil, "other operator" end
+    style.conds[#style.conds + 1] = {lo, hi, code, visible}
+    key[#key + 1] = lo .. ":" .. hi .. ":" .. tostring(code) .. ":" .. tostring(visible)
+  end
+  style.key = "native-countdown:" .. table.concat(key, "|")
+  return style
+end
+
 -- The stack text's breakpoints from the display's Stack Count conditions, or
 -- nil without any.
 local function StackBreakpoints(data, property)
@@ -391,7 +429,7 @@ local function StackBreakpoints(data, property)
     for _, rule in ipairs(rules) do
       if Matches(value, rule) then
         if rule.channel == "color" then color = rule.value
-        elseif rule.channel == "visible" then visible = rule.value ~= false
+        elseif rule.channel == "visible" then visible = rule.value and true or false
         elseif rule.channel == "text" and type(rule.value) == "string" then format = rule.value:gsub("%%", "%%%%"); visible = true end
       end
     end
@@ -606,14 +644,37 @@ function Display.ValidateConditions(data)
   end
 end
 
+-- ForeverAuras (dev.58): the one test for "a condition prepares this element's
+-- property" (allocated and bound before combat), shared by the preparation
+-- below and by readers that must agree with it without copying the settings
+-- (Display.UsesStackText, SecretAuraSingle.lua).
+local function ConditionPrepares(data, condition, change)
+  local index, key = (change.property or ''):match('^sub%.(%d+)%.(.+)$')
+  index = tonumber(index)
+  if index and not Display.IsDetachedProperty(data, change.property) and (key == 'glow' or key == 'text_visible') and PropertyType(data, change.property) then
+    return index, key
+  end
+end
+-- Whether a condition can show element `index` (a text_visible change a
+-- condition plan prepares). Reads the settings; copies nothing.
+function Display.ConditionShowsElement(data, index)
+  local base = data.nativeConditionBaseData or data
+  for _, condition in ipairs(base.conditions or {}) do
+    for _, change in ipairs(condition.changes or {}) do
+      local i, key = ConditionPrepares(base, condition, change)
+      if i == index and key == 'text_visible' then return true end
+    end
+  end
+  return false
+end
+
 -- Allocate and bind conditional elements during configuration, never from combat updates.
 function Display.PrepareConditionAppearance(data)
   local result
   for _, condition in ipairs(data.conditions or {}) do
     for _, change in ipairs(condition.changes or {}) do
-      local index, key = (change.property or ''):match('^sub%.(%d+)%.(.+)$')
-      index = tonumber(index)
-      if index and not Display.IsDetachedProperty(data, change.property) and (key == 'glow' or key == 'text_visible') and PropertyType(data, change.property) then
+      local index, key = ConditionPrepares(data, condition, change)
+      if index then
         if not result then
           result = {}
           for field, value in pairs(data) do result[field] = value end
@@ -713,7 +774,10 @@ local function ApplyProperty(button, data, property, value, overrides, setup)
   elseif property == 'inverse' then button.cooldown:SetReverse(value)
   elseif property == 'cooldownSwipe' then button.cooldown:SetDrawSwipe(value)
   elseif property == 'cooldownEdge' then button.cooldown:SetDrawEdge(value)
-  elseif property == 'cooldownTextDisabled' then button.cooldown:SetHideCountdownNumbers(value)
+  elseif property == 'cooldownTextDisabled' then
+    button.cooldown:SetHideCountdownNumbers(value)
+    -- Default numbers have their own holder; handed-off %p text keeps its formatter and visibility.
+    if button.countdownDefaultNumbers and button.countdownTextHolder then button.countdownTextHolder:SetShown(not value) end
   elseif property == 'fontSize' and button.mainText then SetFontSize(button.mainText, value)
   elseif property == 'displayText' and button.mainText then button.mainText:SetText((value:gsub('%%%%', '%%'))) end
 end
@@ -791,7 +855,14 @@ function Display.RestyleButtons(region)
   end
 end
 
-function Display.ApplyConditionAppearance(button, region, data)
+-- setup: the button is being set up (Style): its look is applied like any
+-- other set-up styling, also while access to live buttons is otherwise
+-- denied (a display first built in combat, BlizzardAuraDisplay.lua, Create:
+-- its buttons are styled in the client's initializeFrame call, before the
+-- client restricts them). Left out, the ordinary conditions were refused
+-- there and a glow or text the saved settings show, which a false ordinary
+-- condition should have hidden, stayed shown.
+function Display.ApplyConditionAppearance(button, region, data, setup)
   -- ForeverAuras: the precedence is the saved setting, then the "Aura Active
   -- = True" conditions painted when the button was styled (kept in
   -- kindConditionValues), then the ordinary conditions (issue #143). The
@@ -808,26 +879,57 @@ function Display.ApplyConditionAppearance(button, region, data)
         local property = 'sub.' .. index .. '.glow'
         local value = kind[property]
         if value == nil then value = element.glow == true end
-        ApplyProperty(button, data, property, value, overrides)
-      elseif element.type == 'subtext' then ApplyProperty(button, data, 'sub.' .. index .. '.text_visible', element.text_visible ~= false, overrides) end
+        ApplyProperty(button, data, property, value, overrides, setup)
+      elseif element.type == 'subtext' then ApplyProperty(button, data, 'sub.' .. index .. '.text_visible', element.text_visible ~= false, overrides, setup) end
     end
   end
   for property, value in pairs(region.secretAuraConditionValues or {}) do
-    ApplyProperty(button, data, property, value, overrides)
+    ApplyProperty(button, data, property, value, overrides, setup)
   end
 end
 
-function Display.SetConditionProperty(region, property, ...)
+-- ForeverAuras: the aura data a condition value is typed against. Before the
+-- display record exists (a build still queued at login, or waiting for the
+-- restrictions to end) the saved data is used; the condition code only
+-- calls in for Modern displays, so the data is always eligible. No frame is
+-- created here: recording a value only writes a table on the region.
+local function ConditionData(region)
   local native = region.blizzardAuraDisplay
-  if not native or not native.active then return end
-  local kind = PropertyType(native.data, property)
+  if native then return native.data, native end
+  return region.id and WeakAuras.GetData(region.id), nil
+end
+
+function Display.SetConditionProperty(region, property, ...)
+  local data, native = ConditionData(region)
+  if not data then return end
+  local kind = PropertyType(data, property)
   if not kind then return end
   local value = kind == 'color' and {...} or ...
+  -- ForeverAuras: the value is recorded even before the display is built,
+  -- so a build that follows (one in combat after a reload, whose buttons
+  -- are styled only once, in the client's callback) starts from the
+  -- conditions already evaluated instead of the saved settings. Seen in
+  -- game: a glow a false In Combat condition should have hidden showed
+  -- after a reload in combat, because the engine had evaluated it before
+  -- the display was active and nothing was recorded. The record is kept
+  -- even before the display record exists (the builds queued at login),
+  -- where it was still being discarded (rc.4 review).
   region.secretAuraConditionValues = region.secretAuraConditionValues or {}
   region.secretAuraConditionValues[property] = value
   -- A condition setting the property again supersedes a reset still waiting
-  -- for access (ResetConditionProperty).
+  -- for access (ResetConditionProperty). Cleared before the inactive-display
+  -- return as well: a display waiting for recovery after a failed background
+  -- build can hold a reset whose later repaint would overwrite this newer
+  -- value (rc.5 review: a glow set on was drawn off).
   if region.secretAuraPendingResets then region.secretAuraPendingResets[property] = nil end
+  if not native or not native.active then
+    -- A display still being built in combat (its first instances styled, the
+    -- rest queued) takes the value when the restrictions end, since the
+    -- styled buttons cannot be reached now and the build no longer marks
+    -- itself dirty as a whole (BlizzardAuraDisplay.lua, ApplyInstance).
+    if native and (InCombatLockdown() or C_Secrets.ShouldAurasBeSecret()) then region.secretAuraConditionDirty = true end
+    return
+  end
   -- While access to the native buttons is denied the values below are not
   -- applied; RefreshConditionAppearance applies them once access returns.
   if InCombatLockdown() or C_Secrets.ShouldAurasBeSecret() then region.secretAuraConditionDirty = true end
@@ -881,13 +983,20 @@ end
 -- condition that sets the saved value on purpose stays an override through
 -- SetConditionProperty, so only a withdrawn condition reaches here (#143).
 function Display.ResetConditionProperty(region, property, ...)
-  local native = region.blizzardAuraDisplay
-  if not native or not native.active then return end
-  local kind = PropertyType(native.data, property)
+  local data, native = ConditionData(region)
+  if not data then return end
+  local kind = PropertyType(data, property)
   if not kind then return end
   local values = region.secretAuraConditionValues
   if not values or values[property] == nil then return end
   values[property] = nil
+  -- Before the display is built the recorded value is simply dropped (see
+  -- SetConditionProperty); a display being built in combat repaints when
+  -- the restrictions end.
+  if not native or not native.active then
+    if native and (InCombatLockdown() or C_Secrets.ShouldAurasBeSecret()) then region.secretAuraConditionDirty = true end
+    return
+  end
   local saved = kind == 'color' and {...} or ...
   -- While access to the live buttons is denied the repaint cannot happen
   -- now, and the dropped override is no longer there for the refresh to
@@ -973,7 +1082,7 @@ function Display.StyleNativeConditionIndicators(native, data)
   -- Inside the Total Duration gate clip, when there is one, so a rejected aura
   -- shows no highlight either.
   native.conditionOverlay = native.conditionOverlay or CreateFrame("Frame", nil, Display.ElementHolder(native))
-  native.conditionOverlay:SetAllPoints(button)
+  native.conditionOverlay:SetAllPoints(Display.Box(native))
   local base = native.elementFrames and native.elementFrames.sharedBase
   native.conditionOverlay:SetFrameLevel(math.max(native.cooldown:GetFrameLevel(), native.bar and native.bar:GetFrameLevel() or 0,
     base and base:GetFrameLevel() or button:GetFrameLevel()) + 1)
@@ -996,7 +1105,7 @@ function Display.StyleNativeConditionIndicators(native, data)
         local host = native.conditionHosts[index]
         if not host then
           host = CreateFrame("Frame", nil, native.conditionOverlay)
-          host:SetAllPoints(button)
+          host:SetAllPoints(Display.Box(native))
           native.conditionHosts[index] = host
         end
         local textures = native.conditionIndicators[index]
@@ -1053,17 +1162,17 @@ function Display.StyleNativeConditionIndicators(native, data)
             if style == "border" then
               if side <= 2 then
                 local point = side == 1 and "TOP" or "BOTTOM"
-                texture:SetPoint(point .. "LEFT", button, point .. "LEFT")
-                texture:SetPoint(point .. "RIGHT", button, point .. "RIGHT"); texture:SetHeight(size)
+                texture:SetPoint(point .. "LEFT", Display.Box(native), point .. "LEFT")
+                texture:SetPoint(point .. "RIGHT", Display.Box(native), point .. "RIGHT"); texture:SetHeight(size)
               else
                 local point = side == 3 and "LEFT" or "RIGHT"
-                texture:SetPoint("TOP" .. point, button, "TOP" .. point)
-                texture:SetPoint("BOTTOM" .. point, button, "BOTTOM" .. point); texture:SetWidth(size)
+                texture:SetPoint("TOP" .. point, Display.Box(native), "TOP" .. point)
+                texture:SetPoint("BOTTOM" .. point, Display.Box(native), "BOTTOM" .. point); texture:SetWidth(size)
               end
             else
               local padding = style == "glow" and (size + 8) or style == "texture" and size or 0
-              texture:SetPoint("TOPLEFT", button, "TOPLEFT", -padding, padding)
-              texture:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", padding, -padding)
+              texture:SetPoint("TOPLEFT", Display.Box(native), "TOPLEFT", -padding, padding)
+              texture:SetPoint("BOTTOMRIGHT", Display.Box(native), "BOTTOMRIGHT", padding, -padding)
             end
             if native.preview then
               -- Only ordinary preview textures use a public sample predicate.

@@ -34,9 +34,26 @@ local function Busy(frame)
   if Locked(frame) then return true end
   return InCombatLockdown() and frame.IsProtected ~= nil and frame:IsProtected()
 end
-local function Place(frame, ...)
-  if Busy(frame) then return false end
-  return pcall(frame.SetPoint, frame, ...)
+-- ForeverAuras (dev.70): under aura restrictions a placement already made
+-- with exactly these arguments is not written again: a start prewired on a
+-- chained member's end (PrewireFollower) must not be rewritten once that
+-- end depends on a secret (the client refuses the write); out of
+-- restrictions every placement is written (the callers clear the frame
+-- first). The record is the frame's own and is dropped on a refusal.
+local function RestrictedNow()
+  return InCombatLockdown() or (C_Secrets and C_Secrets.ShouldAurasBeSecret())
+end
+local function Place(frame, point, rel, relPoint, x, y)
+  -- ForeverAuras (dev.72): the placement record is consulted first: a frame
+  -- placed with exactly these arguments needs no write, whether or not it
+  -- could take one now (a prewired start that has since become protected)
+  local last = frame.faPlace
+  if last and RestrictedNow() and last[1] == point and last[2] == rel and last[3] == relPoint and last[4] == (x or 0) and last[5] == (y or 0) then return true end
+  if Busy(frame) then return false, "busy" end
+  local ok, err = pcall(frame.SetPoint, frame, point, rel, relPoint, x, y)
+  frame.faPlace = ok and {point, rel, relPoint, x or 0, y or 0} or nil
+  if not ok then frame.faPlaceError = err end
+  return ok, err
 end
 local function SetShown(frame, shown)
   if not frame or Busy(frame) or frame:IsShown() == shown then return end
@@ -124,10 +141,14 @@ local GROWTH = {
 local function Centered(visible, shadow, centerPoint)
   local result = CopyTable(GROWTH[visible])
   result.visible, result.shadow, result.centerPoint = visible, GROWTH[shadow], centerPoint
+  result.shadowKey = shadow   -- ForeverAuras (dev.74): the shadows' growth by name (the chain's shadow geometry, ChainBound)
   return result
 end
 GROWTH.CENTER_HORIZONTAL = Centered("RIGHT", "LEFT", "TOP")
 GROWTH.CENTER_VERTICAL = Centered("DOWN", "UP", "LEFT")
+-- ForeverAuras (cell chain, SecretAuraChain.lua): the growth table and the
+-- pixel scale, shared with the chain.
+Display.GROWTH = GROWTH
 
 -- The direction a display's own aura area grows in.
 function Display.VisibleGrowth(growth)
@@ -163,6 +184,8 @@ local function PixelsPerUnit(region)
   if type(factor) ~= "number" or factor <= 0 or type(scale) ~= "number" or issecretvalue(scale) or scale <= 0 then return nil end
   return scale / factor
 end
+
+Display.PixelsPerUnit = PixelsPerUnit
 
 -- The spacing the row uses after a display of the given size along it: the
 -- group's spacing, made a whole number of screen pixels on top of a whole
@@ -231,6 +254,25 @@ Display.flowSortModes = {
   blizzard = "Blizzard default", important = "Importance only", bigDefensive = "Big defensives", applied = "Order applied",
 }
 Display.flowSortOrder = {"ascending", "descending", "expiration", "name", "namePriority", "blizzard", "important", "bigDefensive", "applied", "none"}
+-- ForeverAuras: the Sort list offers the orders that differ on this client.
+-- The "Blizzard priority" orders put the game's important and big-defensive
+-- auras first, and that classification is empty on WoW Forever (Divine
+-- Shield, Shield Wall and Recklessness all unflagged, forever-bugs #99), so
+-- they sort like their plain twins; a group that already uses one keeps it
+-- and still sees it in the list.
+Display.flowSortShown = {"ascending", "descending", "name", "blizzard", "important", "applied", "none"}
+-- The list's entries and their order; the order names only entries that are
+-- in the list (a named entry that is not in it draws as an empty line).
+function Display.FlowSortValues(group)
+  local values, order, current = {}, {}, Display.FlowSortMode(group)
+  for _, mode in ipairs(Display.flowSortOrder) do
+    if tContains(Display.flowSortShown, mode) or mode == current then
+      values[mode] = Display.flowSortModes[mode]
+      order[#order + 1] = mode
+    end
+  end
+  return values, order
+end
 local sortModeMethods = {
   none = "Default", ascending = "ExpirationOnly", descending = "ExpirationOnly", expiration = "Expiration",
   name = "NameOnly", namePriority = "Name", blizzard = "Default", important = "ImportantOnly",
@@ -307,6 +349,11 @@ local function TrackEnabled(container)
   local setEnabled = container.SetEnabled
   container.SetEnabled = function(self, enabled)
     enabled = enabled and true or false
+    -- (dev.94, diagnostic) a chained member's list disabled: where from (with "/fa cells debug on")
+    if not enabled and self.faEnabled == true and self.faReportDisable and type(ForeverAurasSaved) == "table" and ForeverAurasSaved.rowCellsDebug and Display.BuildReport then
+      local okS, stack = pcall(debugstack, 2, 5, 0)
+      Display.BuildReport(("%s: list disabled by %s"):format(tostring(self.faReportDisable), okS and tostring(stack):gsub("\n", " | ") or "?"))
+    end
     self.faEnabled = enabled
     if Private.HitchCount then Private.HitchCount(enabled and "container enable" or "container disable") end
     return setEnabled(self, enabled)
@@ -318,20 +365,202 @@ function Display.CreateAuraContainer(parent, data, optOut)
   if optOut or Display.FlowGroup(data) then
     local ok, container = pcall(CreateFrame, "AuraContainer", nil, parent,
       "CustomAuraContainerTemplate, DisableUntrustedLayoutScriptsTemplate")
-    if ok and container then return TrackEnabled(container), true end
+    if ok and container then
+      -- ForeverAuras (combat-reload probe): noted at allocation (BlizzardAuraDisplay.lua, NoteAllocation).
+      if Display.NoteAllocation then Display.NoteAllocation(parent, container) end
+      return TrackEnabled(container), true
+    end
   end
-  return TrackEnabled(CreateFrame("AuraContainer", nil, parent, "CustomAuraContainerTemplate")), false
+  local container = CreateFrame("AuraContainer", nil, parent, "CustomAuraContainerTemplate")
+  if Display.NoteAllocation then Display.NoteAllocation(parent, container) end
+  return TrackEnabled(container), false
 end
 
 -- Anchors a container to a Modern Aura Group start frame; falls back to the
 -- region when Blizzard refuses the anchor.
 function Display.AnchorToContent(container, point, region, relativePoint, x, y)
+  -- ForeverAuras (independent carriers): the container is pinned to the
+  -- group's frame instead; its artwork follows the row through its boxes
+  -- (PlaceCarrierBox) and its end through TranslateEnd (SetFlowEnd).
+  local native = region.blizzardAuraDisplay
+  -- ForeverAuras (cell chain): a chained list's container is pinned too; its
+  -- artwork follows the row through its chain, not through the carriers.
+  local chained = native and native.data and Display.FlowChain ~= nil and Display.FlowChain(native.data) ~= nil
+  if native and native.data and (chained or Display.FlowIndependent(native.data)) then
+    local pin = Display.CarrierPin(native.data)
+    local ok, err = false, "no group frame"
+    if pin then ok, err = Place(container, point, pin, "TOPLEFT", 0, 0) end
+    if ok then
+      if native.flow then native.flow.carrierPinned, native.flow.carrierPinError = true, nil end
+      return true
+    end
+    -- The refused operation is kept for the end's report (dev.19 review).
+    if native.flow then native.flow.carrierPinned, native.flow.carrierPinError = false, "pin: " .. tostring(err or "locked") end
+  end
   local anchor = Display.ContentAnchor(region)
-  if anchor ~= region and Place(container, point, anchor, relativePoint, x or 0, y or 0) then return true end
+  local refused
+  if anchor ~= region then
+    if Place(container, point, anchor, relativePoint, x or 0, y or 0) then return true end
+    refused = container.faPlaceError or "busy"
+  end
   if Busy(container) then return false end
+  -- ForeverAuras (dev.87, Dan's D after a combat reload; Astra's dev.85 review P1): under restrictions nothing
+  -- is cleared before a write that may be refused (a container left with no anchors has no place and draws
+  -- nothing: D's container, "left nil"); the fallback is written under protection and a refused content
+  -- placement is said. (dev.88: a display whose content IS its region - an ordinary display - takes this
+  -- write as its ordinary anchor, as before, and reports nothing.)
+  if RestrictedNow() then
+    local okF, errF = pcall(container.SetPoint, container, point, region, relativePoint, x or 0, y or 0)
+    if refused and Display.BuildReport and native and native.data then
+      Display.BuildReport(("%s: its container could not be placed on its content (%s)%s"):format(tostring(native.data.id), tostring(refused),
+        okF and "; on the region instead" or ("; nor on the region: " .. tostring(errF))))
+    end
+    return anchor == region and okF
+  end
   container:ClearAllPoints()
   container:SetPoint(point, region, relativePoint, x or 0, y or 0)
   return anchor == region
+end
+
+-- ForeverAuras (dev.70, Astra's dev.69 handoff): before a chained member's
+-- records are bound (PrepareChain), the NEXT member's start frame is placed
+-- on this member's prewired end, with the arguments RechainFlow will use for
+-- it (so RechainFlow's own pass under restrictions skips the write: Place).
+-- Only a group-owned row has chained members. The next member's flow is
+-- made here if it does not exist yet (its own Apply comes later and keeps
+-- the prewired place: EnsureFlowStart).
+-- ForeverAuras (dev.72, Astra's dev.70 review): the members of a row that
+-- take part in it are the LIVE ones: a member whose build is queued (a fresh
+-- combat load has every member queued before any native state exists), or
+-- one that is shown and built or being built. An unloaded or hidden member
+-- that is not being built is not part of the row (RechainFlow skips it too),
+-- so the next live member, not the next configured child, is prewired and
+-- waited for. Returns the region, its data and its native state (which may
+-- not exist yet).
+-- ForeverAuras (dev.74, Astra's dev.73 review): an ordinary display copied
+-- into the row (a text or icon with a stand, LinkFlowNormal) is a live
+-- member too, in its place: it is prewired on the chained member before it
+-- as the row's pass would place it, so that pass writes nothing new to a
+-- bound end. One that leads the row at its own home (a bar, no stand) is not
+-- a follower and is not listed. Returns region, data, native state (nil for
+-- an ordinary member) and the ordinary member's flow state.
+local function LiveMember(id, group)
+  local entry = Private.regions[id]
+  local region = entry and entry.region
+  if not region then return nil end
+  local d = WeakAuras.GetData(id)
+  if not d then return nil end
+  local native = region.blizzardAuraDisplay
+  if Display.IsBuildPending and Display.IsBuildPending(region) then return region, d, native end
+  if native and (native.active or native.applying) and region:IsShown() then return region, d, native end
+  local normal = region.flowNormal
+  if normal and normal.active and normal.flow and normal.flow.start and normal.stand and normal.stand.active
+    and (not group or Display.FlowNormal(normal.data) == group) and region:IsShown() then return region, d, nil, normal end
+  return nil
+end
+function Display.NextLiveMember(group, id)
+  local order = Display.FlowOrder(group)
+  local after = false
+  for _, member in ipairs(order) do
+    if after then
+      local r, d, native, normal = LiveMember(member, group)
+      if r then return r, d, native, member, normal end
+    elseif member == id then after = true end
+  end
+  return nil
+end
+local prewireDepth = 0
+function Display.PrewireFollower(region, data, endOwner)
+  local group = Display.FlowGroup(data)
+  if not group or not Display.FlowGroupOwned(group) then return true end
+  local native = region.blizzardAuraDisplay
+  -- (dev.78) the end the follower sits on: the member's chain, or its measurement chain (endOwner)
+  local flow = endOwner and endOwner.flow or native and native.flow
+  if not (flow and flow.chainEnd and flow.chainEndWired) then return false, "no prewired end" end
+  local endFrame = endOwner and endOwner.out or flow.chainEnd
+  local endPoint = endOwner and endOwner.outCorner or flow.chainCorner
+  local nextRegion, nextData, nextNative, nextID, nextNormal = Display.NextLiveMember(group, data.id)
+  if not nextRegion then return true end
+  local nextFlow
+  if nextNormal then
+    -- (dev.74) an ordinary copied member: its own start, as the row's pass places it
+    nextFlow = nextNormal.flow
+  else
+    -- (dev.72) a member queued at a fresh load has no native state yet: it is
+    -- made here, owned by that member (its own Apply takes it over as is)
+    if not nextNative then
+      nextNative = {instances = {}, data = nextData}
+      nextRegion.blizzardAuraDisplay = nextNative
+    end
+    nextFlow = nextNative.flow
+    if not (nextFlow and nextFlow.start) then Display.EnsureFlowStart(nextRegion, nextData); nextFlow = nextNative.flow end
+  end
+  if not (nextFlow and nextFlow.start) then return true end
+  local g = GROWTH[GrowthKey(group)] or GROWTH.RIGHT
+  local px, py = OwnOffset(data)
+  local point, rel, relPoint, x, y = g.start, endFrame, endPoint or g.start, 0 - px, 0 - py
+  local last = nextFlow.start.faPlace
+  if not (last and last[1] == point and last[2] == rel and last[3] == relPoint and last[4] == x and last[5] == y) then
+    if not RestrictedNow() then nextFlow.start:ClearAllPoints() end
+    local ok = Place(nextFlow.start, point, rel, relPoint, x, y)
+    if not ok then return false, "the next member's start could not be prewired: " .. tostring(nextFlow.start.faPlaceError) end
+  end
+  nextFlow.startPrewired = true
+  -- and the next member's own preparation, if it is chained: its content
+  -- hangs from its start, its spine from its content, and all of it must be
+  -- in place before THIS member's records bind (PrepareChain recurses along
+  -- the row; a member already prepared is a no-op)
+  if not nextNormal and Display.FlowChain and Display.FlowChain(nextData) and Display.PrepareChain then
+    -- ForeverAuras (dev.75 watchdog): the preparation recurses along the
+    -- row; a depth past any row's length is a loop, reported with its stack
+    -- rather than a frozen client
+    prewireDepth = prewireDepth + 1
+    if prewireDepth > 64 then prewireDepth = 0; error("ForeverAuras watchdog: the row's preparation recursed past 64 members at " .. tostring(nextID)) end
+    local okN, whyN = Display.PrepareChain(nextRegion, nextData, nextNative)
+    prewireDepth = prewireDepth - 1
+    if not okN then return false, tostring(nextID) .. ": " .. tostring(whyN) end
+  end
+  return true
+end
+
+-- ForeverAuras (dev.70): the member of this display's row that must be
+-- whole before this (chained) display is built under restrictions: the next
+-- member whose build is still pending, or the next chained member whose
+-- records are not all made yet; nil when none (this display may be built
+-- now). Only chained displays wait; ordinary members (Missing, Always) are
+-- built as they come.
+function Display.ChainOrderBlocker(region, data, pendingTable)
+  if not ((Display.FlowChain and Display.FlowChain(data)) or (Display.MeasuresEnd and Display.MeasuresEnd(data))) then return nil end
+  local group = Display.FlowGroup(data)
+  if not group or not Display.FlowGroupOwned(group) then return nil end
+  -- (dev.72) over the live members only, and a queued member blocks whether
+  -- or not it has native state yet (a fresh combat load has none). Every
+  -- queued live member after this one blocks, ordinary ones too: the chain
+  -- pass that commits this member places the whole live row after it, and a
+  -- member still queued then would be left out of that pass, so the member
+  -- after it would be anchored afresh to this member's end, which the
+  -- client refuses once the records are bound. Ordinary members never wait,
+  -- so they are built first and the wait is bounded.
+  local order = Display.FlowOrder(group)
+  local after = false
+  for _, id in ipairs(order) do
+    if after then
+      local r, d, native, normal = LiveMember(id, group)
+      if r and not normal then
+        if pendingTable[r] then return id end
+        if Display.FlowChain(d) then
+          if not native or #native.instances == 0 then return id end
+          local instance = native.instances[1]
+          if instance and #(instance.buttons or {}) < (Display.CHAIN_RECORDS or 10) then return id end
+        elseif Display.MeasuresEnd and Display.MeasuresEnd(d) then
+          -- (dev.78) a member whose end is a measurement chain is whole when that chain is
+          local mc = native and native.flow and native.flow.measureChain
+          if not (mc and #mc.buttons >= (Display.CHAIN_RECORDS or 10)) then return id end
+        end
+      end
+    elseif id == data.id then after = true end
+  end
+  return nil
 end
 
 -- ForeverAuras: row layout ("Use old row layout", Modern Aura Group Settings). A group-owned row
@@ -357,6 +586,659 @@ local function RowOrigin(group)
   return entry and entry.region, group.selfPoint or "CENTER"
 end
 
+---------------------------------------------------------------------------- independent carriers (row cells)
+-- Supported group-owned rows use independent carriers by default. An absent
+-- group setting and the older "independent" value both enable them; explicit
+-- false is the group's emergency override. A Found list's native container
+-- (its "carrier")
+-- is pinned to the group's own frame, a place no secret measurement ever
+-- moves, and only the artwork follows the row: each button's box is placed at
+--   member start + (button corner - carrier corner)
+-- and the member's end at
+--   member start + (list end - carrier corner)
+-- by two helper frames per point that the client's anchor solver resolves
+-- (Translate below): nothing in Lua reads a native position. The carrier then
+-- never hangs from another member's secret measurement, which is what left
+-- buttons the client added in combat unbuildable (FlowOrder's workaround).
+-- Grid, legacy row origins, Group by Frame and multi-unit members retain their
+-- existing layouts. Missing and gated members use their own supported paths.
+-- The supported unit tokens have one container per display, so the
+-- padding (CarrierPadding) can count one list per member. A row member of
+-- any other unit (party, raid, boss, arena, nameplate, group) lays out one
+-- list per unit ahead of the next member, which that bound does not cover,
+-- so such a group keeps its existing layout as a whole.
+local SINGLE_UNITS = {player = true, target = true, focus = true, pet = true, targettarget = true, focustarget = true}
+local function SingleUnitMember(child)
+  local trigger = child and Display.GetTrigger(child)
+  if not trigger then return true end -- an ordinary display, or no trigger: one place in the row
+  return SINGLE_UNITS[trigger.unit] == true
+end
+function Display.FlowIndependentGroup(group)
+  if not group then return false end
+  if not Display.FlowGroupOwned(group) or Display.FlowGrid(group) then return false end
+  if group.blizzardFlowFrames == "UNITFRAME" or group.blizzardFlowFrames == "NAMEPLATE" then return false end
+  -- ForeverAuras (dev.74): a Centered row is taken too: its members' shadows
+  -- (a chained member's shadow chain among them, EnsureChainShadow) run back
+  -- from the centre as in the legacy row, and the visible row starts at
+  -- their end (RechainFlow).
+  local g = GROWTH[GrowthKey(group)]
+  if not g then return false end
+  for _, childID in ipairs(group.controlledChildren or {}) do
+    if not SingleUnitMember(WeakAuras.GetData(childID)) then return false end
+  end
+  return true
+end
+
+-- The same eligibility decision with its reason for the editor. Historical
+-- experiment switches are ignored; Grid or legacy origin is "off".
+-- Frame anchoring and multi-unit members keep their existing explanations.
+function Display.FlowIndependentGroupProblem(group)
+  if not group then return "off" end
+  if not Display.FlowGroupOwned(group) or Display.FlowGrid(group) then return "off" end
+  if group.blizzardFlowFrames == "UNITFRAME" or group.blizzardFlowFrames == "NAMEPLATE" then return "frame" end
+  local g = GROWTH[GrowthKey(group)]
+  if not g then return "growth" end   -- (dev.74) Centered is taken: see FlowIndependentGroup
+  for _, childID in ipairs(group.controlledChildren or {}) do
+    if not SingleUnitMember(WeakAuras.GetData(childID)) then return "unit" end
+  end
+end
+
+function Display.FlowIndependent(data)
+  local group = Display.FlowGroup(data)
+  if not Display.FlowIndependentGroup(group) then return false end
+  if Display.FlowFrameMode(data) then return false end
+  if Display.IconsPerRow and Display.IconsPerRow(data) then return false end
+  local trigger = Display.GetTrigger(data)
+  if not trigger or Display.ShowOn(trigger) ~= "showOnActive" or Display.UsesGate(data) then return false end
+  if Display.RemainingRange and Display.RemainingRange(trigger) then return false end
+  return SingleUnitMember(data)
+end
+
+-- The frame a carrier is pinned to: the group's own region (non-secret).
+function Display.CarrierPin(data)
+  local group = Display.FlowGroup(data)
+  local region = group and RowOrigin(group)
+  return region
+end
+
+-- The padding M of the translation helpers, from settings only: both helper
+-- sizes stay positive while M exceeds every distance a member start or a
+-- native corner can be from the pin, in either direction; the whole
+-- configured membership counts (a row's Limit only clips), with every
+-- member's own offset. Recomputed whenever a member's end is recorded.
+function Display.CarrierPadding(group)
+  local total = 0
+  for _, childID in ipairs(group and group.controlledChildren or {}) do
+    local child = WeakAuras.GetData(childID)
+    if child then
+      local okD, w, h = pcall(Display.Dimensions, child)
+      local size = okD and math.max(tonumber(w) or 0, tonumber(h) or 0, 1) or 64
+      local okM, max = pcall(Display.MaxAuras, child)
+      local count = math.max(1, okM and tonumber(max) or 1)
+      local okS, _, spacing = pcall(Display.FlowGrowth, child)
+      spacing = okS and math.abs(tonumber(spacing) or 0) or 0
+      total = total + count * (size + spacing + 1) + math.abs(tonumber(child.xOffset) or 0) + math.abs(tonumber(child.yOffset) or 0)
+    end
+  end
+  return 2 * total + 64
+end
+
+-- The helpers carry NO explicit size: a frame with one takes its width and
+-- height from it, and only opposite-corner anchors (H's TOPLEFT/BOTTOMRIGHT)
+-- override that; P's TOPLEFT + CENTER pair does not, so a sized P stayed
+-- 1x1 and every output landed on one point up-left of the pin (dev.25 trace,
+-- plain control: "P 1.0 x 1.0 (expected 162.0 x 240.0)"). The sizes of H and
+-- P come from their anchors alone.
+local function CarrierFrames(parent)
+  local frames = {}
+  for _, key in ipairs({"h", "p"}) do
+    local frame = CreateFrame("Frame", nil, parent, "DisableUntrustedLayoutScriptsTemplate")
+    frame:EnableMouse(false)
+    frames[key] = frame
+  end
+  return frames
+end
+
+-- Places "out" so that its outPoint corner is at startPoint of startFrame plus
+-- (nativePoint of nativeFrame minus the pin's TOPLEFT), through the helpers:
+--   H: TOPLEFT = S, BOTTOMRIGHT = B + (M, -M)      so H.CENTER = (S + B + M) / 2
+--   P: TOPLEFT = R, CENTER = H.CENTER             so P.BOTTOMRIGHT = S + B - R + M
+--   out: outPoint = P.BOTTOMRIGHT + (-M, M)        = S + (B - R)
+-- Returns true, or false, the operation that failed and the client's error
+-- (a locked frame is "locked", not a refusal), so a native refusal can be
+-- named exactly (dev.18 review). Every write is guarded.
+local function Translate(frames, startFrame, startPoint, nativeFrame, nativePoint, pin, M, out, outPoint)
+  local H, P = frames.h, frames.p
+  for _, f in ipairs({H, P, out}) do
+    if Busy(f) then return false, "locked", f == out and "box" or f == H and "helper H" or "helper P" end
+  end
+  -- ForeverAuras (dev.84, Dan's combat freeze): the TARGETS are checked before
+  -- anything is cleared. The steps below clear H, P and out first and anchor
+  -- them again; an anchor to a forbidden target (a start that depends on a
+  -- bound end) is refused, and the three frames were then left with no
+  -- anchors at all while the row still hung from out (the next shadow's
+  -- start, the visible row's start): an unresolved dependency the client's
+  -- layout walk revisits through every duplicate entry until it hangs (the
+  -- same walk as the dev.77 import freezes). Nothing is cleared that cannot
+  -- be anchored again.
+  for _, pair in ipairs({{startFrame, "the member's start"}, {nativeFrame, "the native corner"}, {pin, "the pin"}}) do
+    if Locked(pair[1]) then return false, "a forbidden target", pair[2] .. " is forbidden (it depends on a bound end); nothing cleared" end
+  end
+  -- (dev.89, Astra's dev.88 review P1) non-destructive: each anchor is written on the point it already has
+  -- (replaced in one write); nothing is cleared first, so a refusal at any step leaves every frame with the
+  -- anchors it had on the points not yet written - all resolvable, nothing to restore. A frame that carries
+  -- a point of another name (the output's corner changed with the row's growth) is cleared first, out of
+  -- restrictions only; under them it is refused and the caller keeps its old construction.
+  do
+    local wanted = {[H] = {TOPLEFT = true, BOTTOMRIGHT = true}, [P] = {TOPLEFT = true, CENTER = true}, [out] = {[outPoint] = true}}
+    for _, f in ipairs({H, P, out}) do
+      -- (a frame whose points cannot be read is written as it is: the writes below replace the points they name)
+      local okN, n = pcall(function() return f:GetNumPoints() end)
+      local stale = false
+      -- A successful API call can still return secret values. They must not
+      -- drive a loop or become a table key. Unknown points are left intact;
+      -- the guarded writes below replace only the known points we own.
+      local count = okN and not issecretvalue(n) and type(n) == "number" and n or 0
+      for i = 1, count do
+        local okP, point = pcall(function() return f:GetPoint(i) end)
+        if okP and not issecretvalue(point) and type(point) == "string" and not wanted[f][point] then stale = true end
+      end
+      if stale then
+        if RestrictedNow() then return false, "another corner", (f == out and "the output" or "a helper") .. " carries another point under restrictions; nothing written" end
+        local okC, errC = pcall(f.ClearAllPoints, f)
+        if not okC then return false, "clear", tostring(errC) end
+      end
+    end
+  end
+  local steps = {
+    {"H to the member's start", function() H:SetPoint("TOPLEFT", startFrame, startPoint, 0, 0) end},
+    {"H to the native corner", function() H:SetPoint("BOTTOMRIGHT", nativeFrame, nativePoint, M, -M) end},
+    {"P to the pin", function() P:SetPoint("TOPLEFT", pin, "TOPLEFT", 0, 0) end},
+    {"P centred on H", function() P:SetPoint("CENTER", H, "CENTER", 0, 0) end},
+    {"output to P", function() out:SetPoint(outPoint, P, "BOTTOMRIGHT", -M, M) end},
+  }
+  for _, step in ipairs(steps) do
+    local ok, err = pcall(step[2])
+    if not ok then return false, step[1], tostring(err) end
+  end
+  return true
+end
+
+Display.TranslatePoint = Translate   -- ForeverAuras (dev.79): a measurement chain's end translated into the row (SecretAuraChain.lua)
+-- The padding a member's boxes and end use: computed once per member per
+-- layout (TranslateEnd) and kept on the flow, so a button's placement does
+-- not scan the membership again.
+local function CarrierM(flow, data)
+  if not flow.carrierM then flow.carrierM = Display.CarrierPadding(Display.FlowGroup(data)) end
+  return flow.carrierM
+end
+
+-- A list button's artwork box in an independent-carrier row: made with the
+-- button (BuildButton, withBox) and placed here, inside the client's
+-- initializeFrame and again by every layout (TranslateEnd), at the member's
+-- content corner plus the button's own corner offset inside its carrier.
+-- The placement is recorded as complete only when every write succeeded,
+-- with the references it was made for (content frame, pin, corner, padding,
+-- size): a later call with the same references and a complete placement
+-- writes nothing (a locked, finished box is kept); any difference, or an
+-- incomplete placement, is placed again. Returns true, or false and
+-- "operation: error" (dev.18 review).
+function Display.PlaceCarrierBox(native, region, data)
+  local owner = region.blizzardAuraDisplay
+  local flow = owner and owner.flow
+  if not flow or not flow.content or not flow.growth then return false, "no row content frame" end
+  if not native.box then return false, "no box" end
+  local pin = Display.CarrierPin(data)
+  if not pin then return false, "no group frame" end
+  local g = flow.growth
+  local M = CarrierM(flow, data)
+  local width, height = Display.Dimensions(data)
+  local placed = native.carrierPlaced
+  if placed and placed.complete and placed.content == flow.content and placed.pin == pin and placed.start == g.start
+    and placed.M == M and placed.width == width and placed.height == height and placed.box == native.box then
+    return true
+  end
+  native.carrierPlaced = nil
+  if not native.carrier then
+    local ok, frames = pcall(CarrierFrames, native.button)
+    if not ok then native.carrierFailure = {op = "helpers", err = tostring(frames)}; return false, "helpers: " .. tostring(frames) end
+    native.carrier = frames
+  end
+  local okSize, errSize = pcall(native.box.SetSize, native.box, width, height)
+  if not okSize then native.carrierFailure = {op = "box size", err = tostring(errSize)}; return false, "box size: " .. tostring(errSize) end
+  local ok, op, err = Translate(native.carrier, flow.content, g.start, native.button, g.start, pin, M, native.box, g.start)
+  if not ok then
+    native.carrierFailure = {op = op, err = err}
+    return false, tostring(op) .. ": " .. tostring(err)
+  end
+  native.carrierFailure = nil
+  native.carrierPlaced = {complete = true, content = flow.content, pin = pin, start = g.start, M = M, width = width, height = height, box = native.box}
+  return true
+end
+
+-- Every box of the member placed (or left as it is when complete and
+-- current); returns the number of failures and the first failure's text.
+-- Every box of the member placed (or left as it is when complete and
+-- current). A failure is counted against its instance's build (NoteSlotFailure:
+-- a probe build's finishing or late styling then rejects the build, as a
+-- refused measurement does) and the display's paced re-apply is requested.
+-- Returns the number of failures and the first failure's text.
+local function PlaceCarrierBoxes(region, data)
+  local native = region.blizzardAuraDisplay
+  local failures, first = 0, nil
+  for _, instance in ipairs(native and native.instances or {}) do
+    for _, button in ipairs(instance.buttons or {}) do
+      if button.box then
+        local ok, why = Display.PlaceCarrierBox(button, region, data)
+        if not ok then
+          failures = failures + 1
+          first = first or why
+          if Display.NoteSlotFailure then Display.NoteSlotFailure(instance, "carrier box", why) end
+        end
+      end
+    end
+  end
+  if failures > 0 and Display.NotePendingRelayout then Display.NotePendingRelayout(region) end
+  -- ForeverAuras (dev.31 diagnostics): the build history notes each pass.
+  if Display.NoteCarrierEvent then Display.NoteCarrierEvent(region, "boxes", ("%d failed"):format(failures)) end
+  return failures, first
+end
+
+-- What the editor says about the experiment on this display, from the
+-- CURRENT state: the boxes' recorded failures (so a late callback's refusal
+-- shows at once, not after the next layout) and the end's problem. Called
+-- by the row layout (SetFlowEnd) and by a late button's placement
+-- (BlizzardAuraDisplay.lua, Create); cleared by both when nothing is wrong.
+local function ClearMeasureOutputWarning(data)
+  if data and data.uid and Private.AuraWarnings and Private.AuraWarnings.UpdateWarning then
+    Private.AuraWarnings.UpdateWarning(data.uid, "blizzard_aura_row_measure", nil, nil)
+  end
+end
+function Display.PublishCarrierWarnings(region, data, pending)
+  if not Display.MeasuresEnd or not Display.MeasuresEnd(data) then ClearMeasureOutputWarning(data) end
+  local native = region.blizzardAuraDisplay
+  local flow = native and native.flow
+  if not flow then return end
+  local failures, first = 0, nil
+  -- Outside the experiment nothing of it is reported, whatever old records
+  -- the buttons still carry (their containers are made again on the change).
+  local independent = Display.FlowIndependent(data)
+  if not independent then flow.carrierProblem = nil end
+  local seen = {}
+  local function Note(button)
+    if seen[button] then return end
+    seen[button] = true
+    if button.carrierFailure then
+      failures = failures + 1
+      first = first or (tostring(button.carrierFailure.op) .. ": " .. tostring(button.carrierFailure.err))
+    end
+  end
+  for _, instance in ipairs(independent and native.instances or {}) do
+    for _, button in ipairs(instance.buttons or {}) do Note(button) end
+  end
+  -- A record still being made (the client's callback has not returned it
+  -- to its list yet) is counted with the rest (dev.20 review).
+  if independent and pending then Note(pending) end
+  flow.carrierBoxProblem = failures > 0 and (L["%d button(s): %s"]):format(failures, tostring(first)) or nil
+  if Private and Private.AuraWarnings and data and data.uid then
+    local problem = flow.carrierProblem and L["Row cells: %s. The next display is laid out from this display's carrier, which is the wrong place."]:format(tostring(flow.carrierProblem))
+    Private.AuraWarnings.UpdateWarning(data.uid, "blizzard_aura_carrier", problem and "warning" or nil, problem)
+    local boxes = flow.carrierBoxProblem and L["Row cells: a button's artwork could not be placed on the row: %s"]:format(tostring(flow.carrierBoxProblem))
+    Private.AuraWarnings.UpdateWarning(data.uid, "blizzard_aura_carrier_box", boxes and "warning" or nil, boxes)
+  end
+  -- ForeverAuras (cell chain, dev.40 review): the chained list's own state
+  -- (why a gated list is not chained; refused links; records past the batch).
+  if Display.PublishChainWarnings then Display.PublishChainWarnings(region, data) end
+end
+
+-- The translated end of an independent carrier: where the next member starts,
+-- from the member's start frame and the carrier's list end. Places the
+-- member's boxes first (a failed or stale one is placed again; a failure is
+-- reported in the editor and queues the display's paced re-apply, the same
+-- path a refused style takes). Returns the end frame (its TOPLEFT is the
+-- point) or nil and why when the client refused.
+local function TranslateEnd(region, flow, container, g, data)
+  local pin = Display.CarrierPin(data)
+  if not pin then return nil, "no group frame" end
+  -- The padding for this layout, from the current membership.
+  flow.carrierM = Display.CarrierPadding(Display.FlowGroup(data))
+  PlaceCarrierBoxes(region, data)
+  if not flow.carrierEnd or Locked(flow.carrierEnd.h) or Locked(flow.carrierEnd.p) or Locked(flow.carrierEnd.out) then
+    flow.carrierEnd = CarrierFrames(region)
+    flow.carrierEnd.out = CreateFrame("Frame", nil, region, "DisableUntrustedLayoutScriptsTemplate")
+    flow.carrierEnd.out:EnableMouse(false)
+    flow.carrierEnd.out:SetSize(1, 1)
+  end
+  local ok, op, err = Translate(flow.carrierEnd, flow.start, g.start, container, g.listEnd, pin, flow.carrierM, flow.carrierEnd.out, "TOPLEFT")
+  -- ForeverAuras (dev.31 diagnostics): the build history notes the end.
+  if Display.NoteCarrierEvent then Display.NoteCarrierEvent(region, "end", ok and "ok" or tostring(op)) end
+  if not ok then return nil, tostring(op) .. ": " .. tostring(err) end
+  return flow.carrierEnd.out
+end
+
+-- ForeverAuras (development, dev.31): the build history of a display, for
+-- the carrier diagnostics. An explicit record made AT each lifecycle event
+-- (not a cache relabelled afterwards: native.previewStyled is kept up to
+-- date by RefreshPreview as well, so it is no history of the build). Each
+-- entry: the apply epoch (counted up by every apply), the time, the event,
+-- and whether the editor was open, combat was on and auras were secret at
+-- that moment. The last 16 are kept per display. Called from ApplyDisplay
+-- ("apply"), Create ("container"), FinishApply ("finish"), TranslateEnd
+-- ("end") and PlaceCarrierBoxes ("boxes").
+local CARRIER_EVENTS = 16
+-- A guarded read of a state flag: true, false, or nil for unknown (the read
+-- was refused or returned a secret value), kept distinct in the history.
+local function Flag(read)
+  local ok, value = pcall(read)
+  if not ok or issecretvalue(value) then return nil end
+  return value and true or false
+end
+function Display.NoteCarrierEvent(region, what, detail)
+  local native = region and region.blizzardAuraDisplay
+  if not native then return end
+  -- Development history for the opted-in groups only (their every member,
+  -- so an import's ordering across B, C and D stays visible); an ordinary
+  -- Modern display records nothing (dev.32 review).
+  local data = native.data
+  if not (data and Display.FlowIndependentGroup(Display.FlowGroup(data))) then return end
+  if what == "apply" then native.carrierEpoch = (native.carrierEpoch or 0) + 1 end
+  local events = native.carrierEvents or {}
+  native.carrierEvents = events
+  local okT, now = pcall(GetTime)
+  events[#events + 1] = {epoch = native.carrierEpoch or 0, time = okT and not issecretvalue(now) and now or nil, what = what, detail = detail,
+    editor = Flag(function() return WeakAuras.IsOptionsOpen() end),
+    combat = Flag(InCombatLockdown),
+    secret = Flag(function() return C_Secrets and C_Secrets.ShouldAurasBeSecret() end)}
+  while #events > CARRIER_EVENTS do table.remove(events, 1) end
+end
+
+-- Development print (/fa carriers <group>, dev.29-31): per member, its
+-- configured settings (growth, size, spacing, capacity, padding), then the
+-- COMPLETE readable constraints of every frame this addon anchored for the
+-- experiment: the member's start and content frames, every container, the
+-- end helpers (H, P, out) and EVERY tracked button record (stable index =
+-- its place in the instance's list, the same number the markers show) with
+-- its button, H, P and box. For each frame: how many points it has and, for
+-- each point, its own corner, the frame it hangs from (named by identity:
+-- the pin, start, content, a numbered container/button/box/helper of this
+-- display, the display's own frame, or OTHER with the frame's name or type),
+-- the relative corner and the offsets. Every value is guarded: a refused or
+-- secret answer prints as "?" and is never compared or treated as zero. The
+-- build history (NoteCarrierEvent) follows. Nothing is read from a native
+-- position; only the arguments this addon passed, as the client reports them.
+local function Readable(v) return not issecretvalue(v) and v ~= nil end
+local function Num(v)
+  if not Readable(v) or type(v) ~= "number" then return "?" end
+  if v == math.floor(v) then return ("%d"):format(v) end
+  return ("%.2f"):format(v)
+end
+local function SafeName(frame)
+  local okN, name = pcall(function() return frame.GetName and frame:GetName() end)
+  if okN and Readable(name) and name ~= "" then return tostring(name) end
+  local okT, kind = pcall(function() return frame.GetObjectType and frame:GetObjectType() end)
+  return okT and Readable(kind) and tostring(kind) or "?"
+end
+-- The readable constraints of one frame, with a naming function for the
+-- frames it hangs from. "none" = no points; "?" = unreadable.
+local function Constraints(frame, Name)
+  if not frame then return "missing" end
+  local okN, n = pcall(function() return frame:GetNumPoints() end)
+  if not okN or not Readable(n) then return "points ?" end
+  if n == 0 then return "no points" end
+  local parts = {}
+  for i = 1, n do
+    local ok, point, rel, relPoint, x, y = pcall(frame.GetPoint, frame, i)
+    if not ok then parts[#parts + 1] = "[?]"
+    else
+      parts[#parts + 1] = ("[%s -> %s.%s %s,%s]"):format(Readable(point) and tostring(point) or "?",
+        Readable(rel) and Name(rel) or "?", Readable(relPoint) and tostring(relPoint) or "?", Num(x), Num(y))
+    end
+  end
+  local okS, shown = pcall(function() return frame:IsShown() end)
+  return table.concat(parts, " ") .. (okS and Readable(shown) and (shown and " shown" or " hidden") or " shown?")
+end
+function Display.PrintCarriers(id)
+  local group = WeakAuras.GetData(id)
+  if not group or not group.blizzardFlow then print(L["FA carriers: %s is not a Modern Aura Group."]:format(tostring(id))); return end
+  local okE, editor = pcall(function() return WeakAuras.IsOptionsOpen() end)
+  print(L["FA carriers: %s: setting %s, growth %s, independent group %s, editor open now %s, combat now %s"]:format(id, "automatic",
+    tostring(GrowthKey(group)), tostring(Display.FlowIndependentGroup(group)), tostring(okE and editor or false), tostring(InCombatLockdown())))
+  local pin = Display.CarrierPin({parent = id})
+  -- Names by identity, across the whole group, so a start frame that hangs
+  -- from the previous member's end (or its container) is named as such.
+  local names = {}
+  if pin then names[pin] = "pin" end
+  for _, childID in ipairs(Display.FlowOrder(group)) do
+    local entry = Private.regions[childID]
+    local region = entry and entry.region
+    local native = region and region.blizzardAuraDisplay
+    local flow = native and native.flow
+    if region then names[region] = childID .. ".region" end
+    if flow then
+      if flow.start then names[flow.start] = childID .. ".start" end
+      if flow.content then names[flow.content] = childID .. ".content" end
+      if flow.remain then names[flow.remain] = childID .. ".remain" end
+      if flow.carrierEnd then
+        names[flow.carrierEnd.h] = childID .. ".endH"; names[flow.carrierEnd.p] = childID .. ".endP"
+        if flow.carrierEnd.out then names[flow.carrierEnd.out] = childID .. ".endOut" end
+      end
+    end
+    for index, instance in ipairs(native and native.instances or {}) do
+      if instance.container then names[instance.container] = childID .. ".container" .. index end
+      -- ForeverAuras (dev.34): a Missing member's presence container (its end), named.
+      local missing = instance.single and instance.single.missing
+      if missing and missing.presence then names[missing.presence] = childID .. ".presence" end
+      for i, button in ipairs(instance.buttons or {}) do
+        if button.button then names[button.button] = childID .. ".button" .. i end
+        if button.box then names[button.box] = childID .. ".box" .. i end
+        if button.carrier then names[button.carrier.h] = childID .. ".H" .. i; names[button.carrier.p] = childID .. ".P" .. i end
+      end
+    end
+  end
+  local function Name(frame)
+    if frame == nil then return "nil" end
+    return names[frame] or ("OTHER(" .. SafeName(frame) .. ")")
+  end
+  print(L["  pin (group frame): %s"]:format(Constraints(pin, Name)))
+  for _, childID in ipairs(Display.FlowOrder(group)) do
+    local data = WeakAuras.GetData(childID)
+    local entry = Private.regions[childID]
+    local region = entry and entry.region
+    local native = region and region.blizzardAuraDisplay
+    local flow = native and native.flow
+    if data and native then
+      local okD, width, height = pcall(Display.Dimensions, data)
+      local okG, growth, spacing = pcall(Display.FlowGrowth, data)
+      local okM, max = pcall(Display.MaxAuras, data)
+      print(L["  %s: independent %s, pinned %s, end %s, boxes %s; configured: growth %s, size %sx%s, spacing %s, capacity %s, padding %s, own offset %s,%s"]:format(childID,
+        tostring(Display.FlowIndependent(data)), tostring(flow and flow.carrierPinned), flow and flow.carrierProblem or L["ok"], flow and flow.carrierBoxProblem or L["ok"],
+        okG and tostring(growth) or "?", okD and Num(width) or "?", okD and Num(height) or "?", okG and Num(spacing) or "?", okM and Num(max) or "?",
+        flow and flow.carrierM and Num(flow.carrierM) or "none", Num(tonumber(data.xOffset) or 0), Num(tonumber(data.yOffset) or 0)))
+      if flow then
+        print(L["    start: %s"]:format(Constraints(flow.start, Name)))
+        print(L["    content: %s"]:format(Constraints(flow.content, Name)))
+        print(L["    end in use: %s at %s %s,%s; translated end %s"]:format(Name(flow.endFrame), tostring(flow.endPoint), Num(flow.x), Num(flow.y),
+          flow.carrierEnd and (flow.endFrame == flow.carrierEnd.out and "in use" or "NOT in use") or "none"))
+        if flow.carrierEnd then
+          print(L["    endH: %s"]:format(Constraints(flow.carrierEnd.h, Name)))
+          print(L["    endP: %s"]:format(Constraints(flow.carrierEnd.p, Name)))
+          print(L["    endOut: %s"]:format(Constraints(flow.carrierEnd.out, Name)))
+        end
+      end
+      for index, instance in ipairs(native.instances or {}) do
+        print(L["    container%d: %s"]:format(index, Constraints(instance.container, Name)))
+        local placed, failed = 0, 0
+        for i, button in ipairs(instance.buttons or {}) do
+          local record = button.carrierPlaced
+          local state = record and record.complete and "complete" or record and "incomplete" or "none"
+          if record and record.complete then placed = placed + 1 end
+          if button.carrierFailure then failed = failed + 1 end
+          if button.box or button.carrier or record or button.carrierFailure then
+            print(L["    #%d record %s%s; button %s; H %s; P %s; box %s"]:format(i, state,
+              button.carrierFailure and ("; failure " .. tostring(button.carrierFailure.op) .. ": " .. tostring(button.carrierFailure.err)) or "",
+              Constraints(button.button, Name), Constraints(button.carrier and button.carrier.h, Name),
+              Constraints(button.carrier and button.carrier.p, Name), Constraints(button.box, Name)))
+            -- ForeverAuras (dev.34): the artwork's own state, for the "picture
+            -- missing, countdown present" observation: the icon texture, its
+            -- frame (sharedBase, on the gate clip) and the elements holder.
+            -- Every read guarded; a secret answer is "?".
+            local function Tex(t)
+              if not t then return "missing" end
+              local okS, shown = pcall(function() return t:IsShown() end)
+              local okA, alpha = pcall(function() return t:GetAlpha() end)
+              local okT, tex = pcall(function() return t:GetTexture() end)
+              local okL, layer = pcall(function() return t:GetDrawLayer() end)
+              return ("%s a=%s tex=%s %s %s"):format(okS and Readable(shown) and (shown and "shown" or "hidden") or "shown?",
+                okA and Num(alpha) or "?", (okT and not issecretvalue(tex)) and (tex ~= nil and "set" or "none") or "?",
+                okL and Readable(layer) and tostring(layer) or "?", Constraints(t, Name))
+            end
+            local base = button.elementFrames and button.elementFrames.sharedBase
+            if base then names[base] = childID .. ".base" .. i end
+            if button.elements then names[button.elements] = childID .. ".elements" .. i end
+            if button.gateClip then names[button.gateClip] = childID .. ".clip" .. i end
+            print(L["      art: icon %s; base %s; elements %s; clip %s"]:format(Tex(button.icon), Constraints(base, Name), Constraints(button.elements, Name), Constraints(button.gateClip, Name)))
+          else
+            print(L["    #%d no box (not an independent-carrier button); button %s"]:format(i, Constraints(button.button, Name)))
+          end
+        end
+        local cb = instance.callbacks or {initial = {attempts = 0, constructed = 0, failed = 0, operations = 0},
+          later = {attempts = 0, built = 0, failed = 0, operations = 0, restricted = 0, restrictedBuilt = 0, restrictedFailed = 0}}
+        print(L["    container %d: %d buttons; callbacks with the container: %d attempted, %d constructed (styled afterwards), %d failed (%d refused operations); later: %d attempted, %d built, %d failed (%d refused operations); of the later ones under restrictions: %d attempted, %d built, %d failed; boxes now: %d placed, %d failed%s"]:format(index,
+          #(instance.buttons or {}), cb.initial.attempts, cb.initial.constructed, cb.initial.failed, cb.initial.operations,
+          cb.later.attempts, cb.later.built, cb.later.failed, cb.later.operations, cb.later.restricted, cb.later.restrictedBuilt, cb.later.restrictedFailed, placed, failed,
+          instance.lastCallbackFailure and ("; last callback failure: " .. tostring(instance.lastCallbackFailure)) or ""))
+      end
+      local history = native.carrierHistory
+      if history then
+        print(L["    history since login (all containers of this display, not the current state): later callbacks %d attempted, %d built, %d failed; under restrictions %d attempted, %d built, %d failed"]:format(
+          history.attempts, history.built or 0, history.failed, history.restricted, history.restrictedBuilt or 0, history.restrictedFailed or 0))
+      end
+      local events = {}
+      for _, e in ipairs(native.carrierEvents or {}) do
+        -- A flag: named when true, "?" when its read was refused, silent when false.
+        local function Shown(flag, name) if flag == nil then return " " .. name .. "?" elseif flag then return " " .. name else return "" end end
+        events[#events + 1] = ("%d:%s%s@%s%s%s%s"):format(e.epoch, e.what, e.detail and ("(" .. tostring(e.detail) .. ")") or "", Num(e.time),
+          Shown(e.editor, "editor"), Shown(e.combat, "combat"), Shown(e.secret, "secret"))
+      end
+      print(L["    events (epoch:event@time, flags at that moment): %s"]:format(#events > 0 and table.concat(events, "; ") or L["nothing"]))
+    elseif data then
+      print(L["  %s: not built"]:format(childID))
+    end
+  end
+end
+
+-- Development markers (/fa carriermarks <group>, dev.29-31): coloured marks
+-- on the ACTUAL frames of a row's independent lists, so a screenshot shows
+-- where each stage of the construction lands. Red 10 px square = the pin
+-- (the group's TOPLEFT); cyan 8 px square = each member's start corner;
+-- white 14 px RING = its content corner (a ring, so that the cyan square it
+-- normally coincides with stays visible inside it); yellow 10 px = each
+-- container's TOPLEFT and orange 10 px = its BOTTOMRIGHT (the container's own
+-- rectangle, by anchor); blue 8 px square = each tracked button's start
+-- corner, with the record's index written under it; green 6 px square = the
+-- box's start corner (bright for a complete placement record, dim for an
+-- incomplete or missing one), with the index written above it; magenta 10 px
+-- = the translated list end. The button and box marks are children of the
+-- button, so only shown buttons show them. Nothing is read, no live frame is
+-- re-anchored: markers are new frames anchored to existing ones. Every
+-- creation and placement is guarded; the print says how many failed, and
+-- "off" removes every mark of a run, a partial one included.
+local marks, markFailures = {}, 0
+local function Mark(parent, r, g, b, size, label, labelBelow)
+  local ok, f = pcall(CreateFrame, "Frame", nil, parent, "DisableUntrustedLayoutScriptsTemplate")
+  if not ok or not f then markFailures = markFailures + 1; return nil end
+  marks[#marks + 1] = f
+  local okS = pcall(function()
+    f:SetSize(size or 8, size or 8)
+    f:SetFrameStrata("TOOLTIP")
+    f:EnableMouse(false)
+    local tex = f:CreateTexture(nil, "OVERLAY"); tex:SetAllPoints(); tex:SetColorTexture(r, g, b, 0.9)
+    if label then
+      local text = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+      text:SetText(tostring(label))
+      text:SetTextColor(r, g, b, 1)
+      if labelBelow then text:SetPoint("TOP", f, "BOTTOM", 0, -1) else text:SetPoint("BOTTOM", f, "TOP", 0, 1) end
+    end
+  end)
+  if not okS then markFailures = markFailures + 1 end
+  return f
+end
+-- A hollow square (four 1 px edges), for a mark that sits on another mark.
+local function Ring(parent, r, g, b, size)
+  local ok, f = pcall(CreateFrame, "Frame", nil, parent, "DisableUntrustedLayoutScriptsTemplate")
+  if not ok or not f then markFailures = markFailures + 1; return nil end
+  marks[#marks + 1] = f
+  local okS = pcall(function()
+    f:SetSize(size, size)
+    f:SetFrameStrata("TOOLTIP")
+    f:EnableMouse(false)
+    for _, edge in ipairs({{"TOPLEFT", "TOPRIGHT", 1, nil}, {"BOTTOMLEFT", "BOTTOMRIGHT", 1, nil}, {"TOPLEFT", "BOTTOMLEFT", nil, 1}, {"TOPRIGHT", "BOTTOMRIGHT", nil, 1}}) do
+      local tex = f:CreateTexture(nil, "OVERLAY"); tex:SetColorTexture(r, g, b, 0.9)
+      tex:SetPoint(edge[1]); tex:SetPoint(edge[2])
+      if edge[3] then tex:SetHeight(1) else tex:SetWidth(1) end
+    end
+  end)
+  if not okS then markFailures = markFailures + 1 end
+  return f
+end
+local function Pin(mark, point, frame, relPoint)
+  if not mark then return end
+  local ok = pcall(mark.SetPoint, mark, point, frame, relPoint)
+  if not ok then markFailures = markFailures + 1 end
+end
+function Display.MarkCarriers(id)
+  Display.UnmarkCarriers()
+  local group = WeakAuras.GetData(id)
+  if not group or not group.blizzardFlow then print(L["FA carriermarks: %s is not a Modern Aura Group."]:format(tostring(id))); return end
+  local pin = Display.CarrierPin({parent = id})
+  local g = GROWTH[GrowthKey(group)]
+  if pin then Pin(Mark(pin, 1, 0.2, 0.2, 10), "CENTER", pin, "TOPLEFT") end
+  local boxes, containers = 0, 0
+  for _, childID in ipairs(Display.FlowOrder(group)) do
+    local entry = Private.regions[childID]
+    local native = entry and entry.region and entry.region.blizzardAuraDisplay
+    local flow = native and native.flow
+    if flow and flow.start then
+      Pin(Mark(entry.region, 0.2, 1, 1, 8), "CENTER", flow.start, g.start)
+      if flow.content then Pin(Ring(entry.region, 1, 1, 1, 14), "CENTER", flow.content, g.start) end
+      if flow.carrierEnd and flow.carrierEnd.out and flow.endFrame == flow.carrierEnd.out then
+        Pin(Mark(entry.region, 1, 0.2, 1, 10), "CENTER", flow.carrierEnd.out, "TOPLEFT")
+      end
+      for _, instance in ipairs(native.instances or {}) do
+        if instance.container and Display.FlowIndependent(native.data) then
+          containers = containers + 1
+          Pin(Mark(entry.region, 1, 0.9, 0.1, 10), "CENTER", instance.container, "TOPLEFT")
+          Pin(Mark(entry.region, 1, 0.5, 0.1, 10), "CENTER", instance.container, "BOTTOMRIGHT")
+        end
+        for i, button in ipairs(instance.buttons or {}) do
+          if button.button then Pin(Mark(button.button, 0.2, 0.4, 1, 8, i, true), "CENTER", button.button, g.start) end
+          if button.box then
+            local complete = button.carrierPlaced and button.carrierPlaced.complete
+            Pin(Mark(button.button, complete and 0.3 or 0.1, complete and 1 or 0.5, complete and 0.3 or 0.1, 6, i, false), "CENTER", button.box, g.start)
+            boxes = boxes + 1
+          end
+        end
+      end
+    end
+  end
+  print(L["FA carriermarks: %s: red pin, cyan member starts, white rings content corners, yellow/orange container TOPLEFT/BOTTOMRIGHT (%d containers), blue native button corners (index below), green box corners (index above; dim = no complete record; %d boxes), magenta translated list ends. %d marker operations failed. Type /fa carriermarks off to remove."]:format(id, containers, boxes, markFailures))
+end
+-- Removes every mark of the last run. Hide and ClearAllPoints are guarded
+-- separately; a mark that refused either stays on the list and is tried
+-- again by the next "off" or the next marking, so a partial run is never
+-- forgotten (dev.32 review). Returns how many marks are still stuck.
+function Display.UnmarkCarriers()
+  local stuck = {}
+  for _, f in ipairs(marks) do
+    local hidden = pcall(f.Hide, f)
+    local cleared = pcall(f.ClearAllPoints, f)
+    if not (hidden and cleared) then stuck[#stuck + 1] = f end
+  end
+  marks, markFailures = stuck, 0
+  if #stuck > 0 then print(L["FA carriermarks: %d mark(s) could not be removed yet; they will be tried again next time."]:format(#stuck)) end
+  return #stuck
+end
+
 -- A member's content frame in a group-owned row: the same rectangle as its
 -- start frame, moved by the member's own X/Y Offset. Containers, the Missing
 -- look, samples and stand copies hang from it (ContentAnchor), so the offset
@@ -374,12 +1256,18 @@ end
 local function PlaceContent(flow, ox, oy)
   local content = flow.content
   if not content or Busy(content) then return end
+  -- ForeverAuras (dev.70): under aura restrictions a content frame already
+  -- on this start with these offsets is not written again (its start may
+  -- hang from a chained member's end, which the client guards then).
+  local last = content.faContent
+  if last and RestrictedNow() and last[1] == flow.start and last[2] == (ox or 0) and last[3] == (oy or 0) then return end
   -- A child of the start frame, so it shows and hides with it (the editor
   -- hides a stand's start frame while its preview stands in).
   if content:GetParent() ~= flow.start and not InCombatLockdown() then content:SetParent(flow.start) end
   content:ClearAllPoints()
   content:SetPoint("TOPLEFT", flow.start, "TOPLEFT", ox or 0, oy or 0)
   content:SetPoint("BOTTOMRIGHT", flow.start, "BOTTOMRIGHT", ox or 0, oy or 0)
+  content.faContent = {flow.start, ox or 0, oy or 0}
 end
 
 -- Where this display's content is drawn from: its content frame in a
@@ -394,6 +1282,7 @@ end
 function Display.EnsureFlowStart(region, data)
   local native = region.blizzardAuraDisplay
   if not Display.FlowGroup(data) then
+    ClearMeasureOutputWarning(data)
     if native.flow then SetShown(native.flow.start, false); native.flow = nil end
     return
   end
@@ -412,9 +1301,14 @@ function Display.EnsureFlowStart(region, data)
   SetShown(flow.start, true)
   local growth = Display.FlowGrowth(data)
   flow.growth = GROWTH[growth]
-  -- Until the chain is built, start where the region is.
-  flow.start:ClearAllPoints()
-  flow.start:SetPoint(flow.growth.start, region, flow.growth.start)
+  -- Until the chain is built, start where the region is. ForeverAuras
+  -- (dev.70): a start prewired on the previous member's chained end
+  -- (PrewireFollower) keeps that place; it is not reset here.
+  if not flow.startPrewired then
+    flow.start:ClearAllPoints()
+    flow.start:SetPoint(flow.growth.start, region, flow.growth.start)
+    flow.start.faPlace = nil   -- the placement record (Place) is stale now
+  end
   -- ForeverAuras: group-owned row: the content frame carries the display's
   -- own offset (FlowContent); a legacy row draws from the start frame.
   local hadContent = flow.content ~= nil
@@ -452,7 +1346,48 @@ function Display.SetFlowEnd(region, data, presence)
   -- only where it is (RechainFlow); taken off a presence end, a Missing
   -- display's offset moved every member after it the other way.
   flow.endInContent = false
-  if flow.remain then
+  -- ForeverAuras (independent carriers): decided here for the whole display,
+  -- so a display that left the experiment by any route (flag off, or its
+  -- trigger changed to Missing or Remaining Time) drops the experiment's
+  -- state and warnings whatever branch below it takes (dev.19 review).
+  local independent = Display.FlowIndependent ~= nil and Display.FlowIndependent(data)
+  if not independent then
+    flow.carrierProblem, flow.carrierBoxProblem, flow.carrierM = nil, nil, nil
+    if flow.carrierEnd then for _, key in ipairs({"h", "p", "out"}) do pcall(flow.carrierEnd[key].Hide, flow.carrierEnd[key]) end end
+  end
+  -- ForeverAuras (cell chain, SecretAuraChain.lua): a chained filtered list
+  -- ends on its end frame's start corner (FinishChain); the chain's advances
+  -- include the spacing, so nothing is added. The end lives in the content
+  -- frame (the chain hangs from it), so the member's own offset is taken
+  -- back off by the chain as for a list's container.
+  local chainSpec = Display.FlowChain ~= nil and Display.FlowChain(data)
+  local measure = flow.measureChain
+  if chainSpec and flow.chainEndReady and flow.chainEnd then
+    flow.endFrame, flow.endPoint, flow.x, flow.y = flow.chainEnd, flow.chainCorner or g.start, 0, 0
+    flow.endInContent = true
+    flow.remain = nil
+  elseif not chainSpec and measure and measure.flow.chainEndReady and measure.flow.chainEnd then
+    -- ForeverAuras (dev.78): an ordinary member of a row with cells ends on
+    -- its measurement chain (EnsureFlowMeasure), never on a container's edge.
+    -- Local measurements publish their translated end in the member's content.
+    flow.endFrame, flow.endPoint, flow.x, flow.y = measure.out or measure.flow.chainEnd, measure.outCorner or measure.flow.chainCorner or g.start, 0, 0
+    flow.endInContent = true
+    flow.remain = nil
+  elseif chainSpec then
+    -- The chain is not in place (a refused link or end, dev.40 review): the
+    -- display keeps one spot and draws nothing, until the bounded re-apply
+    -- (NoteChainFailure, QuietChain); the editor says so (PublishChainWarnings,
+    -- below). When the client refused to hide some of its cells (restricted
+    -- records), what is drawn is unknown, so the display reserves its full
+    -- length instead: a gap, never an overlap (dev.42 review).
+    -- (native.chainReserve, NoteChainFailure: ten cells at the measured
+    -- advance, the longest of every construction those frames may hold).
+    local extent = native.chainReserve or (width + spacing)
+    if g.sign[2] ~= 0 and not native.chainReserve then extent = height + spacing end
+    flow.endFrame, flow.endPoint = flow.start, g.start
+    flow.x, flow.y = g.sign[1] * extent, g.sign[2] * extent
+    flow.remain = nil
+  elseif flow.remain then
     -- The measured pixels back from the text's end (MeasureText), in the
     -- next display's units.
     local px = PixelsPerUnit(flow.start) or 1
@@ -463,14 +1398,45 @@ function Display.SetFlowEnd(region, data, presence)
   -- A gate (Total Duration or Stack Count) keeps the candidates on one spot.
   elseif showOn == "showOnActive" and not Display.UsesGate(data) and native.instances[1] then
     -- Several units are chained one after another; the last one ends the display.
-    flow.endFrame, flow.endPoint = native.instances[#native.instances].container, g.listEnd
-    flow.x, flow.y = g.pixel[1], g.pixel[2]
-    flow.endInContent = true
+    local last = native.instances[#native.instances].container
+    -- ForeverAuras (independent carriers): the pinned carrier's end is
+    -- translated to the row (TranslateEnd); the pixel an empty container
+    -- keeps is still taken off once, as below. The member's own offset is
+    -- not in this end (it is measured from the start frame), so nothing is
+    -- subtracted for it. A refused translation falls back to the carrier's
+    -- own end, which is then the wrong place, and says so in the editor.
+    local translated, why
+    if independent and flow.carrierPinned then
+      translated, why = TranslateEnd(region, flow, last, g, data)
+    elseif independent then
+      why = flow.carrierPinError or "the carrier could not be pinned to the group"
+    end
+    if translated then
+      flow.endFrame, flow.endPoint = translated, "TOPLEFT"
+      flow.x, flow.y = g.pixel[1], g.pixel[2]
+      flow.endInContent = false
+      flow.carrierProblem = nil
+    else
+      flow.endFrame, flow.endPoint = last, g.listEnd
+      flow.x, flow.y = g.pixel[1], g.pixel[2]
+      flow.endInContent = true
+      if independent then
+        -- A refused pin or end: the wrong end is in use until the paced
+        -- re-apply; counted against the build like a refused box.
+        flow.carrierProblem = why
+        local instance = native.instances[#native.instances]
+        if Display.NoteSlotFailure then Display.NoteSlotFailure(instance, "carrier end", why) end
+        if Display.NotePendingRelayout then Display.NotePendingRelayout(region) end
+      end
+    end
   else
     -- A fixed icon: Always, or a Total Duration list whose candidates overlap.
     flow.endFrame, flow.endPoint = flow.start, g.start
     flow.x, flow.y = g.sign[1] * (width + spacing), g.sign[2] * (height + spacing)
   end
+  -- ForeverAuras (independent carriers): what is wrong, if anything, said in
+  -- the editor from the current state; cleared when nothing is.
+  if Display.PublishCarrierWarnings then Display.PublishCarrierWarnings(region, data) end
 end
 
 -- The Aura(s) Missing end container: one icon plus spacing along the growth
@@ -735,6 +1701,10 @@ function Display.EnsureFlowShadows(region, data)
   if not sh then
     HideShadow(missing, "flowShadow")
     if flow then SetShown(flow.shadowStart, false) end
+    if flow and flow.shadowChain and Display.ReleaseChainSpine then Display.ReleaseChainSpine(flow.shadowChain); flow.shadowKind = nil end
+    -- (dev.90, Astra's dev.89 review) no shadows here: a kept shadow explanation no longer applies
+    if flow then flow.shadowChainProblem = nil end
+    if data and data.uid and Private.AuraWarnings and Private.AuraWarnings.UpdateWarning then Private.AuraWarnings.UpdateWarning(data.uid, "blizzard_aura_shadow", nil, nil) end
     return
   end
   if not flow.shadowStart then
@@ -757,8 +1727,43 @@ function Display.EnsureFlowShadows(region, data)
   local filter, candidates = Display.FilterString(trigger), Display.CandidateFilters(data)
   local showOn = Display.ShowOn(trigger)
   flow.shadowKind, flow.shadowList = "fixed", nil
+  -- ForeverAuras (dev.74): a chained member's shadow is a shadow chain (its
+  -- own half-step spine on a second invisible container, SecretAuraChain.lua
+  -- EnsureChainShadow); when it cannot be made the member keeps a fixed spot.
+  local chainShadow = false
+  if Display.EnsureChainShadow and native.instances[1] then
+    -- (dev.78) every member that measures (a chained member, a Found list of
+    -- at most a batch, a Missing member) shadows with a measurement chain;
+    -- a row with cells must not hang from a container's edge (Dan's freezes)
+    local made, why = Display.EnsureChainShadow(region, data, native, native.instances[1])
+    if made then flow.shadowKind = "chain"; chainShadow = true
+    elseif why == "off" or why == "nothing to measure" then
+      -- (1.2.0, Astra's audit 5) this member no longer measures (its settings changed): a kept failure
+      -- and its editor warning are obsolete
+      flow.shadowChainProblem = nil
+      if data.uid and Private.AuraWarnings and Private.AuraWarnings.UpdateWarning then Private.AuraWarnings.UpdateWarning(data.uid, "blizzard_aura_shadow", nil, nil) end
+    else flow.shadowChainProblem = why end
+    -- (dev.90, Astra's dev.89 review) an ordinary shadow BOUND whole drops a kept explanation and its editor
+    -- warning (a prepared, still unbound scaffold does not: its binding decides, ActivateShadows)
+    local sc = flow.shadowChain
+    if made and sc and not sc.scaffold and sc.flow.chainEndReady then
+      flow.shadowChainProblem = nil
+      if data.uid and Private.AuraWarnings and Private.AuraWarnings.UpdateWarning then Private.AuraWarnings.UpdateWarning(data.uid, "blizzard_aura_shadow", nil, nil) end
+    end
+    if Display.BuildReport and why ~= "off" and why ~= "nothing to measure" then
+      local sc = flow.shadowChain
+      -- (dev.82) under restrictions the shadow is prepared without its records (ActivateShadows binds them)
+      if made and sc and sc.scaffold then Display.BuildReport(("%s shadow prepared: its records are bound once the whole row is in place"):format(tostring(data.id)))
+      else
+      Display.BuildReport(made and ("%s shadow measured: %d records, end %s"):format(tostring(data.id), sc and #sc.buttons or 0, (sc and sc.flow.chainEndReady) and "ready" or "NOT ready")
+        or ("%s shadow not measured (%s): a fixed half step"):format(tostring(data.id), tostring(why)))
+      end
+    end
+  end
+  if chainShadow then
+    for index = 2, #native.instances do HideShadow(native.instances[index], "flowShadow") end
   -- Gated lists (Total Duration, Stack Count) keep a fixed spot.
-  if showOn == "showOnActive" and not Display.UsesGate(data) then
+  elseif showOn == "showOnActive" and not Display.UsesGate(data) then
     flow.shadowList = {}
     for _, instance in ipairs(native.instances) do
       instance.flowShadow = MeasureContainer(instance.flowShadow, region, data, sh, layout, Display.MaxAuras(data), filter, candidates)
@@ -769,7 +1774,8 @@ function Display.EnsureFlowShadows(region, data)
   else
     for _, instance in ipairs(native.instances) do HideShadow(instance, "flowShadow") end
   end
-  if showOn == "showOnMissing" and missing and missing.active and not missing.slot then
+  if flow.shadowKind ~= "chain" and flow.shadowChain and Display.ReleaseChainSpine then Display.ReleaseChainSpine(flow.shadowChain) end
+  if not chainShadow and showOn == "showOnMissing" and missing and missing.active and not missing.slot then
     local single = {elementWidth = along and size or width, elementHeight = along and height or size}
     missing.flowShadow = MeasureContainer(missing.flowShadow, region, data, sh, single, 1, filter, candidates)
     missing.flowShadowActive = missing.flowShadow ~= nil
@@ -787,11 +1793,97 @@ end
 local FLOW_REMAIN, FLOW_REMAIN_SHADOW = "FAFlowRemain", "FAFlowRemainShadow"
 local measureCurve
 
-local function MeasureText(instance, key, data, trigger, g, startFrame, length, lower, upper, property)
+-- ForeverAuras: everything drawn in the measure slot's button is made and
+-- arranged in `setup`, inside the client's initializeFrame when the slot is
+-- made and directly on later calls, since a slot button made under aura
+-- restrictions is locked by the client, with every frame under it, the
+-- moment AddAuraSlot returns (probed in game, 1.2.0-rc.7; the same rule as
+-- the Remaining Time slots, SecretAuraSingle.lua EnsureSlot). Seen in game:
+-- a Modern Aura Group member with a Remaining Time window stopped its build
+-- in combat here ("finishing failed", CreateFrame on the locked button).
+-- Only the bindings and the container's slot calls follow.
+local function MeasureText(region, instance, key, data, trigger, g, startFrame, length, lower, upper, property)
   local container, store = instance.container, instance.flowRemainSlots
   local entry = store[key]
+  local fill
+  local function setup(button)
+    -- Each frame made on its own, so a setup that failed part way is
+    -- finished by the next one (rc.15 review).
+    entry.complete = nil
+    -- The text sits in a frame scaled so that one of its units is one screen
+    -- pixel: the fill is then a whole number of pixels, and the one unit the
+    -- text adds around it is exactly one pixel, so the next display's start
+    -- needs no rounding (see SetFlowEnd). Only the creation is guarded: the
+    -- settings are written every time, so a setup that failed between the
+    -- two is finished by the next one (rc.17 review).
+    entry.holder = entry.holder or CreateFrame("Frame", nil, button, "DisableUntrustedLayoutScriptsTemplate")
+    entry.holder:EnableMouse(false)
+    entry.holder:SetSize(1, 1)
+    -- The fill is a plain texture that the text colour cannot hide; the holder
+    -- is invisible (its size still measures), as the slot button is.
+    entry.holder:SetAlpha(0)
+    entry.text = entry.text or entry.holder:CreateFontString(nil, "ARTWORK")
+    -- A plain copy of the text, to measure how wide the fill really renders.
+    entry.probe = entry.probe or entry.holder:CreateFontString(nil, "ARTWORK")
+    entry.probe:SetAlpha(0)
+    button:ClearAllPoints()
+    Place(button, g.start, startFrame, g.start)
+    local holder, text = entry.holder, entry.text
+    -- One holder unit is one screen pixel where the scale is known; the fill is
+    -- the step in whole pixels. Unknown scale: units, as the row's own frames.
+    local px = PixelsPerUnit(button)
+    holder:SetScale(px and 1 / px or 1)
+    holder:ClearAllPoints()
+    if not Place(holder, g.start, startFrame, g.start) then return false end
+    text:SetFont(STANDARD_TEXT_FONT, 12, "")
+    text:SetWordWrap(false)
+    text:SetJustifyH(g.sign[1] < 0 and "RIGHT" or "LEFT")
+    -- Invisible: the fill texture ignores the text colour (seen as a dark line).
+    text:SetAlpha(0)
+    text:ClearAllPoints()
+    -- Anchors see the text as exactly its fill, and as nothing when empty
+    -- (GetRight reports a one-pixel minimum that anchors do not use), so the
+    -- fill is the step in whole pixels and the text starts at the display.
+    text:SetPoint(g.start, holder, g.start)
+    local along = g.sign[1] ~= 0
+    -- A texture in a text does not render at its stated size (a 44 pixel fill
+    -- measured 43.27 on a scaled group), and an empty text is one pixel long.
+    -- So the fill is chosen by measuring: the size whose rendered length is
+    -- closest to the step plus one pixel; the next display then starts one
+    -- pixel back from the text's end, filled or empty (SetFlowEnd), and any
+    -- remainder of the match is folded into that offset.
+    local target = math.max(1, math.floor(length * (px or 1) + 0.5)) + 1
+    local probe = entry.probe
+    probe:SetFont(STANDARD_TEXT_FONT, 12, "")
+    probe:SetWordWrap(false)
+    probe:ClearAllPoints()
+    probe:SetPoint(g.start, holder, g.start)
+    local function Markup(n) return ("|TInterface\\Buttons\\WHITE8X8:%d:%d|t"):format(along and 1 or n, along and n or 1) end
+    local best, bestLength
+    for n = math.max(1, target - 3), target + 3 do
+      probe:SetText(Markup(n))
+      local rendered = along and probe:GetStringWidth() or probe:GetStringHeight()
+      if type(rendered) == "number" and not issecretvalue(rendered) and rendered > 0
+        and (not best or math.abs(rendered - target) < math.abs(bestLength - target)) then
+        best, bestLength = n, rendered
+      end
+    end
+    probe:SetText("")
+    if not best then best, bestLength = target, target end
+    -- Pixels back from the text's end to the next display: one for the empty
+    -- text, plus whatever the fill renders over the target.
+    entry.back = 1 + (bestLength - target)
+    fill = Markup(best)
+    -- Stack Count: Blizzard writes the count through the formatter, also 0.
+    if property == "stacks" then text:SetTextColor(0, 0, 0, 0) end
+    text:Show()
+    return true
+  end
+  local native = region.blizzardAuraDisplay
+  local probeBuild = native and native.probeBuild
   if not entry then
     entry = {}
+    local placed, setupErr = false, nil
     local ok = pcall(container.AddAuraSlot, container, key, Display.FilterString(trigger), {
       candidateFilters = Display.CandidateFilters(data),
       initializeFrame = function(button)
@@ -799,79 +1891,59 @@ local function MeasureText(instance, key, data, trigger, g, startFrame, length, 
         button:EnableMouse(false)
         button:SetAlpha(0)
         button:SetSize(1, 1)
+        -- The client calls this through an error boundary of its own, so a
+        -- failed setup is recorded, not raised.
+        local okSetup, result = pcall(setup, button)
+        placed = okSetup and result == true
+        if not placed then setupErr = okSetup and "measurement not placed" or result end
       end,
     })
-    if not ok or not entry.button then return end
-    -- The text sits in a frame scaled so that one of its units is one screen
-    -- pixel: the fill is then a whole number of pixels, and the one unit the
-    -- text adds around it is exactly one pixel, so the next display's start
-    -- needs no rounding (see SetFlowEnd).
-    entry.holder = CreateFrame("Frame", nil, entry.button, "DisableUntrustedLayoutScriptsTemplate")
-    entry.holder:EnableMouse(false)
-    entry.holder:SetSize(1, 1)
-    -- The fill is a plain texture that the text colour cannot hide; the holder
-    -- is invisible (its size still measures), as the slot button is.
-    entry.holder:SetAlpha(0)
-    entry.text = entry.holder:CreateFontString(nil, "ARTWORK")
-    -- A plain copy of the text, to measure how wide the fill really renders.
-    entry.probe = entry.holder:CreateFontString(nil, "ARTWORK")
-    entry.probe:SetAlpha(0)
+    if not ok or not entry.button then
+      if Display.NoteSlotFailure then Display.NoteSlotFailure(instance, "measure " .. tostring(key), ok and "no button" or "AddAuraSlot failed") end
+      return
+    end
     store[key] = entry
+    container:SetAuraSlotEnabled(key, false)
+    if not placed then
+      -- Counted with the build's failures (SecretAuraSingle.lua, NoteSlotFailure).
+      if Display.NoteSlotFailure then Display.NoteSlotFailure(instance, "measure " .. tostring(key), setupErr) end
+      if probeBuild and Display.NotePendingRelayout then Display.NotePendingRelayout(region) end
+      return
+    end
+  else
+    if probeBuild then
+      -- A slot made earlier is locked now: it keeps measuring as it is,
+      -- untouched (tried before it is disabled, rc.15 review), and the
+      -- display is applied again when the restrictions end
+      -- (SecretAuraSingle.lua, SlotWrite).
+      local wasComplete = entry.complete
+      local okSetup, result = pcall(setup, entry.button)
+      if not (okSetup and result == true) then
+        -- A measurement that had finished keeps working as it is: no failure.
+        -- One that had not is incomplete, counted with the build's failures.
+        if not wasComplete and Display.NoteSlotFailure then Display.NoteSlotFailure(instance, "measure " .. tostring(key), okSetup and "locked" or result) end
+        if Display.NotePendingRelayout then Display.NotePendingRelayout(region) end
+        -- Only a measurement whose setup had finished is kept (rc.17
+        -- review: a partial one has unbound, unplaced text).
+        entry.complete = wasComplete
+        return wasComplete and entry or nil
+      end
+      container:SetAuraSlotEnabled(key, false)
+    else
+      container:SetAuraSlotEnabled(key, false)
+      if not setup(entry.button) then return end
+    end
   end
-  container:SetAuraSlotEnabled(key, false)
   container:SetAuraSlotFilterString(key, Display.FilterString(trigger))
   container:SetAuraSlotCandidateFilters(key, Display.CandidateFilters(data))
   container:SetAuraSlotSortMethod(key, Display.SortOrder(data, trigger))
-  entry.button:ClearAllPoints()
-  Place(entry.button, g.start, startFrame, g.start)
-  local holder, text = entry.holder, entry.text
-  -- One holder unit is one screen pixel where the scale is known; the fill is
-  -- the step in whole pixels. Unknown scale: units, as the row's own frames.
-  local px = PixelsPerUnit(entry.button)
-  holder:SetScale(px and 1 / px or 1)
-  holder:ClearAllPoints()
-  if not Place(holder, g.start, startFrame, g.start) then return end
-  text:SetFont(STANDARD_TEXT_FONT, 12, "")
-  text:SetWordWrap(false)
-  text:SetJustifyH(g.sign[1] < 0 and "RIGHT" or "LEFT")
-  -- Invisible: the fill texture ignores the text colour (seen as a dark line).
-  text:SetAlpha(0)
-  text:ClearAllPoints()
-  -- Anchors see the text as exactly its fill, and as nothing when empty
-  -- (GetRight reports a one-pixel minimum that anchors do not use), so the
-  -- fill is the step in whole pixels and the text starts at the display.
-  text:SetPoint(g.start, holder, g.start)
-  local along = g.sign[1] ~= 0
-  -- A texture in a text does not render at its stated size (a 44 pixel fill
-  -- measured 43.27 on a scaled group), and an empty text is one pixel long.
-  -- So the fill is chosen by measuring: the size whose rendered length is
-  -- closest to the step plus one pixel; the next display then starts one
-  -- pixel back from the text's end, filled or empty (SetFlowEnd), and any
-  -- remainder of the match is folded into that offset.
-  local target = math.max(1, math.floor(length * (px or 1) + 0.5)) + 1
-  local probe = entry.probe
-  probe:SetFont(STANDARD_TEXT_FONT, 12, "")
-  probe:SetWordWrap(false)
-  probe:ClearAllPoints()
-  probe:SetPoint(g.start, holder, g.start)
-  local function Markup(n) return ("|TInterface\\Buttons\\WHITE8X8:%d:%d|t"):format(along and 1 or n, along and n or 1) end
-  local best, bestLength
-  for n = math.max(1, target - 3), target + 3 do
-    probe:SetText(Markup(n))
-    local rendered = along and probe:GetStringWidth() or probe:GetStringHeight()
-    if type(rendered) == "number" and not issecretvalue(rendered) and rendered > 0
-      and (not best or math.abs(rendered - target) < math.abs(bestLength - target)) then
-      best, bestLength = n, rendered
-    end
+  local text = entry.text
+  local formatter, formatterErr = Display.GateFormatter(lower, upper, fill)
+  if not formatter then
+    -- A refused formatter counts like a refused binding (rc.52 review).
+    if Display.NoteSlotFailure then Display.NoteSlotFailure(instance, "measure " .. tostring(key) .. " formatter", formatterErr) end
+    return
   end
-  probe:SetText("")
-  if not best then best, bestLength = target, target end
-  -- Pixels back from the text's end to the next display: one for the empty
-  -- text, plus whatever the fill renders over the target.
-  entry.back = 1 + (bestLength - target)
-  local fill = Markup(best)
-  local formatter = Display.GateFormatter(lower, upper, fill)
-  if not formatter then return end
   if not measureCurve then
     measureCurve = C_CurveUtil.CreateColorCurve()
     measureCurve:SetType(Enum.LuaCurveType.Step)
@@ -879,25 +1951,41 @@ local function MeasureText(instance, key, data, trigger, g, startFrame, length, 
   end
   pcall(entry.button.ClearDurationText, entry.button)
   pcall(entry.button.ClearApplicationCount, entry.button)
+  -- A refused binding is counted with the build's failures too
+  -- (SecretAuraSingle.lua, NoteSlotFailure), so a measurement left unbound
+  -- never passes as a finished build (rc.51 review).
   if property == "stacks" then
-    -- Stack Count: Blizzard writes the count through the formatter, also 0.
-    text:SetTextColor(0, 0, 0, 0)
-    if not pcall(entry.button.SetApplicationCount, entry.button, text, {formatter = formatter}) then return end
+    local okBind, errBind = pcall(entry.button.SetApplicationCount, entry.button, text, {formatter = formatter})
+    if not okBind then
+      if Display.NoteSlotFailure then Display.NoteSlotFailure(instance, "measure " .. tostring(key) .. " count", errBind) end
+      return
+    end
   else
     property = Enum.DurationTextBindingProperty[property or "RemainingDuration"]
-    if not pcall(entry.button.SetDurationText, entry.button, text, {
+    local okBind, errBind = pcall(entry.button.SetDurationText, entry.button, text, {
       textFormat = {formatString = "{}", components = {{property = property, formatter = formatter}}},
       textColor = {curve = measureCurve, property = property},
-    }) then return end
+    })
+    if not okBind then
+      if Display.NoteSlotFailure then Display.NoteSlotFailure(instance, "measure " .. tostring(key) .. " text", errBind) end
+      return
+    end
   end
-  text:Show()
   container:SetAuraSlotEnabled(key, true)
+  entry.enabledApplied = true   -- (dev.92) DisableMeasure writes the disable once
+  -- Complete only now, bound and enabled (rc.18 review): a locked slot kept
+  -- on a later build is one that measured.
+  entry.complete = true
   return entry
 end
 
 local function DisableMeasure(instance, key)
   local entry = instance and instance.flowRemainSlots and instance.flowRemainSlots[key]
-  if entry then pcall(instance.container.SetAuraSlotEnabled, instance.container, key, false) end
+  -- (dev.92, Astra's dev.90 review) written once: the client refreshes the whole container on every
+  -- SetAuraSlotEnabled, even to the state the slot already has, which hands the list's buttons out again
+  if entry and entry.enabledApplied ~= false then
+    if pcall(instance.container.SetAuraSlotEnabled, instance.container, key, false) then entry.enabledApplied = false end
+  end
 end
 
 -- Called by Apply after the flow shadows, before the display's end is recorded.
@@ -908,7 +1996,9 @@ function Display.EnsureFlowRemaining(region, data)
   local trigger = Display.GetTrigger(data)
   local lower, upper
   local property
-  if flow and instance and trigger and not Display.FlowFrameMode(data) and not Display.FlowGrid(Display.FlowGroup(data)) then
+  -- ForeverAuras (cell chain): a chained list measures itself; no slot.
+  local chained = Display.FlowChain ~= nil and Display.FlowChain(data) ~= nil
+  if flow and instance and trigger and not chained and not Display.FlowFrameMode(data) and not Display.FlowGrid(Display.FlowGroup(data)) then
     lower, upper = Display.RemainingRange(trigger)
     -- Gated displays take space only while their gate is open.
     if not lower then
@@ -933,11 +2023,11 @@ function Display.EnsureFlowRemaining(region, data)
   local width, height = Display.Dimensions(data)
   local g = flow.growth
   local size = ((g.sign[1] ~= 0) and width or height) + spacing
-  local main = MeasureText(instance, FLOW_REMAIN, data, trigger, g, flow.start, size, lower, upper, property)
+  local main = MeasureText(region, instance, FLOW_REMAIN, data, trigger, g, flow.start, size, lower, upper, property)
   flow.remain = main and main.text
   flow.remainBack = main and main.back
   local shadow = main and g.shadow and flow.shadowStart
-    and MeasureText(instance, FLOW_REMAIN_SHADOW, data, trigger, g.shadow, flow.shadowStart, Display.FlowHalf(region, size), lower, upper, property)
+    and MeasureText(region, instance, FLOW_REMAIN_SHADOW, data, trigger, g.shadow, flow.shadowStart, Display.FlowHalf(region, size), lower, upper, property)
   if shadow then
     HideShadow(instance, "flowShadow")
     flow.shadowKind, flow.shadowList, flow.shadowRemain = "remain", nil, shadow.text
@@ -947,11 +2037,50 @@ function Display.EnsureFlowRemaining(region, data)
   end
 end
 
+-- The native content delegate can update a protected measurement without
+-- moving or rebinding it. Only the currently active, same-token parts qualify.
+function Display.RefreshFlowContent(instance, unit, shown, force)
+  local accepted, refused = 0, 0
+  if instance.flowMeasureActive and instance.flowMeasure then
+    accepted, refused = Display.RequestBoundAuraRefresh(instance.flowMeasure, instance.flowMeasureUnit, unit, shown, force)
+  end
+  if instance.flowShadowActive and instance.flowShadow then
+    local a, r = Display.RequestBoundAuraRefresh(instance.flowShadow, instance.flowShadowUnit, unit, shown, force)
+    accepted, refused = accepted + a, refused + r
+  end
+  return accepted, refused
+end
+
+function Display.RefreshMeasureContainer(instance, container, unitKey, unit, shown, force)
+  if Busy(container) then
+    Display.RequestBoundAuraRefresh(container, instance[unitKey], unit, shown, force)
+    return false
+  end
+  if unit and instance[unitKey] ~= unit then
+    container:SetEnabled(false)
+    container:SetUnit(unit)
+    instance[unitKey] = unit
+  end
+  if container:IsShown() ~= shown then container:SetShown(shown) end
+  if container.faEnabled ~= shown or (shown and force) then
+    container:SetEnabled(shown)
+    if shown then container:UpdateAllAuras() end
+  end
+end
 -- Keeps a display's list shadow on the same unit as its aura area.
 -- force: see Display.RefreshSingle.
 function Display.RefreshFlowShadow(instance, unit, shown, force)
+  -- ForeverAuras (dev.78): the end measurement's container follows the unit as the shadow does
+  local ready = true
+  if instance.flowMeasureActive and instance.flowMeasure then
+    ready = Display.RefreshMeasureContainer(instance, instance.flowMeasure, "flowMeasureUnit", unit, shown, force) ~= false
+  end
   local container = instance.flowShadowActive and instance.flowShadow
-  if not container or Busy(container) then return end
+  if not container then return ready end
+  if Busy(container) then
+    Display.RequestBoundAuraRefresh(container, instance.flowShadowUnit, unit, shown, force)
+    return false
+  end
   if unit and instance.flowShadowUnit ~= unit then
     container:SetEnabled(false)
     container:SetUnit(unit)
@@ -963,6 +2092,7 @@ function Display.RefreshFlowShadow(instance, unit, shown, force)
     container:SetEnabled(shown)
     if shown then container:UpdateAllAuras() end
   end
+  return ready
 end
 
 -- Chains one display's shadows from its shadow start; returns where the next
@@ -992,8 +2122,114 @@ local function ChainShadows(flow)
   elseif flow.shadowKind == "missing" then
     local single = flow.region.blizzardAuraDisplay.instances[1].single.missing
     return {single.flowShadow, sh.start, 0, 0}
+  elseif flow.shadowKind == "chain" then
+    -- ForeverAuras (dev.74): the shadow chain's end, once every shadow cell
+    -- is bound (its start corner is the last shadow cell's point: half the
+    -- member's length back); a fixed spot until then
+    local sc = flow.shadowChain
+    if sc and sc.flow.chainEndReady and sc.flow.chainEnd then
+      -- (dev.79) a locally measured shadow: its end translated to the shadow start (EnsureMeasureChain)
+      if sc.out and sc.outCorner then return {sc.out, sc.outCorner, 0, 0} end
+      return {sc.flow.chainEnd, sc.flow.chainCorner or sh.start, 0, 0}
+    end
+    -- ForeverAuras (dev.82): a shadow prepared under restrictions without its
+    -- records (EnsureChainShadow, opts.defer) is chained by its translated
+    -- end all the same: that end depends on nothing yet, so what hangs from
+    -- it can be anchored there now, and follows the records once they bind.
+    if sc and sc.scaffold and sc.out and sc.outCorner and sc.flow.chainEndWired then return {sc.out, sc.outCorner, 0, 0} end
   end
   return {flow.shadowStart, sh.start, sh.sign[1] * flow.half, sh.sign[2] * flow.half}
+end
+
+-- ForeverAuras (dev.82): a Centered row under restrictions. Each member's
+-- shadow is prepared during its build without its records (EnsureChainShadow,
+-- opts.defer), the row's pass chains the shadows and places the visible start
+-- on their end while every end still depends on nothing, and once no live
+-- member of the row is queued any more (the row built last-to-first, its
+-- first member last) the records are bound here, member by member: every
+-- anchor into the shadows exists by then, so the client moves the finished
+-- row onto the centre itself. Before anything binds, the placements are
+-- checked (Astra's dev.81 review: a built row is not a centred one): every
+-- shadow start on the shadows before it (the first on the row's centre) and
+-- the row's start on the shadows' end; a missing one is said and nothing is
+-- bound (the row then starts at the centre, as it did, until restrictions
+-- end). Called by FinishApply after each build under restrictions. Returns
+-- the members whose shadows were bound (their containers take the unit
+-- next, RefreshUnits), or nil while a member is still queued, a placement
+-- is missing, or the row is not a Centered row with cells.
+function Display.ActivateShadows(group)
+  if not (group and InCombatLockdown() and Display.FlowGroupOwned(group)) then return nil end
+  local g = GROWTH[GrowthKey(group)]
+  if not (g and g.shadow and Display.FlowIndependentGroup(group) and Display.ShadowDeferred) then return nil end
+  local waiting = {}
+  local rowFrame = RowOrigin(group)
+  local previousEnd, first = nil, true
+  for _, id in ipairs(Display.FlowOrder(group)) do
+    local r, _, native, normal = LiveMember(id, group)
+    if r and Display.IsBuildPending and Display.IsBuildPending(r) then return nil, id end
+    local flow = native and native.active and native.flow or normal and normal.flow
+    if flow and flow.shadowStart and flow.shadowKind and r:IsShown() then
+      local place = flow.shadowStart.faPlace
+      local expected = previousEnd and previousEnd[1] or rowFrame
+      if not (place and place[2] == expected) then
+        -- (quiet while a load batch holds the row's pass: that pass places it and asks again, Astra's dev.83 review)
+        if Display.BuildReport and not (Display.FlowLoadHeld and Display.FlowLoadHeld()) then Display.BuildReport(("%s's shadow is not on the shadows before it (%s): the shadows stay unbound until the row's pass places it"):format(tostring(id), place and "on another frame" or "not placed yet")) end
+        return nil, id
+      end
+      local ok, chained = pcall(ChainShadows, flow)
+      if not ok then return nil, id end
+      previousEnd = chained
+      if first then
+        first = false
+        if not flow.startPlaced then
+          if Display.BuildReport then Display.BuildReport(("%s: the row's start is not on the shadows' end: the shadows stay unbound until the row's pass places it"):format(tostring(id))) end
+          return nil, id
+        end
+      end
+    end
+    if r and native and Display.ShadowDeferred(native) then waiting[#waiting + 1] = {r, native} end
+  end
+  local done = {}
+  -- bound from the LAST member's shadow back to the first: a shadow's start hangs from the shadow before it, so
+  -- the one before binds after the one after it (nothing is written to it then anyway: EnsureMeasureChain keeps
+  -- a prepared chain as it is, but the order costs nothing and asks nothing of the client)
+  for index = #waiting, 1, -1 do
+    local w = waiting[index]
+    local r, native = w[1], w[2]
+    local data = native.data
+    local instance = native.instances and native.instances[1]
+    local made, why
+    -- (dev.84, Astra's dev.83 review P2) each member's binding under its own protection: an exception in one is
+    -- that member's failure, reported, its chain no longer "applying", and the members bound before it keep
+    -- their result (their containers take the unit all the same)
+    if instance and data then
+      local okB, madeB, whyB = pcall(Display.EnsureChainShadow, r, data, native, instance, true)
+      if okB then made, why = madeB, whyB else made, why = nil, "exception: " .. tostring(madeB); if native.flow and native.flow.shadowChain then native.flow.shadowChain.applying = nil end end
+    else why = "no instance" end
+    if Display.BuildReport then
+      local sc = native.flow and native.flow.shadowChain
+      Display.BuildReport(made and ("%s shadow measured: %d records, end %s (bound with the row in place)"):format(tostring(data and data.id), sc and #sc.buttons or 0, (sc and sc.flow.chainEndReady) and "ready" or "NOT ready")
+        or ("%s shadow could not be bound (%s): a fixed half step until restrictions end"):format(tostring(data and data.id), tostring(why)))
+    end
+    if made then
+      done[#done + 1] = r
+      -- (dev.89) a repaired shadow drops its explanation
+      if native.flow then native.flow.shadowChainProblem = nil end
+      if data and data.uid and Private.AuraWarnings and Private.AuraWarnings.UpdateWarning then Private.AuraWarnings.UpdateWarning(data.uid, "blizzard_aura_shadow", nil, nil) end
+    elseif native.flow then
+      native.flow.shadowKind, native.flow.shadowChainProblem = "fixed", why
+      -- (dev.89, Astra's dev.88 review) said in the editor too, under its own key, until the repair
+      if data and data.uid and Private.AuraWarnings and Private.AuraWarnings.UpdateWarning then
+        Private.AuraWarnings.UpdateWarning(data.uid, "blizzard_aura_shadow", "warning", L["This display's share of the centred row could not be measured (%s); it keeps a fixed half step until restrictions end."]:format(tostring(why)))
+      end
+      if native.flow.shadowChain then native.flow.shadowChain.scaffold = nil end
+      -- (dev.87, Astra's dev.85 review P2) a fixed half step until restrictions end, and then the member is
+      -- applied again through the bounded relayout request (the restriction-end handler): its shadow is made
+      -- anew then, out of restrictions
+      if Display.NotePendingRelayout then Display.NotePendingRelayout(r, "shadow: " .. tostring(why)) end
+    end
+  end
+  return done
 end
 
 -- Grouped by frame: for every unit, its aura area in the first display sits
@@ -1042,25 +2278,37 @@ end
 -- the preview uses (Private.AnchorFrame, FlowPreviewFrame), and its bounds
 -- are set to cover the first unit's preview row, which starts at the group's
 -- anchor. Put back when the group no longer previews on a frame.
-local function SetGroupPreviewBounds(group, g, length, cross, ox, oy)
+-- The group's editor rectangle (GetBoundingRect), in the group's units from
+-- its anchor point: bottom-left and top-right corners.
+local function SetGroupPreviewRect(group, blx, bly, trx, try)
   local entry = Private.regions[group.id]
   local region = entry and entry.region
   if not region then return end
-  local blx, bly, trx, try
-  if g.sign[1] > 0 then blx, trx, try, bly = 0, length, 0, -cross
-  elseif g.sign[1] < 0 then blx, trx, try, bly = -length, 0, 0, -cross
-  elseif g.sign[2] < 0 then blx, trx, try, bly = 0, cross, 0, -length
-  else blx, trx, bly, try = 0, cross, 0, length end
-  blx, trx, bly, try = blx + ox, trx + ox, bly + oy, try + oy
   if region.GetBoundingRect ~= region.flowPreviewBoundsFn then
     region.flowPreviewBoundsSaved = region.GetBoundingRect
   end
+  local changed = region.blx ~= blx or region.bly ~= bly or region.trx ~= trx or region.try ~= try
   region.flowPreviewBoundsFn = function(self)
     self.blx, self.bly, self.trx, self.try = blx, bly, trx, try
     return blx, bly, trx, try
   end
   region.GetBoundingRect = region.flowPreviewBoundsFn
   region:GetBoundingRect()
+  -- ForeverAuras: the editor's box (MoverSizer) reads the rectangle when the
+  -- group is picked, and the arrangement that sets it often runs after that
+  -- (next frame, or after a batched pick): a changed rectangle moves the box
+  -- of the picked group at once.
+  if changed and WeakAuras.RefreshMoverSizer then WeakAuras.RefreshMoverSizer(group.id) end
+end
+
+-- Grouped by frame: the rectangle from the row's length and depth.
+local function SetGroupPreviewBounds(group, g, length, cross, ox, oy)
+  local blx, bly, trx, try
+  if g.sign[1] > 0 then blx, trx, try, bly = 0, length, 0, -cross
+  elseif g.sign[1] < 0 then blx, trx, try, bly = -length, 0, 0, -cross
+  elseif g.sign[2] < 0 then blx, trx, try, bly = 0, cross, 0, -length
+  else blx, trx, bly, try = 0, cross, 0, length end
+  SetGroupPreviewRect(group, blx + ox, bly + oy, trx + ox, try + oy)
 end
 
 function Display.RestoreGroupPreview(group)
@@ -1072,6 +2320,58 @@ function Display.RestoreGroupPreview(group)
     region.flowPreviewBoundsSaved, region.flowPreviewBoundsFn = nil, nil
     region.boundingRect = false
     region:GetBoundingRect()
+    if WeakAuras.RefreshMoverSizer then WeakAuras.RefreshMoverSizer(group.id) end
+  end
+end
+
+-- ForeverAuras: the group's editor rectangle around the given frames (the
+-- union of their rectangles, cut to `clip` when it is shown), in the group's
+-- units from the group's anchored point (its selfPoint: CENTER for most
+-- groups, BOTTOMLEFT for groups with a group offset), which is what the
+-- editor's box measures from. Restores the plain rectangle when nothing can
+-- be measured. Used by the row preview (ArrangeFlowPreviewNow) and the Grid
+-- preview (SecretAuraGrid.lua).
+function Display.SetGroupPreviewUnion(group, groupRegion, frames, clip)
+  local anchorX, anchorY
+  if groupRegion then
+    local selfPoint = group.selfPoint or "CENTER"
+    local ok, l, b, w, h = pcall(groupRegion.GetRect, groupRegion)
+    if ok and type(l) == "number" and not issecretvalue(l) and not issecretvalue(b) and not issecretvalue(w) and not issecretvalue(h) then
+      anchorX = selfPoint:find("LEFT") and l or selfPoint:find("RIGHT") and l + w or l + w / 2
+      anchorY = selfPoint:find("BOTTOM") and b or selfPoint:find("TOP") and b + h or b + h / 2
+    end
+  end
+  local groupScale = groupRegion and groupRegion:GetEffectiveScale()
+  if anchorX and type(groupScale) == "number" and groupScale > 0 then
+    local minX, minY, maxX, maxY
+    local function Extend(frame)
+      local ok, l, b, w, h = pcall(frame.GetRect, frame)
+      if not ok or type(l) ~= "number" or issecretvalue(l) or issecretvalue(b) or issecretvalue(w) or issecretvalue(h) then return end
+      local scale = frame:GetEffectiveScale()
+      if type(scale) ~= "number" or issecretvalue(scale) or scale <= 0 then return end
+      -- Screen pixels first, the group's units from its anchor at the end.
+      local x1, y1 = l * scale, b * scale
+      local x2, y2 = (l + w) * scale, (b + h) * scale
+      minX, maxX = math.min(minX or x1, x1), math.max(maxX or x2, x2)
+      minY, maxY = math.min(minY or y1, y1), math.max(maxY or y2, y2)
+    end
+    for _, frame in ipairs(frames) do Extend(frame) end
+    if clip and clip:IsShown() and minX then
+      local ok, l, b, w, h = pcall(clip.GetRect, clip)
+      local scale = clip:GetEffectiveScale()
+      if ok and type(l) == "number" and not issecretvalue(l) and type(scale) == "number" and scale > 0 then
+        minX, maxX = math.max(minX, l * scale), math.min(maxX, (l + w) * scale)
+        minY, maxY = math.max(minY, b * scale), math.min(maxY, (b + h) * scale)
+      end
+    end
+    if minX and maxX > minX and maxY > minY then
+      local ax, ay = anchorX * groupScale, anchorY * groupScale
+      SetGroupPreviewRect(group, (minX - ax) / groupScale, (minY - ay) / groupScale, (maxX - ax) / groupScale, (maxY - ay) / groupScale)
+    else
+      Display.RestoreGroupPreview(group)
+    end
+  else
+    Display.RestoreGroupPreview(group)
   end
 end
 
@@ -1330,6 +2630,71 @@ function Display.FlowPreviewFrame(group)
   return PreviewFrame(group, unit or "player")
 end
 
+-- ForeverAuras: a gated member of a row (a Remaining Time, Total Duration or
+-- Stack Count filter) takes its row space from a measurement text inside a
+-- locked aura slot. A member anchored after it hangs from that text, and the
+-- client then treats the member's whole container as locked in combat: a
+-- button the client adds to it then (a buff list growing, or the client's
+-- own refresh making new buttons) cannot be built, an empty slot until the
+-- fight ends (probed in game, 1.2.0-rc.28: the member after the Remaining
+-- Time icon had an unreadable container in combat, the same member placed
+-- before it did not).
+function Display.FlowGated(data)
+  if not data or not Display.Enabled(data) then return false end
+  local trigger = Display.GetTrigger(data)
+  if not trigger then return false end
+  if Display.UsesGate(data) then return true end
+  return Display.RemainingRange ~= nil and Display.RemainingRange(trigger) ~= nil
+end
+
+-- The order a row chains its members in: the group's order, with the gated
+-- members moved to the end (keeping their order among themselves), so no
+-- other member hangs from a locked measurement. Decided from the settings,
+-- so the live row and the editor preview agree; only for the rows the
+-- problem is known for: a Centered row's start hangs from every member's
+-- shadow (the whole row would move), and Grid and Group by Frame rows are
+-- laid out differently. Those keep the group's order.
+function Display.FlowOrder(group)
+  local ids = group and group.controlledChildren or {}
+  if not group or Display.FlowGrid(group) or group.blizzardFlowFrames ~= nil then return ids end
+  -- Supported independent-carrier rows preserve the configured member order.
+  -- Other rows retain the ordinary filtered-last ordering below.
+  if Display.FlowIndependentGroup and Display.FlowIndependentGroup(group) then return ids end
+  if (GROWTH[group.blizzardFlowGrowth] or GROWTH.RIGHT).shadow then return ids end
+  local order, gated = {}, nil
+  for _, childID in ipairs(ids) do
+    if Display.FlowGated(WeakAuras.GetData(childID)) then
+      gated = gated or {}
+      gated[#gated + 1] = childID
+    else
+      order[#order + 1] = childID
+    end
+  end
+  if not gated then return ids end
+  for _, childID in ipairs(gated) do order[#order + 1] = childID end
+  return order
+end
+
+-- What the order above cannot solve, said in the editor: a second gated
+-- member still hangs from the first one's measurement, and in a Centered
+-- row the gated member's own shadow is in the chain every member's start
+-- hangs from (the row's centre is a secret distance from its start).
+function Display.FlowAfterGateProblem(data)
+  local group = Display.FlowGroup(data)
+  if not group or Display.FlowGrid(group) or group.blizzardFlowFrames ~= nil or not Display.FlowGated(data) then return end
+  -- ForeverAuras (cell chain): a chained list hangs from no measurement.
+  if Display.FlowChain and Display.FlowChain(data) then return end
+  if (GROWTH[group.blizzardFlowGrowth] or GROWTH.RIGHT).shadow then
+    return L["This aura's time or stack filter may leave it blank during combat in a Centered row.\n\nChoose another Grow setting, or move this aura out of the group."]
+  end
+  for _, childID in ipairs(group.controlledChildren or {}) do
+    if childID == data.id then return end
+    if Display.FlowGated(WeakAuras.GetData(childID)) then
+      return L["Another aura in this row also uses a time or stack filter. This aura may appear blank or in the wrong place during combat.\n\nMove it to a separate row or group."]
+    end
+  end
+end
+
 function Display.FlowNormalProblem(data)
   local group = Display.FlowGroup(data)
   if not group or Display.Enabled(data) or Display.FlowNormal(data) then return end
@@ -1373,7 +2738,9 @@ end
 function ArrangeFlowPreviewNow(group)
   if Display.FlowGrid(group) then
     Display.ReleaseNameplatePreview(group)
-    Display.ArrangeGridPreview(group)
+    -- ForeverAuras: a row's editor rectangle does not carry over to a Grid;
+    -- the Grid preview sets its own (ArrangeGridPreview) or restores it.
+    if not Display.ArrangeGridPreview(group) then Display.RestoreGroupPreview(group) end
     return
   end
   local mode = group.blizzardFlowFrames
@@ -1403,6 +2770,9 @@ function ArrangeFlowPreviewNow(group)
   local function Key(sample) return framed and mode == "UNITFRAME" and sample.previewUnit or "" end
   -- Each row's length and depth, known here; centred rows start half back.
   local length, cross, firstKey, sampleStep, iconStep, anyStep = {}, {}, nil, nil, nil, nil
+  -- The row's cross size as the live chain takes it (RowStep: the first
+  -- Modern display's, else the first copied icon's, else the first display's).
+  local sampleCross, iconCross, anyCross
   local leadSteps = {}
   -- The last display's spacing is not part of the row; the row's lengths
   -- were summed with the pixel gaps, so the gap taken off is the same kind.
@@ -1412,7 +2782,38 @@ function ArrangeFlowPreviewNow(group)
   local halves = {}
   local groupRegionForHalf = Private.regions[group.id] and Private.regions[group.id].region
   local function Half(step) return Display.FlowHalf(groupRegionForHalf, step) end
-  for _, childID in ipairs(group.controlledChildren or {}) do
+  -- ForeverAuras: the row's order (Display.FlowOrder: gated members last), as
+  -- the live row chains them. The first sample's step is the Limit's step, so
+  -- this loop runs in that order too (rc.31 review: the preview cut at the
+  -- gated first display's size, the live row at its first chained display's).
+  local rowOrder = Display.FlowOrder(group)
+  -- The old row layout starts at the group's first member's own frame, and
+  -- measures own offsets from that member's, even when the row's order moved
+  -- it behind the others (RechainFlow, rowFlow): that member's region here.
+  -- Only when the two orders differ in their first such member (rc.33
+  -- review: with a leading ordinary display first in both, the Modern
+  -- display after it was taken for a moved reference).
+  local referenceRegion, startedAtReference
+  if not framed and not owned and not g.shadow then
+    local function FirstInRow(ids)
+      for _, childID in ipairs(ids) do
+        local entry = Private.regions[childID]
+        local region = entry and entry.region
+        if region and region:IsShown() and (region.secretAuraSamplesActive
+          or (region.flowNormal and region.flowNormal.active and region.flowNormal.stand)) then
+          return region
+        end
+      end
+    end
+    local firstInGroup = FirstInRow(group.controlledChildren or {})
+    if firstInGroup and firstInGroup.secretAuraSamplesActive and firstInGroup ~= FirstInRow(rowOrder) then
+      referenceRegion = firstInGroup
+      -- Its box may still sit on its sample from the last arrangement; the
+      -- row starts at the box's own anchor, so that is put back first.
+      Display.RestorePreviewRegion(referenceRegion)
+    end
+  end
+  for _, childID in ipairs(rowOrder) do
     local entry = Private.regions[childID]
     local region = entry and entry.region
     if region and region.secretAuraSamplesActive and region:IsShown() then
@@ -1423,6 +2824,7 @@ function ArrangeFlowPreviewNow(group)
           firstKey = firstKey or key
           local width, height = button:GetWidth() or 0, button:GetHeight() or 0
           sampleStep = sampleStep or (along and width or height) + Spaced(along and width or height)
+          sampleCross = sampleCross or (along and height or width)
           length[key] = (length[key] or 0) + (along and width or height) + Spaced(along and width or height)
           lastSpacing[key] = Spaced(along and width or height)
           halves[key] = (halves[key] or 0) + Half((along and width or height) + Spaced(along and width or height))
@@ -1434,7 +2836,11 @@ function ArrangeFlowPreviewNow(group)
       local width, height = NormalSize(region, region.flowNormal.data)
       local step = (along and width or height) + Spaced(along and width or height)
       anyStep = anyStep or step
-      if region.flowNormal.stand and region.flowNormal.data.regionType == "icon" then iconStep = iconStep or step end
+      anyCross = anyCross or (along and height or width)
+      if region.flowNormal.stand and region.flowNormal.data.regionType == "icon" then
+        iconStep = iconStep or step
+        iconCross = iconCross or (along and height or width)
+      end
       if not region.flowNormal.stand then leadSteps[#leadSteps + 1] = step end
       length[""] = (length[""] or 0) + (along and width or height) + Spaced(along and width or height)
       lastSpacing[""] = Spaced(along and width or height)
@@ -1444,6 +2850,10 @@ function ArrangeFlowPreviewNow(group)
   end
   local limit = not framed and group.blizzardFlowUseLimit and math.max(1, math.floor(tonumber(group.blizzardFlowLimit) or 5))
   local firstStep = sampleStep or iconStep or anyStep
+  -- ForeverAuras: a group-owned row's place across the row (RechainFlow,
+  -- CrossOffset): added to the first member's offset and to the cut.
+  local ownedCrossX, ownedCrossY = 0, 0
+  if owned then ownedCrossX, ownedCrossY = CrossOffset(group, g, sampleCross or iconCross or anyCross or 0) end
   local rowStart
   -- How far back the row starts: the shadows' halves less half a spacing (the
   -- last display's gap is not part of the row; the live row steps forward by
@@ -1466,6 +2876,9 @@ function ArrangeFlowPreviewNow(group)
     return -g.sign[1] * half, -g.sign[2] * half
   end
   local previous = {}
+  -- ForeverAuras: every frame the arrangement placed (samples, stands and
+  -- ordinary displays in the row), for the group's editor rectangle below.
+  local placed = {}
   -- The previous sample's own display offset per row key, taken back off (OwnOffset).
   local previousOwn = {}
   -- The first display's own offset per row key, off a frame (see PlaceSamples).
@@ -1533,7 +2946,7 @@ function ArrangeFlowPreviewNow(group)
     elseif inRow and owned then
       -- First member: on the group's anchor.
       local ox, oy = Offset("")
-      ox, oy = WholePixel(region, originFrame, originPoint, ox, oy)
+      ox, oy = WholePixel(region, originFrame, originPoint, ox + ownedCrossX, oy + ownedCrossY)
       region:SetAnchor(g.start, originFrame, originPoint)
       region:SetOffset(ox + ownX, oy + ownY)
       previousOwn[""] = {ownX, ownY}
@@ -1542,15 +2955,27 @@ function ArrangeFlowPreviewNow(group)
       ox, oy = WholePixel(region, normal.home, g.centerPoint, ox, oy)
       region:SetAnchor(g.start, normal.home, g.centerPoint)
       region:SetOffset(ox, oy)
+    elseif inRow and normal.stand and referenceRegion and not previous[""] then
+      -- ForeverAuras: a copied ordinary display starting the row when the
+      -- group's first member (a gated Modern display) moved behind it: at
+      -- that member's own anchor, as the live row starts (rowFlow). An
+      -- ordinary display that leads the row starts at its own place, as live.
+      startedAtReference = Origin(referenceRegion)
+      region:SetAnchor(g.start, startedAtReference, g.start)
+      region:SetOffset(0, 0)
     else
       region:SetAnchor(g.start, normal.home, g.start)
       region:SetOffset(0, 0)
     end
+    if inRow then placed[#placed + 1] = region end
     if inRow and not previous[""] then
       rowStart = region
       -- An ordinary first display's offset is the row's first offset too
       -- (FlowOwnOffset), so a Modern sample after it adds the difference only.
-      firstOwn[""] = {OwnOffset(normal.data)}
+      -- ForeverAuras: with a reference display, the offsets are measured
+      -- from that display's (RowOffset), whichever display starts the row.
+      local reference = normal.stand and referenceRegion and referenceRegion.blizzardAuraDisplay
+      firstOwn[""] = {OwnOffset(reference and reference.data or normal.data)}
     end
     if inRow then previous[""] = region end
   end
@@ -1573,7 +2998,12 @@ function ArrangeFlowPreviewNow(group)
         -- ordinary display, PlaceNormal) takes back off.
         local addX, addY = ownX, ownY
         if not framed and not owned then
-          if not previous[key] then firstOwn[key] = {ownX, ownY} end
+          if not previous[key] then
+            -- ForeverAuras: measured from the reference display's offset when
+            -- another display starts the row (see referenceRegion).
+            local reference = referenceRegion and referenceRegion.blizzardAuraDisplay
+            firstOwn[key] = {OwnOffset(reference and reference.data or native and native.data)}
+          end
           local first = firstOwn[key] or {0, 0}
           addX, addY = ownX - first[1], ownY - first[2]
         end
@@ -1593,7 +3023,7 @@ function ArrangeFlowPreviewNow(group)
         elseif owned then
           -- Group-owned row: the first sample sits on the group's anchor, a
           -- centred row half its length back from it.
-          ox, oy = WholePixel(button, originFrame, originPoint, ox, oy)
+          ox, oy = WholePixel(button, originFrame, originPoint, ox + ownedCrossX, oy + ownedCrossY)
           button:SetPoint(g.start, originFrame, originPoint, ox, oy)
         elseif frame then
           button:SetPoint(start, frame, point, frameX + ox, frameY + oy)
@@ -1610,7 +3040,19 @@ function ArrangeFlowPreviewNow(group)
         else
           -- As above.
           if framed then Display.RestorePreviewRegion(region) end
-          button:SetPoint(g.start, Origin(region), g.start)
+          -- ForeverAuras: at the reference display's own anchor when another
+          -- display starts the row (see referenceRegion), as the live row.
+          -- Its own offset's difference from the reference display's is
+          -- applied (addX/addY, in ox/oy), as the live row applies it to its
+          -- first chained display.
+          -- Only then: off a frame the own offset is already in the box's
+          -- place (rc.33 review: it was added twice).
+          if referenceRegion then
+            startedAtReference = Origin(referenceRegion)
+            button:SetPoint(g.start, startedAtReference, g.start, ox, oy)
+          else
+            button:SetPoint(g.start, Origin(region), g.start)
+          end
         end
         -- The display's own box follows its first icon.
         if (frame or not framed) and not moved then
@@ -1618,6 +3060,7 @@ function ArrangeFlowPreviewNow(group)
           moved = true
         end
         onFrame = onFrame or frame ~= nil and frame ~= false
+        placed[#placed + 1] = button
         if not framed and not previous[key] then rowStart = button end
         previous[key] = button
         previousOwn[key] = {addX, addY}
@@ -1627,8 +3070,9 @@ function ArrangeFlowPreviewNow(group)
   end
   -- Ordinary displays that are not copied lead the row (in both row modes:
   -- they cannot hang from a secret-length container), then samples and
-  -- stands in the group's order.
-  for _, childID in ipairs(group.controlledChildren or {}) do
+  -- stands in the row's order (Display.FlowOrder, as the live row chains
+  -- them: gated members last).
+  for _, childID in ipairs(rowOrder) do
     local entry = Private.regions[childID]
     local region = entry and entry.region
     if region and not region.secretAuraSamplesActive and region.flowNormal and region.flowNormal.active
@@ -1636,7 +3080,7 @@ function ArrangeFlowPreviewNow(group)
       PlaceNormal(region)
     end
   end
-  for _, childID in ipairs(group.controlledChildren or {}) do
+  for _, childID in ipairs(rowOrder) do
     local entry = Private.regions[childID]
     local region = entry and entry.region
     if region and region.secretAuraSamplesActive and region:IsShown() then
@@ -1657,8 +3101,17 @@ function ArrangeFlowPreviewNow(group)
       if px then window = math.floor(window * px + 0.5 + 0.001) / px end
       ox, oy = -g.sign[1] * window, -g.sign[2] * window
     end
-    ox, oy = WholePixel(rowStart, originFrame, originPoint, ox, oy)
+    ox, oy = WholePixel(rowStart, originFrame, originPoint, ox + ownedCrossX, oy + ownedCrossY)
     clipOrigin = {originFrame, originPoint, ox, oy}
+  elseif startedAtReference and rowStart and limit then
+    -- ForeverAuras: the row started at the reference display's own anchor
+    -- (referenceRegion); the live cut starts there too (UpdateFlowClip,
+    -- flows.origin), not at the first display, which its offset may move.
+    -- The origin frame as it was placed then (startedAtReference): placed
+    -- again here it would follow the reference display's box, which has
+    -- moved onto its sample since, a sample that hangs from this origin
+    -- (an anchor loop; rc.34 review).
+    clipOrigin = {startedAtReference, g.start, 0, 0}
   end
   if limit and Display.PreviewFlowClip then Display.PreviewFlowClip(group, g, rowStart, leadSteps, firstStep, clipOrigin) end
   if onFrame and firstKey then
@@ -1666,6 +3119,18 @@ function ArrangeFlowPreviewNow(group)
     local cx, cy = CrossOffset(group, g, cross[firstKey] or 0)
     ox, oy = ox + cx, oy + cy
     SetGroupPreviewBounds(group, g, math.max(0, (length[firstKey] or 0) - (lastSpacing[firstKey] or spacing)), cross[firstKey] or 0, ox, oy)
+  elseif not framed and #placed > 0 then
+    -- ForeverAuras: the row's box in the editor (its selection outline and
+    -- mover, from GetBoundingRect) covers the previewed row as a Dynamic
+    -- Group's box covers its children: the rectangle around every frame the
+    -- arrangement placed, offsets and sizes included, cut to the Limit's
+    -- window when there is one (the clip frame, PreviewFlowClip), in the
+    -- group's units from its anchor point. Without this the box was the
+    -- children's own frames, all sitting on the anchor: one icon centred on
+    -- the row's start, half of it beside the row. Shared with the Grid
+    -- preview (SecretAuraGrid.lua, ArrangeGridPreview).
+    local clip = limit and Display.PreviewClipFrame and Display.PreviewClipFrame(group)
+    Display.SetGroupPreviewUnion(group, groupRegionForHalf, placed, clip)
   else
     Display.RestoreGroupPreview(group)
   end
@@ -1678,6 +3143,10 @@ end
 -- stretched from that cap to the row start collapses onto the cap when the
 -- row is longer, so its far edge is whichever is further on.
 local clips, caps = {}, {}
+-- ForeverAuras: the group's cut frame, for the editor rectangle (ArrangeFlowPreviewNow).
+function Display.PreviewClipFrame(group)
+  return group and clips[group.id]
+end
 local CLIP_MARGIN = 600
 
 -- How to stretch a frame between the cap and the row start so that one of its
@@ -2010,7 +3479,9 @@ function Display.UpdateFlowClip(group, flows, g)
     end
     MatchClipStrata(clip, groupRegion)
   end
-  local first = flows and flows[1]
+  -- ForeverAuras: the row's reference display (RechainFlow, rowFlow), where
+  -- the old row layout starts; the first chained display when none is noted.
+  local first = flows and (flows.origin or flows[1])
   -- The options preview places its own cut.
   if not first or WeakAuras.IsOptionsOpen() then return end
   local step, spacing, width, height = RowStep(group, g, flows)
@@ -2028,7 +3499,9 @@ function Display.UpdateFlowClip(group, flows, g)
     local originFrame, originPoint = RowOrigin(group)
     if originFrame then
       local snapX, snapY = SnapOffset(originFrame, originPoint)
-      SetWindow(clip, g, g.start, originFrame, length, width, height, spacing, originPoint, snapX, snapY)
+      -- Across the row as the chain is (RechainFlow, CrossOffset).
+      local crossX, crossY = CrossOffset(group, g, g.sign[1] ~= 0 and height or width)
+      SetWindow(clip, g, g.start, originFrame, length, width, height, spacing, originPoint, snapX + crossX, snapY + crossY)
       return
     end
   end
@@ -2046,12 +3519,21 @@ end)
 local flushing = false
 -- When each group was last chained (GetTime is constant within a frame).
 local lastFlush = setmetatable({}, {__mode = "k"})
+local flushesAt, flushes = nil, 0
+local activatingShadows = false   -- ForeverAuras (dev.83): the shadows' binding asked from the row's pass, never from itself
 local function FlushQueued()
   -- ForeverAuras: during a load scan (and the editor's batched pick of a
   -- large group, OptionsFrame) the queue is kept for Display.EndFlowLoad:
   -- the per-frame timer below chained every queued group once a frame
   -- regardless of the hold, which made the hold worthless (issue #136).
   if flushing or loadScan > 0 then return end
+  -- ForeverAuras (dev.75 watchdog): more than 200 flushes in one frame is a
+  -- loop between a layout pass and what it queues; reported with its stack
+  -- rather than a frozen client
+  local now = GetTime()
+  if flushesAt ~= now then flushesAt, flushes = now, 0 end
+  flushes = flushes + 1
+  if flushes > 200 then flushes = 0; error("ForeverAuras watchdog: the row layout was asked for " .. 200 .. " times in one frame") end
   flushing = true
   local groups = queued
   queued = {}
@@ -2071,7 +3553,9 @@ local function FlushQueued()
   -- for the timer QueueRechain set, so a rechain can never loop on itself.
 end
 
-local function QueueRechain(region)
+local QueueRechain
+Display.QueueRechain = function(region) return QueueRechain(region) end   -- ForeverAuras (dev.74): a shadow chain completed late asks for the row's pass
+function QueueRechain(region)
   local native = region.blizzardAuraDisplay
   local normal = region.flowNormal
   local data = native and native.active and native.data or normal and normal.active and normal.data
@@ -2101,6 +3585,13 @@ end
 function Display.EndFlowLoad()
   loadScan = math.max(0, loadScan - 1)
   if loadScan == 0 and next(queued) then FlushQueued() end
+  -- Grid rebuilds that waited for this hold (BlizzardAuraDisplay.lua, DrainPending).
+  if loadScan == 0 and Display.ResumeGridDrain then Display.ResumeGridDrain() end
+end
+
+-- Whether a flow hold is open (a rechain now would only join its batch).
+function Display.FlowLoadHeld()
+  return loadScan > 0
 end
 
 function Display.WatchFlowVisibility(region)
@@ -2269,6 +3760,35 @@ local function StaleGrowth(group, childID)
 end
 
 -- Re-anchors every child of a Modern Aura Group in the group's child order.
+local function LocalOutputFailure(region, data, kind, why)
+  local native = region.blizzardAuraDisplay
+  if not native then return false end
+  local flow = native.flow
+  local ask = native.chainCommitPending
+  local instance = ask and ask.instance or native.instances and native.instances[1]
+  if kind == "main" and Display.FlowChain(data) then
+    native.chainCommitPending, native.chainCommitResult = nil, false
+    Display.NoteChainFailure(region, instance, "end", why, ask and ask.pending)
+    Display.SetFlowEnd(region, data, nil)
+    if Display.SettleProbeCommit then Display.SettleProbeCommit(region) end
+  else
+    -- Keep the old measurement graph resolvable until its paced repair.
+    -- An ordinary measurement failure is not a failed gated display.
+    local shadow = kind == "shadowChain"
+    if shadow and flow then flow.shadowChainProblem, flow.localShadowOutputProblem = why, true end
+    if data.uid and Private.AuraWarnings and Private.AuraWarnings.UpdateWarning then
+      Private.AuraWarnings.UpdateWarning(data.uid, shadow and "blizzard_aura_shadow" or "blizzard_aura_row_measure", "warning", L["Blizzard could not create the Modern Aura Group spacing: %s"]:format(tostring(why)))
+    end
+    if instance and instance.finishing and Display.NoteSlotFailure then Display.NoteSlotFailure(instance, "local row measurement", why) end
+    if Display.RequestReapply then Display.RequestReapply(region, "local row measurement: " .. tostring(why)) end
+    if native.probeBuild and Display.SettleProbeCommit then
+      native.chainCommitPending, native.chainCommitResult = nil, false
+      Display.SettleProbeCommit(region)
+    end
+  end
+  return false
+end
+local committingChains = false -- ForeverAuras (cell chain): a commit's own re-chain does not commit again
 function Display.RechainFlow(group)
   if not group then return end
   if loadScan > 0 then queued[group] = true; return end
@@ -2310,14 +3830,23 @@ function Display.RechainFlow(group)
   if owned then originFrame, originPoint = RowOrigin(group) end
   if owned and not originFrame then owned = false end
   -- Each child's own region, then its clones (multi-state triggers) in a stable order.
+  -- ForeverAuras: in the row's order (Display.FlowOrder: gated members last).
   local members = {}
-  for _, childID in ipairs(group.controlledChildren or {}) do
+  -- ForeverAuras: each member's place in the group's own order, to find the
+  -- row's reference display (rowFlow below) after the gated members moved.
+  local groupPosition, memberPosition = {}, {}
+  for index, childID in ipairs(group.controlledChildren or {}) do groupPosition[childID] = index end
+  for _, childID in ipairs(Display.FlowOrder(group)) do
     local entry = Private.regions[childID]
-    if entry and entry.region then members[#members + 1] = entry.region end
+    if entry and entry.region then members[#members + 1] = entry.region; memberPosition[entry.region] = groupPosition[childID] end
     local cloneIDs = {}
     for cloneId in pairs(Private.clones and Private.clones[childID] or {}) do cloneIDs[#cloneIDs + 1] = cloneId end
     table.sort(cloneIDs, function(a, b) return tostring(a) < tostring(b) end)
-    for _, cloneId in ipairs(cloneIDs) do members[#members + 1] = Private.clones[childID][cloneId] end
+    for _, cloneId in ipairs(cloneIDs) do
+      local clone = Private.clones[childID][cloneId]
+      members[#members + 1] = clone
+      memberPosition[clone] = groupPosition[childID]
+    end
   end
   for _, region in ipairs(members) do
     local native = region.blizzardAuraDisplay
@@ -2351,15 +3880,39 @@ function Display.RechainFlow(group)
       end
     end
   end
+  -- ForeverAuras: the old row layout starts the row at its first display's
+  -- own frame, and measures every member's own offset from that display's.
+  -- That display stays the group's first member even when the row's order
+  -- moved it behind the others (Display.FlowOrder: a gated first member), so
+  -- the row keeps its place on the screen; the leading ordinary displays, if
+  -- any, come before it as before. Carried on the chain for the clip.
+  local rowFlow = flows[1]
+  if not rowFlow then
+    for _, flow in ipairs(modernFlows) do
+      if not rowFlow or (memberPosition[flow.region] or math.huge) < (memberPosition[rowFlow.region] or math.huge) then rowFlow = flow end
+    end
+  end
   for _, flow in ipairs(modernFlows) do flows[#flows + 1] = flow end
+  flows.origin = rowFlow
   -- Centred: the shadows run backwards from the first display's centre point,
   -- and the visible row starts where they end, half a spacing on.
   local previous, shadowEnd
   -- The row's centre (Centered growth) or start corner: the group's anchor
-  -- for a group-owned row, else the first display's own frame.
-  local rowFrame = owned and originFrame or flows[1] and (flows[1].home or flows[1].region)
+  -- for a group-owned row, else the reference display's own frame.
+  local rowFrame = owned and originFrame or rowFlow and (rowFlow.home or rowFlow.region)
   local rowPoint = owned and originPoint or (g.shadow and g.centerPoint or g.start)
   local snapX, snapY = SnapOffset(rowFrame, rowPoint)
+  -- ForeverAuras: a group-owned row lines up across the row with the group's
+  -- anchor point like a Dynamic Group's children: the row's cross size (its
+  -- first display's, RowStep) is centred on a CENTER/LEFT/RIGHT point, hangs
+  -- from a TOP point and stands on a BOTTOM one (CrossOffset; the same
+  -- rule as rows on unit frames). Before, the row's top-left corner sat on
+  -- the point whatever it was, so a centred row hung below its anchor.
+  if owned and flows[1] then
+    local _, _, rowWidth, rowHeight = RowStep(group, g, flows)
+    local crossX, crossY = CrossOffset(group, g, g.sign[1] ~= 0 and rowHeight or rowWidth)
+    snapX, snapY = snapX + crossX, snapY + crossY
+  end
   if g.shadow and flows[1] then
     local firstRegion = flows[1].region
     local spacing = Display.FlowSpacing(group, firstRegion, 0) - 0
@@ -2369,8 +3922,15 @@ function Display.RechainFlow(group)
         if not combat then FreshFrame(flow, "shadowStart", "shadowSize", flow.region) end
         local start = flow.shadowStart
         if combat then
-          if shadowEnd then Place(start, g.shadow.start, shadowEnd[1], shadowEnd[2], shadowEnd[3], shadowEnd[4])
-          else Place(start, g.shadow.start, rowFrame, rowPoint, snapX, snapY) end
+          local placed
+          if shadowEnd then placed = Place(start, g.shadow.start, shadowEnd[1], shadowEnd[2], shadowEnd[3], shadowEnd[4])
+          else placed = Place(start, g.shadow.start, rowFrame, rowPoint, snapX, snapY) end
+          -- ForeverAuras (dev.82, Astra's dev.81 review): a refused shadow placement is said (with
+          -- "/fa cells debug on") instead of passing in silence; the row comes right when
+          -- restrictions end (afterCombat), as every refused placement does
+          if not placed and Display.BuildReport then
+            Display.BuildReport(("%s's shadow could not be placed on the shadows before it: %s"):format(tostring(FlowData(flow) and FlowData(flow).id), tostring(start.faPlaceError)))
+          end
           local ok, chained = pcall(ChainShadows, flow)
           if ok then shadowEnd = chained end
         else
@@ -2391,7 +3951,34 @@ function Display.RechainFlow(group)
       previous = CapRowStart(group, g, flows, previous, combat, snapX, snapY, owned and originFrame or nil, owned and originPoint or nil)
     end
   end
+  -- ForeverAuras (independent carriers, dev.32): the padding M of a member's
+  -- translation comes from the group's membership (CarrierPadding), and a
+  -- member imported with its group is built while the group's child list is
+  -- still empty: its end and boxes were translated with the empty-membership
+  -- padding (64), which does not cover a list growing left or up from the
+  -- pin, and the client collapses a helper whose anchors cross (seen in
+  -- game: the Left row's end 62 px from the pin whatever the list held,
+  -- boxes 3+ astray; the row healed on a reload, which builds the member
+  -- with the list already saved). The group's own modify re-chains the row
+  -- once the list is saved: a member whose recorded padding differs from the
+  -- current one has its end (and, through the placement records, its boxes)
+  -- translated again here, before the chain hangs the next member from it.
+  -- Out of combat only, like the rest of this pass; a refused translation
+  -- falls back and reports as in SetFlowEnd.
+  if owned and not combat and Display.FlowIndependentGroup(group) then
+    local padding = Display.CarrierPadding(group)
+    for _, flow in ipairs(flows) do
+      if flow.carrierEnd and flow.endFrame == flow.carrierEnd.out and flow.carrierM ~= padding then
+        local data = FlowData(flow)
+        if data then Display.SetFlowEnd(flow.region, data, nil) end
+      end
+    end
+  end
   local origin, lead = nil, 0
+  -- ForeverAuras (cell chain, dev.44 review): whether the member hanging from
+  -- each flow's end could be placed there in this chain (nil: no follower
+  -- hangs from it); a completion outside an apply reads it (CompleteChain).
+  for _, flow in ipairs(flows) do flow.followerPlaced, flow.startPlaced = nil, nil; if not combat then flow.startPrewired = nil end end   -- dev.70: out of restrictions every start is placed by this pass
   for _, flow in ipairs(flows) do
     local region = flow.region
     if not combat then
@@ -2441,6 +4028,23 @@ function Display.RechainFlow(group)
         end
       end
     end
+    -- Refresh local outputs after any start/content replacement and before
+    -- placing this member or its follower. The refresh keeps unchanged
+    -- placements intact, and also repairs import-time translation padding.
+    local native = region.blizzardAuraDisplay
+    if native and native.data and Display.RefreshLocalChainOutputs then
+      local ok, refreshed, why, kind = pcall(Display.RefreshLocalChainOutputs, region, native.data)
+      if not ok then why, refreshed = refreshed, false end
+      if refreshed == false then
+        return LocalOutputFailure(region, native.data, kind or (Display.FlowChain(native.data) and "main" or "measureChain"), why)
+      else
+        ClearMeasureOutputWarning(native.data)
+        if flow.localShadowOutputProblem then
+          flow.localShadowOutputProblem, flow.shadowChainProblem = nil, nil
+          if native.data.uid and Private.AuraWarnings and Private.AuraWarnings.UpdateWarning then Private.AuraWarnings.UpdateWarning(native.data.uid, "blizzard_aura_shadow", nil, nil) end
+        end
+      end
+    end
     if owned then
       -- ForeverAuras: group-owned row. A leading ordinary display's start
       -- frame and region go on the group's anchor, a running lead along;
@@ -2467,12 +4071,24 @@ function Display.RechainFlow(group)
           px, py = OwnOffset(FlowData(previous))
         end
         local chained = previous and Place(flow.start, g.start, previous.endFrame, previous.endPoint, previous.x - px, previous.y - py)
+        if previous then previous.followerPlaced = chained and true or false end
         if not chained then
+          -- (dev.80) said in chat with "/fa cells debug on"
+          if previous and Display.BuildReport then Display.BuildReport(("%s could not be placed on %s's end: %s"):format(tostring(FlowData(flow) and FlowData(flow).id), tostring(previous.region and FlowData(previous) and FlowData(previous).id), tostring(flow.start.faPlaceError))) end
           if not combat then flow.start:ClearAllPoints() end
-          Place(flow.start, g.start, originFrame, originPoint, snapX, snapY)
+          -- The first member sits on the row's origin; a refused member too,
+          -- which is then the wrong place (startPlaced = false).
+          local onOrigin = Place(flow.start, g.start, originFrame, originPoint, snapX, snapY)
+          flow.startPlaced = (previous == nil and onOrigin) and true or false
+        else
+          flow.startPlaced = true
         end
         previous = flow
       else
+        -- A locked stand keeps its place: the member before it cannot know
+        -- its follower sits on its end, nor the stand its own.
+        if previous then previous.followerPlaced = false end
+        flow.startPlaced = false
         previous = flow
       end
     elseif flow.home and not flow.stand then
@@ -2489,30 +4105,72 @@ function Display.RechainFlow(group)
       -- The display's own offset (OwnOffset) moves only this display; the
       -- previous one's is taken back off its end anchor. The first display's
       -- offset is already in its region's place, where the row starts.
-      local ox, oy = RowOffset(flow, flows[1])
-      local px, py = RowOffset(previous, flows[1])
+      local ox, oy = RowOffset(flow, rowFlow)
+      local px, py = RowOffset(previous, rowFlow)
       if previous then
         Place(flow.start, flow.growth.start, previous.endFrame, previous.endPoint, previous.x + ox - px, previous.y + oy - py)
       else
-        Place(flow.start, flow.growth.start, flow.home or region, flow.growth.start, snapX + ox, snapY + oy)
+        -- ForeverAuras: at the reference display's frame (rowFlow), not
+        -- necessarily this display's own.
+        Place(flow.start, flow.growth.start, rowFrame, flow.growth.start, snapX + ox, snapY + oy)
       end
       previous = flow
     else
       flow.start:ClearAllPoints()
       -- As in combat above: this display's own offset on, the previous one's off.
-      local ox, oy = RowOffset(flow, flows[1])
-      local px, py = RowOffset(previous, flows[1])
+      local ox, oy = RowOffset(flow, rowFlow)
+      local px, py = RowOffset(previous, rowFlow)
       local chained = previous and Place(flow.start, flow.growth.start,
         previous.endFrame, previous.endPoint, previous.x + ox - px, previous.y + oy - py)
+      if previous then previous.followerPlaced = chained and true or false end
       if not chained then
-        -- First display, or Blizzard refused the anchor: start at the region.
+        -- First display: start at the reference display's frame (rowFlow,
+        -- not necessarily this display's own); Blizzard refused the anchor:
+        -- start at the display's own region.
         flow.start:ClearAllPoints()
-        flow.start:SetPoint(flow.growth.start, flow.home or region, flow.growth.start, snapX + ox, snapY + oy)
+        flow.start:SetPoint(flow.growth.start, previous and (flow.home or region) or rowFrame, flow.growth.start, snapX + ox, snapY + oy)
+        flow.startPlaced = previous == nil
+      else
+        flow.startPlaced = true
       end
       previous = flow
     end
   end
   Display.UpdateFlowClip(group, flows, g)
+  -- ForeverAuras (cell chain, dev.46 review): the members that asked this
+  -- pass to take their prepared end are committed now, with this pass's
+  -- placements (CommitChain); a refused one published its fallback, so the
+  -- pass runs once more for the followers (not again from that pass).
+  if Display.CommitChain and not committingChains then
+    local again = false
+    committingChains = true
+    for _, flow in ipairs(flows) do
+      local native = flow.region.blizzardAuraDisplay
+      local ask = native and native.chainCommitPending
+      if ask then
+        native.chainCommitPending = nil
+        if Display.CommitChain(flow.region, ask.instance, ask.pending) == false then again = true end
+      end
+    end
+    committingChains = false
+    if again then Display.RechainFlow(group) end
+  end
+  -- ForeverAuras (dev.82 -> dev.83, Dan's dev.82 combat reload): the shadows
+  -- of a Centered row are bound once THIS pass has put everything in place.
+  -- FinishApply asks too, but its own pass is deferred to the load batch
+  -- during a reload (loadScan above), so at that moment nothing was placed
+  -- yet ("T's shadow is not on the shadows before it") and no later build
+  -- asked again; the batch's pass is where the placements happen, so it asks
+  -- here. The activated members' new containers take the unit (RefreshUnits).
+  if combat and Display.ActivateShadows and not activatingShadows then
+    activatingShadows = true
+    local okA, activated = pcall(Display.ActivateShadows, group)
+    activatingShadows = false
+    if okA and type(activated) == "table" and Display.RefreshUnits then
+      for _, r in ipairs(activated) do Display.RefreshUnits(r) end
+    end
+  end
+  return true -- the chain ran (nil: deferred to the batch, CompleteChain)
 end
 
 Display.RechainFlow = Private.Profiled("aura (modern) - group layout", Display.RechainFlow)

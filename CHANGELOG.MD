@@ -1,5 +1,39 @@
 # Changelog
 ## VERSIONS
+## 1.2.2
+Major Features
+- Rows of Modern Aura Groups close up on their own: a buff list takes exactly as many spots as it has auras, a Missing icon takes one or none, and the next display starts where the previous one ends. No gaps during a fight, any growth direction, Centered rows too, and it survives reloads in combat. Nothing to switch on.
+- Reloading in combat is reliable: Modern displays appear right away, conditions apply, and anything the game refuses mid-fight is finished when the fight ends.
+- Editor changes apply at once, no reload needed: moving a display in or out of a group, changing conditions, reordering sub-elements.
+- Opening and closing the editor no longer reshuffles the icons of a live buff list.
+- Smoother idle performance: hidden texts stop updating, text-only displays update at text rate instead of every frame, countdowns only reformat when they can change, and spell changes no longer run the cooldown sweep twice.
+- Add French translations - thanks [Firnael](https://github.com/Firnael)!
+
+Conditions and Looks
+- Remaining Time conditions on a countdown text work, in packed rows too: hide it or colour it below or above a number of seconds.
+- Countdown numbers follow the text's place in the sub-element order; the swipe stays under everything.
+- A display with a Total Duration filter and a "Remaining Time < X" glow stays packed and its glow follows the aura's remaining time.
+- Editing or reordering a glow no longer stops its animation; Action Button Glow speed on Modern displays adjusted.
+- A condition that turns the cooldown numbers on now shows them.
+- The editor says so when the game refuses a text's conditions instead of silently ignoring them.
+
+Targets
+- A Show Always display on your target follows target changes in combat: no aura on the new target shows the static icon, swapping back shows the countdown, clearing the target keeps the static icon with "Show If Unit Does Not Exist" ticked.
+Trigger and Editor
+- The spell field is "Name(s)": names or spell IDs, a spell ID matching every rank and same-name spell. "Exact Spell ID(s)" is exact.
+- Clearer warnings when a row can't be laid out reliably in combat, when a Remaining Time icon has no spell, or when the game refuses a countdown.
+- FA_OPTIONS_OPENED is sent when the editor opens.
+- Bug report tools: /fa pstart, /fa pprint, /fa pfocus <aura name>, /fa phitch, /fa loadmem, /fa cells debug on.
+
+Fixes
+- Errors on restricted aura frames ("IsVisible on forbidden object", "EnableMouse on bad self").
+- "Cannot be indexed with secret keys" when re-enabling a Load: Never group or opening the editor with packed rows.
+- A black square over a standalone Show Always icon while the editor was open.
+- Row previews not matching the live row after moving a display.
+- An always-shown icon going missing after a combat reload until the editor was opened.
+- A freeze during rapid combat re-entry after a reload.
+- /fa modern throwing on protected geometry; a false "count is not zero" profiler warning.
+
 ## 1.1.0
 - Modern Aura Groups now behave like Dynamic Groups. The row starts where you place the group, and each display’s X/Y Offset moves only that display. Groups you made before 1.1.0 keep their old layout automatically (a single “Use old row layout” checkbox in the group settings), so nothing you have changes.
 - Bars, progress textures and textures can now sit anywhere in a Modern Aura Group row, after a Modern list, and move with it, including in combat. Bars keep their overlays, ticks and texts; progress textures work in both their straight and circular forms.

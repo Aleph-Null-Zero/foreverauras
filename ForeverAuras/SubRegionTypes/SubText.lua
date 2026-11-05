@@ -387,9 +387,17 @@ local function modify(parent, region, parentData, data, first)
         end
         if timerOnly then
           local state = parent.state
-          local alpha = state and state.cdmHideGCDText and not state.cdmTextPreview
-            and state.cdmTextDurationObject and Private.GCDTextAlpha(state.cdmTextDurationObject)
-          text:SetAlpha(alpha or 1)
+          -- ForeverAuras (dev.103, Dan's dev.102 focus run): the GCD alpha is the client's evaluation of
+          -- the duration object (the costly call of a secret countdown's tick); a tick re-reads it a
+          -- quarter second after the last read at most, a state update at once (region.alphaNow, set by
+          -- Update). Nothing is cached across those reads: it is read less often.
+          local now = GetTime()
+          if region.alphaNow or not region.alphaRead or now - region.alphaRead >= 0.25 then
+            region.alphaNow, region.alphaRead = nil, now
+            local alpha = state and state.cdmHideGCDText and not state.cdmTextPreview
+              and state.cdmTextDurationObject and Private.GCDTextAlpha(state.cdmTextDurationObject)
+            text:SetAlpha(alpha or 1)
+          end
         end
         region:UpdateAnchorOnTextChange()
       end
@@ -403,10 +411,14 @@ local function modify(parent, region, parentData, data, first)
           parent.values.lastCustomTextUpdate = GetTime()
           parent.values.customTextUpdated = true
         end
+        region.alphaNow = true   -- (dev.103) a state update reads the GCD alpha at once
         UpdateText()
       end
-    else
-      Update = UpdateText
+    elseif UpdateText then
+      Update = function()
+        region.alphaNow = true   -- (dev.103) a state update reads the GCD alpha at once
+        UpdateText()
+      end
     end
 
     local FrameTick
@@ -448,6 +460,100 @@ local function modify(parent, region, parentData, data, first)
       Private.BlizzardAuraDisplay.HideLinkedText(region)
     end
 
+    -- ForeverAuras (dev.98, corrected in dev.100 after Astra's review): a text
+    -- that is only a %p timer in the "timed" format shows a string that can
+    -- change only at known points of the remaining time: whole seconds, the
+    -- decimal steps (and half steps, for rounding) below the dynamic
+    -- threshold, the threshold itself, and zero. The tick formats at the
+    -- first tick past the next such point and rests in between; if the shown
+    -- string did not change there (another rounding than expected), it keeps
+    -- formatting every tick until it does. The ordinary %p token is the case
+    -- (Private.ParseCDMText names it "p" too); the native countdown route
+    -- (a cdmBuff state), secret or paused timers, mod-rated or tinted ones,
+    -- Blizzard's modern format and anything but a timed progress keep
+    -- formatting every tick, as before. A state update formats at once and
+    -- forgets the resting point.
+    if FrameTick == UpdateText and timerOnly and region.text_text:match("%%p") then
+      local formatKind = data["text_text_format_p_format"] or "timed"
+      local timeFormat = tonumber(data["text_text_format_p_time_format"]) or 0
+      local tinted = data["text_text_format_p_time_tint"]
+      if formatKind == "timed" and timeFormat ~= 2 and not tinted then
+        local threshold = tonumber(data["text_text_format_p_time_dynamic_threshold"]) or 60
+        local precision = tonumber(data["text_text_format_p_time_precision"]) or 1
+        local scale = 10 ^ precision
+        local margin = 1e-5
+        local restUntil, restFrom, restExpiration, restDuration, expectChange
+        local tick = FrameTick
+        -- the nearest point below the remaining time where the string can change
+        -- (nil when the remaining time sits ON such a point: a string may change just below it, so the
+        -- next tick formats as well)
+        local function NextPoint(remaining)
+          if math.abs(remaining - math.floor(remaining + 0.5)) < margin then return nil end
+          if threshold > 0 and math.abs(remaining - threshold) < margin then return nil end
+          local point = 0
+          local whole = math.floor(remaining - margin)
+          if whole > point then point = whole end
+          if threshold > 0 and remaining < threshold + margin then
+            -- decimals are printf-rounded: the string changes around the half steps (k + 0.5) / scale
+            local steps = remaining * scale - 0.5
+            if math.abs(steps - math.floor(steps + 0.5)) < margin * scale then return nil end
+            local half = (math.floor((remaining - margin) * scale - 0.5) + 0.5) / scale
+            if half > point then point = half end
+          elseif threshold > 0 and threshold > point then
+            point = threshold
+          end
+          if point < 0 then point = 0 end
+          return point
+        end
+        FrameTick = function()
+          local state = parent.state
+          local expiration = state and state.expirationTime
+          local duration = state and state.duration
+          if not state or state.progressType ~= "timed" or state.paused or state.cdmBuff
+            or type(expiration) ~= "number" or type(duration) ~= "number"
+            or issecretvalue(expiration) or issecretvalue(duration)
+            or (state.modRate ~= nil and (issecretvalue(state.modRate) or state.modRate ~= 1)) then
+            restUntil = nil
+            return tick()
+          end
+          local now = GetTime()
+          if restUntil and expiration == restExpiration and duration == restDuration and now < restUntil then return end
+          local before = text:GetText()
+          tick()
+          local after = text:GetText()
+          local expected = expectChange and expiration == restExpiration and duration == restDuration
+          restExpiration, restDuration = expiration, duration
+          if expected and not issecretvalue(after) and not issecretvalue(before) and after == before and now - restFrom < 0.25 then
+            -- the change expected at this point has not shown yet: look again next tick
+            return
+          end
+          expectChange = false
+          local remaining = expiration - now
+          if remaining <= 0 then
+            restUntil, restFrom = math.huge, now   -- expired: formatted (empty) once, a new timer wakes it
+            return
+          end
+          local point = NextPoint(remaining)
+          if point then
+            restUntil, restFrom, expectChange = expiration - point, expiration - point, true
+          else
+            restUntil, restFrom = now, now   -- on a point: the next tick formats too (no change expected of it)
+          end
+          -- (dev.101, Dan's focus profile) a text hidden during GCD-length lockouts re-reads its alpha
+          -- from the client's duration object at every format (Private.GCDTextAlpha, a costly client
+          -- call): resting keeps that to four reads a second at most instead of thirty
+          if state.cdmHideGCDText and restUntil > now + 0.25 then
+            restUntil, restFrom, expectChange = now + 0.25, now + 0.25, false
+          end
+        end
+        local standard = Update
+        Update = function()
+          restUntil = nil
+          return standard()
+        end
+      end
+    end
+
     region.Update = Update
     region.FrameTick = FrameTick and Private.ThrottledTextTick(FrameTick)
 
@@ -462,20 +568,25 @@ local function modify(parent, region, parentData, data, first)
 
   function region:ConfigureSubscribers()
     local visible = self:IsShown()
-    if self.Update then
-      if visible then
-        parent.subRegionEvents:AddSubscriber("Update", region)
-      end
+    -- ForeverAuras 1.2.1 (Astra's performance review 1): a text hidden by its
+    -- own visibility setting leaves its subscriptions; before, only a text
+    -- without the callbacks was removed, so a hidden text kept updating and
+    -- kept an otherwise idle display on the frame tick. Shown again, it
+    -- refreshes at once (below) as before.
+    if visible and self.Update then
+      parent.subRegionEvents:AddSubscriber("Update", region)
     else
       parent.subRegionEvents:RemoveSubscriber("Update", region)
     end
-    if self.FrameTick then
-      if visible then
-        parent.subRegionEvents:AddSubscriber("FrameTick", region)
-      end
+    if visible and self.FrameTick then
+      parent.subRegionEvents:AddSubscriber("FrameTick", region)
     else
       parent.subRegionEvents:RemoveSubscriber("FrameTick", region)
     end
+    -- ForeverAuras 1.2.1 (performance review 2): a text's tick function can
+    -- change while it stays subscribed (ChangeText); the display sorts
+    -- itself onto the text or the frame queue again (RegionPrototype.lua).
+    if parent.UpdateTick then parent:UpdateTick() end
     if self.Update and parent.state and visible then
       self:Update()
     end

@@ -123,7 +123,7 @@ function OptionsPrivate.GetSecretAuraSettings(data)
   args.singleNotice = {type = "description", width = "full", fontSize = "small",
     name = function()
       if Display.InDynamicGroup(data) then return Display.dynamicGroupWarning end
-      return L["The trigger's Show On or Remaining Time shows one aura in this display's position. Sort by chooses which aura when several match."]
+      return L["Show On Always and Remaining Time show one aura in this display's position; use Aura(s) Found with a Limit to show several. Sort by chooses which aura is shown when several match."]
     end,
     hidden = function() return not (Single() or Display.InDynamicGroup(data)) end}
   args.growth.name = L["Aura growth direction"]

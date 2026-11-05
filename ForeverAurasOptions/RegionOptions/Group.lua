@@ -649,12 +649,13 @@ local function createOptions(id, data)
     -- Modern Aura Groups start their row at the group's anchor; groups made
     -- before 1.1.0 keep the old layout (the first display anchors the row)
     -- until this box is unticked, so existing packs are not moved. Shown as
-    -- one checkbox, ticked for the old layout, so a new group shows it
-    -- unticked and can be left alone.
+    -- one checkbox, ticked for the old layout. Shown only while the group
+    -- uses the old layout (1.2.0): a new group never sees it, an old group
+    -- can still be moved to the new layout, after which it goes away.
     blizzardFlowOrigin = {
       type = "toggle", width = WeakAuras.doubleWidth, order = 0.611, name = L["Use old row layout (before 1.1.0)"],
-      desc = L["Leave this unticked: the row starts where you place the group, like a Dynamic Group.\n\nGroups made before 1.1.0 have it ticked so they keep looking the same. Untick it to move such a group to the new layout, then place the group where the row should start."],
-      hidden = function() return FlowOff() or data.blizzardFlowFrames ~= nil or Display.FlowGrid(data) end,
+      desc = L["Groups made before 1.1.0 have this ticked so they keep looking the same. Untick it to move this group to the current layout, where the row starts where you place the group, like a Dynamic Group; then place the group where the row should start. This box goes away once unticked."],
+      hidden = function() return FlowOff() or data.blizzardFlowFrames ~= nil or Display.FlowGrid(data) or data.blizzardFlowOrigin == "group" end,
       get = function() return data.blizzardFlowOrigin ~= "group" end,
       set = function(_, v) SaveFlow("blizzardFlowOrigin", (not v) and "group" or nil) end,
     },
@@ -711,9 +712,11 @@ local function createOptions(id, data)
       hidden = function() return FlowOff() or Display.FlowGrid(data) end},
     blizzardFlowSortMode = {
       type = "select", width = WeakAuras.doubleWidth, order = 0.65, name = L["Sort"], hidden = FlowOff,
-      values = Display.flowSortModes,
-      sorting = Display.flowSortOrder,
-      desc = L["Ascending and Descending sort by remaining time. Outside a Grid, Aura (Modern) displays with Show On: Aura(s) Found, spell IDs, and the same unit, filters and look share one sorted row; other displays keep their normal layout."],
+      -- ForeverAuras: the orders that differ on this client, plus the group's
+      -- current one (Display.FlowSortValues).
+      values = function() return (Display.FlowSortValues(data)) end,
+      sorting = function() return select(2, Display.FlowSortValues(data)) end,
+      desc = L["Ascending and Descending sort by remaining time, Name by aura name, Order applied by when each aura was gained; Blizzard default is the game's own order. Outside a Grid, Aura (Modern) displays with Show On: Aura(s) Found, spell IDs, and the same unit, filters and look share one sorted row; other displays keep their normal layout."],
       get = function() return Display.FlowSortMode(data) end,
       set = function(_, v)
         data.blizzardFlowSort, data.blizzardFlowReverse, data.blizzardFlowMerge = nil, nil, nil

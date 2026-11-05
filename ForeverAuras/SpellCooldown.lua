@@ -99,6 +99,8 @@ function Private.GetSpellCooldownData(spellID, track, showGCD, showLossOfControl
     entry.generation = cacheGeneration
     local base = ReadSpellBase(spellID)
     entry.present = base ~= nil and FillSpellCooldownData(entry.data, base, spellID, track, showGCD, showLossOfControl)
+  else
+    Private.HitchCount("cooldown data reused")   -- (dev.104) a second request this frame, no client query
   end
   if not entry.present then return end
   local cached = entry.data
@@ -108,6 +110,18 @@ function Private.GetSpellCooldownData(spellID, track, showGCD, showLossOfControl
     return into
   end
   return cached
+end
+
+-- ForeverAuras (dev.104, Astra's combat polish candidate): borrow only this
+-- frame's current-generation info; invalidation still forces a fresh read.
+function Private.GetCachedSpellCooldownInfo(spellID)
+  local base = baseCache[spellID]
+  if cooldownCacheFrame == GetTime() and base and base.generation == cacheGeneration and base.valid then
+    Private.HitchCount("cooldown info reused")
+    return base.info
+  end
+  Private.HitchCount("cooldown info query")   -- the fallback's own client query
+  return C_Spell.GetSpellCooldown(spellID)
 end
 
 -- The client's answers for a spell, read once per frame and shared by every
@@ -120,6 +134,9 @@ function ReadSpellBase(spellID)
   base.generation = cacheGeneration
   local info = C_Spell.GetSpellCooldown(spellID)
   local charges = C_Spell.GetSpellCharges(spellID)
+  -- (dev.106, Astra's dev.105 review) the cache core's own queries, counted whether or not the spell has
+  -- data: the two reads above, then the derived reads below; not every cooldown API call of the addon
+  Private.HitchCount("cooldown base query", 2)
   if not info then knownOnCooldown[spellID] = nil end
   base.valid = (info or charges) ~= nil
   if not base.valid then return end
@@ -135,6 +152,8 @@ function ReadSpellBase(spellID)
     if not issecretvalue(result) then zero = result end
   end
   base.zero = zero
+  Private.HitchCount("cooldown spell read")
+  Private.HitchCount("cooldown base query", charges and 3 or 2)
   return base
 end
 

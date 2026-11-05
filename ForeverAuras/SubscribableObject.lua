@@ -19,6 +19,7 @@ local L = WeakAuras.L
 --- @field AddSubscriber fun(self: SubscribableObject, event: string, subscriber: frame, highPriority: boolean?)
 --- @field RemoveSubscriber fun(self: SubscribableObject, event: string, subscriber: frame)
 --- @field SetOnSubscriptionStatusChanged fun(self: SubscribableObject, event: string, cb: fun())
+--- @field SetOnSubscriberChanged fun(self: SubscribableObject, event: string, cb: fun())
 --- @field Notify fun(self: SubscribableObject, event: type, ...: any)
 --- @field HasSubscribers fun(self: SubscribableObject, event: string): boolean
 local SubscribableObject =
@@ -26,6 +27,10 @@ local SubscribableObject =
   events = {},
   subscribers = {},
   callbacks = {},
+  -- ForeverAuras 1.2.1: called after EVERY add or remove of the event's
+  -- subscribers (the status callback above fires only when the list becomes
+  -- empty or non-empty), for a holder that sorts itself by what is subscribed.
+  changed = {},
 
   --- @type fun(self: SubscribableObject)
   ClearSubscribers = function(self)
@@ -36,6 +41,7 @@ local SubscribableObject =
   --- @type fun(self: SubscribableObject)
   ClearCallbacks = function(self)
     self.callbacks = {}
+    self.changed = {}
   end,
 
   --- @type fun(self: SubscribableObject, event: string, subscriber: frame, highPriority: boolean?)
@@ -61,6 +67,7 @@ local SubscribableObject =
         self.callbacks[event]()
       end
     end
+    if self.changed[event] then self.changed[event]() end   -- ForeverAuras 1.2.1
   end,
 
   --- @type fun(self: SubscribableObject, event: string, subscriber: frame)
@@ -80,6 +87,7 @@ local SubscribableObject =
             self.callbacks[event]()
           end
         end
+        if self.changed[event] then self.changed[event]() end   -- ForeverAuras 1.2.1
       end
     end
   end,
@@ -87,6 +95,11 @@ local SubscribableObject =
   --- @type fun(self: SubscribableObject, event: string, cb: fun())
   SetOnSubscriptionStatusChanged = function(self, event, cb)
     self.callbacks[event] = cb
+  end,
+
+  --- @type fun(self: SubscribableObject, event: string, cb: fun())
+  SetOnSubscriberChanged = function(self, event, cb)   -- ForeverAuras 1.2.1
+    self.changed[event] = cb
   end,
 
   --- @type fun(self: SubscribableObject, event: type, ...: any)

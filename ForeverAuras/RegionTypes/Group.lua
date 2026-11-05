@@ -132,6 +132,15 @@ local function modify(parent, region, data)
     return self.blx, self.bly, self.trx, self.try
   end
   region.boundingRect = false
+  -- ForeverAuras: a Modern Aura Group's editor box follows its previewed row
+  -- (SecretAuraFlow.lua, SetGroupPreviewBounds). Every modify makes the
+  -- function above anew, which threw that box away until the next
+  -- arrangement (the box was right once, then broken again); the row's
+  -- bounds stay in place over the new default, which is kept to restore.
+  if region.flowPreviewBoundsFn then
+    region.flowPreviewBoundsSaved = region.GetBoundingRect
+    region.GetBoundingRect = region.flowPreviewBoundsFn
+  end
 
   -- Adjust frame-level sorting
   Private.FixGroupChildrenOrderForGroup(data);
@@ -205,6 +214,9 @@ local function modify(parent, region, data)
   Private.regionPrototype.modifyFinish(parent, region, data);
   -- Modern Aura Group: re-anchor its Aura (Modern) children in the current order.
   if data.blizzardFlow and Private.BlizzardAuraDisplay and Private.BlizzardAuraDisplay.RechainFlow then
+    -- ForeverAuras: a settings change is a new attempt for a Grid whose
+    -- build the client refused (SecretAuraGrid.lua, GridSettingsChanged).
+    if Private.BlizzardAuraDisplay.GridSettingsChanged then Private.BlizzardAuraDisplay.GridSettingsChanged(data.id) end
     Private.BlizzardAuraDisplay.RechainFlow(data)
     if WeakAuras.IsOptionsOpen() then Private.BlizzardAuraDisplay.ArrangeFlowPreview(data) end
   end

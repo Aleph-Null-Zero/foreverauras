@@ -93,6 +93,7 @@ local function StartProfiling(map, id)
     map[id].start = debugprofilestop()
     map[id].elapsed = 0
     map[id].spike = 0
+    map[id].calls = 1   -- ForeverAuras (dev.99): how often it ran (the focus report)
     -- Hitch capture also attributes Lua allocation (see HitchAccumulate).
     if hitchActive then map[id].memStart = collectgarbage("count") end
     return
@@ -100,6 +101,7 @@ local function StartProfiling(map, id)
 
   if map[id].count == 0 then
     map[id].count = 1
+    map[id].calls = (map[id].calls or 0) + 1
     map[id].start = debugprofilestop()
     if hitchActive then map[id].memStart = collectgarbage("count") end
   else
@@ -205,30 +207,90 @@ local function UnwrapApis()
   end
 end
 
+-- ForeverAuras (dev.99): "/fa pfocus <aura name>" names one aura whose time
+-- the next profile breaks down: by the place in the addon that charged it
+-- (the trigger scan, the region update, the conditions, the custom text...)
+-- and by the systems that ran inside those charges. Printed by /fa pprint.
+local focus = {id = nil, stack = {}, sites = {}, systems = {}}
+local focusEnrolled = {}   -- system -> how many of its open intervals the focus enrolled
+function Private.ProfileFocusReset()
+  focus.stack, focus.sites, focus.systems = {}, {}, {}
+  focusEnrolled = {}
+end
+local function FocusStart(id)
+  if focus.id ~= id then return end
+  local site = debugstack(3, 1, 0) or "?"
+  site = site:gsub("^%s+", ""):gsub("%s+$", ""):gsub("Interface/AddOns/ForeverAuras/", ""):gsub(": in function.*$", "")
+  focus.stack[#focus.stack + 1] = site
+  StartProfiling(focus.sites, site)
+end
+local function FocusStop(id)
+  if focus.id ~= id or #focus.stack == 0 then return end
+  StopProfiling(focus.sites, table.remove(focus.stack))
+end
+
+-- (Astra's dev.99 review) a system enrolled in the focus at its start is closed at its stop whatever the
+-- focus depth is then (a system may start before the aura's charge and stop inside it, or the reverse)
+local function FocusSystemStart(system)
+  if #focus.stack > 0 then
+    StartProfiling(focus.systems, system)
+    focusEnrolled[system] = (focusEnrolled[system] or 0) + 1
+  end
+end
+local function FocusSystemStop(system)
+  local n = focusEnrolled[system]
+  if n and n > 0 then
+    focusEnrolled[system] = n - 1
+    StopProfiling(focus.systems, system)
+  end
+end
+
 local function StartProfileSystem(system)
   StartProfiling(profileData.systems, "wa")
   StartProfiling(profileData.systems, system)
+  if focus.id then FocusSystemStart(system) end
 end
 
 local function StartProfileAura(id)
   StartProfiling(profileData.auras, id)
+  if focus.id then FocusStart(id) end
 end
 
 local function StopProfileSystem(system)
   StopProfiling(profileData.systems, "wa")
   StopProfiling(profileData.systems, system)
+  if focus.id then FocusSystemStop(system) end
 end
 
 local function StopProfileAura(id)
   StopProfiling(profileData.auras, id)
+  if focus.id then FocusStop(id) end
+end
+
+function WeakAuras.ProfileFocus(id)
+  if id and id ~= "" and WeakAuras.GetData(id) then
+    focus.id = id
+    Private.ProfileFocusReset()
+    prettyPrint(L["Profile focus: %s (the next /fa pstart ... /fa pprint breaks its time down)."]:format(id))
+  elseif id and id ~= "" then
+    prettyPrint(L["Profile focus: no aura named %s."]:format(id))
+  else
+    focus.id = nil
+    Private.ProfileFocusReset()
+    prettyPrint(L["Profile focus cleared."])
+  end
 end
 
 local function StartProfileUID(uid)
-  StartProfiling(profileData.auras, Private.UIDtoID(uid))
+  local id = Private.UIDtoID(uid)
+  StartProfiling(profileData.auras, id)
+  if focus.id then FocusStart(id) end   -- (dev.100) animations charge through the uid
 end
 
 local function StopProfileUID(uid)
-  StopProfiling(profileData.auras, Private.UIDtoID(uid))
+  local id = Private.UIDtoID(uid)
+  StopProfiling(profileData.auras, id)
+  if focus.id then FocusStop(id) end
 end
 
 function Private.ProfileRenameAura(oldid, id)
@@ -287,6 +349,7 @@ function WeakAuras.StartProfile(startType)
 
   profileData.systems = {}
   profileData.auras = {}
+  Private.ProfileFocusReset()
   profileData.systems.time = {}
   profileData.systems.time.start = debugprofilestop()
   profileData.systems.time.elapsed = nil
@@ -309,16 +372,20 @@ local function doNothing() end
 -- Hitch-capture variants of the stop functions; installed instead of the
 -- normal ones by WeakAuras.StartHitchCapture.
 local function StopProfileSystemHitch(system)
+  if focus.id then FocusSystemStop(system) end
   StopProfilingHitch(profileData.systems, "wa")
   StopProfilingHitch(profileData.systems, system)
 end
 
 local function StopProfileAuraHitch(id)
   StopProfilingHitch(profileData.auras, id)
+  if focus.id then FocusStop(id) end
 end
 
 local function StopProfileUIDHitch(uid)
-  StopProfilingHitch(profileData.auras, Private.UIDtoID(uid))
+  local id = Private.UIDtoID(uid)
+  StopProfilingHitch(profileData.auras, id)
+  if focus.id then FocusStop(id) end
 end
 
 -- Summarises one frame interval (from one hitchFrame OnUpdate to the next):
@@ -729,6 +796,20 @@ function WeakAuras.PrintProfile()
   popup:AddText("Total time attributed to auras: ", floor(total) .. "ms")
   for _, k in ipairs(SortProfileMap(profileData.auras), "spike") do
     PrintOneProfile(popup, k, profileData.auras[k], total)
+  end
+
+  if focus.id then
+    popup:AddText("")
+    popup:AddText("|cff9900ffFocus:|r " .. focus.id)
+    local auraTotal = profileData.auras[focus.id] and profileData.auras[focus.id].elapsed or 0
+    popup:AddText(("Its aura line: %.2fms. By the place that charged it (times it ran in brackets; a place inside another is counted in both, so the rows overlap and do not add up):"):format(auraTotal))
+    for _, k in ipairs(SortProfileMap(focus.sites)) do
+      PrintOneProfile(popup, ("%s [%d]"):format(k, focus.sites[k].calls or 0), focus.sites[k], auraTotal > 0 and auraTotal or nil)
+    end
+    popup:AddText("Systems that ran inside those charges (overlapping too):")
+    for _, k in ipairs(SortProfileMap(focus.systems)) do
+      PrintOneProfile(popup, ("%s [%d]"):format(k, focus.systems[k].calls or 0), focus.systems[k], auraTotal > 0 and auraTotal or nil)
+    end
   end
 
   popup:AddText("")

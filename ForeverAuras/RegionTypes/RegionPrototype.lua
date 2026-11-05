@@ -886,15 +886,79 @@ local function SetAnimAlpha(self, alpha)
   self.subRegionEvents:Notify("AlphaChanged")
 end
 
-local function UpdateTick(self)
+-- ForeverAuras (dev.102, Astra's dev.100 focus results 1): a region whose
+-- only per-frame subscribers are text ticks (throttled to the text cadence,
+-- Private.ThrottledTextTick) is not visited between text ticks at all: the
+-- throttled ticks would return at once, and the aura charge around them is
+-- not free while profiling. A region with any other subscriber (a progress
+-- texture, a stop motion, a bar's tick) is visited every frame as before.
+local function TextOnlyTick(self)
+  local list = self.subRegionEvents.events.FrameTick
+  if not list then return false end
+  local throttled = Private.throttledTicks
+  for i = 1, #list do
+    if not throttled[list[i].FrameTick] then return false end
+  end
+  return true
+end
+
+-- ForeverAuras 1.2.1 (Astra's performance review 2): the frame tick keeps two
+-- queues. A region with only text ticks is on "TextTick", visited on text
+-- frames only (thirty a second); every other ticking region is on "Tick",
+-- visited every frame. The dispatcher no longer visits and classifies the
+-- text-only regions between text ticks. A region is sorted again whenever
+-- its FrameTick subscribers change (SubscribableObject's per-change
+-- callback) and whenever a text's tick function changes while it stays
+-- subscribed (SubText.lua ConfigureSubscribers calls UpdateTick).
+-- ForeverAuras 1.2.1-dev.109 (Astra's dev.108 review P2): the queues are
+-- plain arrays the dispatcher walks in order, so a region may not move
+-- between them WHILE a pass runs (a removal shifts the next region into the
+-- index already visited; an addition is visited again by the other queue in
+-- the same frame). A change asked for during a pass is noted and applied,
+-- as the region's final membership, once both queues have been walked.
+local pendingTick = {}
+local function ApplyTick(self)
   if self.subRegionEvents:HasSubscribers("FrameTick") and self.toShow then
-    Private.FrameTick:AddSubscriber("Tick", self)
+    if TextOnlyTick(self) then
+      Private.FrameTick:RemoveSubscriber("Tick", self)
+      Private.FrameTick:AddSubscriber("TextTick", self)
+    else
+      Private.FrameTick:RemoveSubscriber("TextTick", self)
+      Private.FrameTick:AddSubscriber("Tick", self)
+    end
   else
     Private.FrameTick:RemoveSubscriber("Tick", self)
+    Private.FrameTick:RemoveSubscriber("TextTick", self)
+  end
+end
+local function UpdateTick(self)
+  if Private.FrameTick.dispatching then
+    if not pendingTick[self] then
+      pendingTick[self] = true
+      pendingTick[#pendingTick + 1] = self
+    end
+    return
+  end
+  ApplyTick(self)
+end
+-- applied in the order first asked for; a region asked for several times is sorted once, by its final state
+function Private.FlushPendingTicks()
+  local n = #pendingTick
+  if n == 0 then return end
+  for i = 1, n do
+    local region = pendingTick[i]
+    pendingTick[i] = nil
+    pendingTick[region] = nil
+    ApplyTick(region)
   end
 end
 
 local function Tick(self)
+  -- Queue removal waits for the pass; a region hidden earlier in it must not tick.
+  if not self.toShow then return end
+  -- (the guard stays for a region sorted onto the frame queue whose ticks are all throttled: its text
+  -- ticks run on text frames only, as before)
+  if not Private.FrameTick.textDue and TextOnlyTick(self) then return end
   Private.StartProfileAura(self.id)
   self.values.customTextUpdated = false
   self.subRegionEvents:Notify("FrameTick")
@@ -1067,6 +1131,7 @@ function Private.regionPrototype.create(region)
 
   region.UpdateTick = UpdateTick
   region.Tick = Tick
+  region.TextTick = Tick   -- ForeverAuras 1.2.1: the same visit, from the text queue (UpdateTick)
 
 
   region.subRegionEvents = Private.CreateSubscribableObject()
@@ -1114,7 +1179,7 @@ function Private.regionPrototype.modify(parent, region, data)
   region.states = nil
   region.subRegionEvents:ClearSubscribers()
   region.subRegionEvents:ClearCallbacks()
-  Private.FrameTick:RemoveSubscriber("Tick", region)
+  UpdateTick(region) -- Empty subscribers detach now, or after the current dispatch.
 
   local defaultsForRegion = Private.regionTypes[data.regionType] and Private.regionTypes[data.regionType].default;
 
@@ -1210,6 +1275,11 @@ function Private.regionPrototype.modifyFinish(parent, region, data)
   region.subRegionEvents:SetOnSubscriptionStatusChanged("FrameTick", function()
     region:UpdateTick()
   end)
+  -- ForeverAuras 1.2.1: sorted again on every change of the tick subscribers (a second, non-text
+  -- subscriber added to a text-only region moves it to the frame queue; see UpdateTick)
+  region.subRegionEvents:SetOnSubscriberChanged("FrameTick", function()
+    region:UpdateTick()
+  end)
   region:UpdateTick()
 
   Private.ApplyFrameLevel(region)
@@ -1224,27 +1294,46 @@ Private.frames["Frame Tick Frame"] = frameForFrameTick
 Private.FrameTick = Private.CreateSubscribableObject()
 local TEXT_TICK = 1 / 30
 local nextTextTick = 0
+-- (dev.102) the throttled ticks are known by function, so a region can tell
+-- whether anything of it needs the frame between text ticks (TextOnlyTick)
+Private.throttledTicks = setmetatable({}, {__mode = "k"})
 function Private.ThrottledTextTick(func)
-  return function(...)
+  local tick = function(...)
     if Private.FrameTick.textDue then return func(...) end
   end
+  Private.throttledTicks[tick] = true
+  return tick
+end
+local function Dispatch()
+  Private.FrameTick:Notify("Tick")
+  -- ForeverAuras 1.2.1: the text-only regions, on text frames only
+  if Private.FrameTick.textDue then Private.FrameTick:Notify("TextTick") end
 end
 Private.FrameTick.OnUpdateHandler = function()
   Private.StartProfileSystem("frame tick")
   local now = GetTime()
   Private.FrameTick.textDue = now >= nextTextTick
   if Private.FrameTick.textDue then nextTextTick = now + TEXT_TICK end
-  Private.FrameTick:Notify("Tick")
+  -- (dev.109) queue changes wait for the pass (UpdateTick); an error in a tick still ends the pass, with
+  -- the waiting changes applied, before it is reported, so the dispatcher never stays in its waiting state
+  Private.FrameTick.dispatching = true
+  local ok, err = pcall(Dispatch)
+  Private.FrameTick.dispatching = nil
+  Private.FlushPendingTicks()
   Private.StopProfileSystem("frame tick")
+  if not ok then error(err, 0) end
 end
 
-Private.FrameTick:SetOnSubscriptionStatusChanged("Tick", function()
-  if Private.FrameTick:HasSubscribers("Tick") then
+-- ForeverAuras 1.2.1: the OnUpdate runs while either queue has a region
+local function UpdateFrameTickScript()
+  if Private.FrameTick:HasSubscribers("Tick") or Private.FrameTick:HasSubscribers("TextTick") then
     frameForFrameTick:SetScript("OnUpdate", Private.FrameTick.OnUpdateHandler);
   else
     frameForFrameTick:SetScript("OnUpdate", nil)
   end
-end)
+end
+Private.FrameTick:SetOnSubscriptionStatusChanged("Tick", UpdateFrameTickScript)
+Private.FrameTick:SetOnSubscriptionStatusChanged("TextTick", UpdateFrameTickScript)
 
 function Private.regionPrototype.AddSetDurationInfo(region, uid)
   if (region.UpdateValue and region.UpdateTime) then

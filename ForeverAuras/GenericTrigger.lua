@@ -2610,7 +2610,7 @@ do
       local checked = 0
       while pending[index] do
         local id = pending[index]
-        if self.data[id] then self:CheckSpellCooldown(id, runeDuration) end
+        if self.data[id] then Private.HitchCount("cooldown full-check spell"); self:CheckSpellCooldown(id, runeDuration) end
         index = index + 1
         checked = checked + 1
         if pending[index] and ((deadline and debugprofilestop() > deadline) or (maxSpells and checked >= maxSpells)) then
@@ -2635,7 +2635,8 @@ do
         local gcdGuard = false
         if ready == true then
           local onGCD, since = Private.GetSpellCooldownGCDFlag(effectiveSpellId)
-          local info = onGCD == true and since and now - since < SECRET_MIN_COOLDOWN and C_Spell.GetSpellCooldown(effectiveSpellId)
+          -- ForeverAuras (dev.104): this frame's cached read of the spell, not a second client query
+          local info = onGCD == true and since and now - since < SECRET_MIN_COOLDOWN and Private.GetCachedSpellCooldownInfo(effectiveSpellId)
           if info and info.isActive == true then ready = false; gcdGuard = true end
         end
         for _, handler in ipairs(self.cdHandlers) do
@@ -3060,7 +3061,13 @@ do
         SpellDetails.quietSecretCheck = nil
       elseif(event == "SPELLS_CHANGED") then
         SpellDetails:CheckSpellKnown()
-        Private.CheckCooldownReady()
+        -- ForeverAuras (dev.107, Astra's dev.105 hitch candidate): share the queued cooldown pass while
+        -- keeping spell remapping immediate (the event ran a full sweep here AND the queued one: twice
+        -- the visits in the frame of a spell change).
+        mark_ACTIONBAR_UPDATE_COOLDOWN = true
+        markQuiet = false
+        -- A partial snapshot predates the changed effective-spell mappings.
+        SpellDetails.pendingIds = nil
       elseif(event == "UNIT_SPELLCAST_SENT") then
         local unit, guid, castGUID, name = ...;
         if(unit == "player") then
@@ -3680,6 +3687,7 @@ do
     local runeDuration = Private.CheckRuneCooldown();
     if spell then
       if SpellDetails.data[spell] then
+        Private.HitchCount("cooldown single-check spell")   -- (dev.104) the hitch capture's counters
         SpellDetails:CheckSpellCooldown(spell, runeDuration)
       end
     else

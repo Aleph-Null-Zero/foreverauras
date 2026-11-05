@@ -9,6 +9,204 @@ local SharedMedia = LibStub("LibSharedMedia-3.0")
 local Display = {}
 Private.BlizzardAuraDisplay = Display
 local pending = setmetatable({}, {__mode = "k"})
+-- ForeverAuras (cell chain, dev.49 review): the generation of a display's
+-- settings requests (pending[region] writes made for a NEWER intent: a
+-- Modify under restrictions, a repair, a handoff), so a build that finishes
+-- later (a reserve completed in the background, a held probe) acknowledges
+-- only the request it made and leaves a newer one for the paced apply (the
+-- saved table may be the same one, so identity alone cannot tell them apart).
+-- Marked by MarkRequest at the request sites; read as a stamp.
+local requestStamp = setmetatable({}, {__mode = "k"})
+-- ForeverAuras (dev.72): frames a chained display's request has waited in
+-- the restricted drain for the members after it (ChainOrderWaits); scoped
+-- to the request: a new request starts the count afresh.
+local chainOrderWaits = setmetatable({}, {__mode = "k"})
+local function MarkRequest(region)
+  requestStamp[region] = (requestStamp[region] or 0) + 1
+  chainOrderWaits[region] = nil
+  return requestStamp[region]
+end
+-- ForeverAuras: the paced drain of `pending` (defined below; ApplyDisplay queues to it).
+local draining, drainingNow, DrainPending = false, false, nil
+local drainCursor = 0   -- ForeverAuras (dev.74): where the paced drain's walk of the queue resumes (DrainPending)
+-- ForeverAuras (combat-reload probe): displays whose first build under
+-- restrictions failed; built again, as new, when the restrictions end (the
+-- restriction-end handler moves them to pending). Not tried again before.
+local retryAfterRestrictions = setmetatable({}, {__mode = "k"})
+-- ForeverAuras (dev.70): chained displays built under aura restrictions as
+-- their ordinary (one-spot) construction, to be built again as chained when
+-- the restrictions end (RestrictionEndHandoff). Separate from the set-aside
+-- builds above: these displays are active and healthy meanwhile.
+local chainDeferredRetry = setmetatable({}, {__mode = "k"})
+-- Whether a build of this display is queued (SecretAuraFlow.lua reads it to tell a live member from an unloaded one).
+function Display.IsBuildPending(region) return pending[region] ~= nil end
+-- Every Modern display builds this way under restrictions (1.2.0; developed
+-- as a probe on the FA Test displays).
+local function ProbeEligible(data)
+  return type(data) == "table"
+end
+-- ForeverAuras: the build reports of the 1.2.0 release candidates (timings,
+-- button counts and failures, printed to chat behind a saved flag) are
+-- retired for the release; the callers stay as the record of what each
+-- step learns. The old flag is cleared so it does nothing if still saved.
+-- ForeverAuras (dev.64): the reports print again behind a new saved flag,
+-- ForeverAurasSaved.rowCellsDebug ("/fa cells debug on|off"; read when a
+-- report is made, so no reload): Dan's combat reload of the row cells
+-- (dev.63) showed the chained members only after combat, and the stop's
+-- reason is in these reports. Printed under pcall: a report may carry a
+-- client error text.
+local function CombatBuildReport(msg)
+  if type(ForeverAurasSaved) == "table" and ForeverAurasSaved.rowCellsDebug then
+    pcall(print, "|cff88ccff" .. L["FA build:"] .. "|r " .. tostring(msg))
+  end
+end
+Display.BuildReport = CombatBuildReport   -- ForeverAuras (dev.80): the chain's refusals and measurement failures report through it too
+do
+  -- The saved variables arrive after this file runs: the retired flag is cleared at login.
+  local clearFlag = CreateFrame("Frame")
+  clearFlag:RegisterEvent("PLAYER_LOGIN")
+  clearFlag:SetScript("OnEvent", function(self)
+    self:UnregisterAllEvents()
+    if type(ForeverAurasSaved) == "table" then ForeverAurasSaved.debugCombatBuild = nil end
+  end)
+end
+-- The frames of a probe build are owned by a ledger, per region, from the
+-- moment each is allocated until it is cleaned: every aura container made
+-- for the region while the build runs (Display.CreateAuraContainer notes
+-- them), the unit glow container, the Missing clip, slot and stage
+-- (Display.NoteAllocation), whether or not the constructor that made them
+-- got as far as attaching them to the instance. Cleaning is tried at
+-- restriction end, on release and before a normal build, independently of
+-- whether the display is rebuilt; a frame the client has locked
+-- (Display.Locked) is kept for the next try, never taken for cleaned, and
+-- a rebuild waits while any is kept. The ledger is weak by region.
+local abandonedFrames = setmetatable({}, {__mode = "k"})
+-- Called by every allocation of a frame that belongs to an instance; a
+-- region being built by the probe (region.faProbeAllocations) keeps the list.
+function Display.NoteAllocation(region, frame)
+  -- ForeverAuras (dev.35 review): a probe build's list, or the attempt
+  -- ledger of an ordinary build's reserve instance (DrainInstanceQueues).
+  local list = region and (region.faProbeAllocations or region.faAttemptAllocations)
+  if list and frame then list[#list + 1] = frame end
+end
+local function RetainFrame(region, frame)
+  if not frame then return end
+  local ledger = abandonedFrames[region] or {}
+  abandonedFrames[region] = ledger
+  for _, held in ipairs(ledger) do if held == frame then return end end
+  ledger[#ledger + 1] = frame
+end
+local function RetainAllocations(region)
+  local list = region.faProbeAllocations
+  region.faProbeAllocations = nil
+  for _, frame in ipairs(list or {}) do RetainFrame(region, frame) end
+end
+-- Private duration bindings are not frames and survive container retirement.
+-- Keep refused disables on the same cleanup lifetime as abandoned frames.
+local abandonedGlowBindings = {}
+local function RetireInstanceGlowBindings(region, instance)
+  if not Display.DisableGlowBinding then return end
+  for _, record in ipairs(instance.buttons or {}) do
+    local owner = record.glowBinding
+    if owner and owner.binding then
+      -- Capture this owner, not the record's possibly replaced future owner.
+      local entry = {glowBinding = owner}
+      local ok = Display.DisableGlowBinding(entry)
+      local held = abandonedGlowBindings[region]
+      if not ok then
+        held = held or {}
+        abandonedGlowBindings[region] = held
+        held[owner] = entry
+        abandonedFrames[region] = abandonedFrames[region] or {}
+      elseif held then
+        held[owner] = nil
+        if not next(held) then abandonedGlowBindings[region] = nil end
+      end
+    end
+  end
+end
+-- ForeverAuras (dev.36 review): the frames an instance is known to own, as a
+-- set, so an attempt's allocation ledger can tell a frame a kept instance
+-- took over from one left unattached (FailReserveAttempt).
+local function InstanceFrames(instance, into)
+  into = into or {}
+  local function add(frame) if frame then into[frame] = true end end
+  add(instance.container); add(instance.flowShadow); add(instance.flowMeasure); add(instance.unitGlow and instance.unitGlow.container); add(instance.missingSlot)
+  local single = instance.single
+  if single then
+    add(single.stage)
+    local missing = single.missing
+    if missing then add(missing.container); add(missing.clip); add(missing.presence); add(missing.flowShadow) end
+  end
+  for _, entry in pairs(instance.flowRemainSlots or {}) do add(entry.holder) end
+  return into
+end
+-- ForeverAuras (dev.37 review): the ONE ledger-finalization rule for a
+-- reserve attempt's allocations (queue.ledger, filled by NoteAllocation):
+-- at every terminal or discard transition (failure, success, queue replaced
+-- by a new apply, stale/inactive disposal in the drain, editor flush,
+-- release), each frame allocated during the attempt that no surviving
+-- instance owns (InstanceFrames) is retained for cleaning; frames a kept
+-- instance owns are untouched. A pause for the frame budget keeps the
+-- ledger. Success is not proof of ownership: EnsureMissing allocates a
+-- presence sibling, catches its refusal and returns without attaching it.
+local function ReconcileLedger(region, queue)
+  local native = region and region.blizzardAuraDisplay
+  if region then region.faAttemptAllocations = nil end
+  local ledger = queue and queue.ledger
+  if not ledger then return end
+  queue.ledger = nil
+  local kept = {}
+  for _, instance in ipairs(native and native.instances or {}) do InstanceFrames(instance, kept) end
+  for _, frame in ipairs(ledger) do if not kept[frame] then RetainFrame(region, frame) end end
+end
+-- The frames an instance is known to own (the allocation list covers a
+-- build's own; an instance kept from an earlier build has none there).
+local function RetainInstanceFrames(region, instance)
+  RetireInstanceGlowBindings(region, instance)
+  RetainFrame(region, instance.container)
+  RetainFrame(region, instance.flowShadow)
+  RetainFrame(region, instance.flowMeasure)   -- ForeverAuras (dev.78): the end measurement's container
+  RetainFrame(region, instance.unitGlow and instance.unitGlow.container)
+  RetainFrame(region, instance.missingSlot)
+  local single = instance.single
+  if single then
+    RetainFrame(region, single.stage)
+    local missing = single.missing
+    if missing then
+      RetainFrame(region, missing.container)
+      RetainFrame(region, missing.clip)
+      RetainFrame(region, missing.presence)
+      RetainFrame(region, missing.flowShadow)
+    end
+  end
+end
+local function CleanFrame(frame)
+  if Display.Locked(frame) then return false end
+  return pcall(function()
+    if frame.SetEnabled then frame:SetEnabled(false) end
+    frame:Hide()
+    Display.RetireFrame(frame)
+  end)
+end
+-- Cleans what it can; returns true when nothing is left in the ledger.
+local function CleanAbandoned(region)
+  local list = abandonedFrames[region]
+  local bindings = abandonedGlowBindings[region]
+  if not list and not bindings then return true end
+  if bindings then
+    for owner, entry in pairs(bindings) do
+      if Display.DisableGlowBinding(entry) then bindings[owner] = nil end
+    end
+    if not next(bindings) then abandonedGlowBindings[region], bindings = nil, nil end
+  end
+  local kept = {}
+  for _, frame in ipairs(list or {}) do
+    if not CleanFrame(frame) then kept[#kept + 1] = frame end
+  end
+  abandonedFrames[region] = (#kept > 0 or bindings) and kept or nil
+  return #kept == 0 and bindings == nil
+end
 -- Containers locked in combat: hidden, or given their units, once it ends.
 local lockedHide = setmetatable({}, {__mode = "k"})
 local lockedUnits = setmetatable({}, {__mode = "k"})
@@ -211,19 +409,22 @@ function Display.GetSpellIDs(trigger, expandRanks)
         if expandRanks then
           for _, rankID in ipairs(Private.GetAuraSpellRanks(id) or {}) do Add(rankID) end
         end
+      elseif type(value) == "string" and value ~= "" and Private.SpellIDsByName then
+        -- ForeverAuras: an aura name typed into Name(s), as in Aura (Legacy):
+        -- every spell ID with that name (its ranks and variants share it).
+        for _, nameID in ipairs(Private.SpellIDsByName(value) or {}) do Add(nameID) end
       end
     end
-  end
-  if Display.UsesSpellIDs(trigger) then
-    for _, value in ipairs(trigger.auraspellids or {}) do Add(value) end
   end
   local list = Display.SpellList(trigger)
   if list then
     for _, value in ipairs(list.spellIDs) do Add(value) end
   end
-  -- Same name: every spell ID with the same name as a selected one
-  -- (hidden ranks and server variants missing from the rank data), from the
-  -- client's own spell data (Private.SameNameSpellIDs, SecretAuraRanks.lua).
+  -- Same name: every spell ID with the same name as a Spell ID(s) or Spell
+  -- List selection (hidden ranks and server variants missing from the rank
+  -- data), from the client's own spell data (Private.SameNameSpellIDs,
+  -- SecretAuraRanks.lua). Exact Spell ID(s) are exact, as in Aura (Legacy):
+  -- they are added after the expansion so no name is taken from them.
   if expandRanks and Display.UsesNames(trigger) and Private.SameNameSpellIDs then
     local selected = {}
     for index, id in ipairs(ids) do selected[index] = id end
@@ -231,13 +432,16 @@ function Display.GetSpellIDs(trigger, expandRanks)
       for _, same in ipairs(Private.SameNameSpellIDs(id) or {}) do Add(same) end
     end
   end
+  if Display.UsesSpellIDs(trigger) then
+    for _, value in ipairs(trigger.auraspellids or {}) do Add(value) end
+  end
   return ids
 end
 
--- Same-name matching always applies to selected spell IDs, as Aura (Legacy)
--- matches by name.
+-- Same-name matching applies to Spell ID(s) and Spell Lists, as Aura (Legacy)
+-- matches by name; Exact Spell ID(s) match only the IDs entered.
 function Display.UsesNames(trigger)
-  return type(trigger) == "table" and (Display.UsesSpellIDs(trigger) or Display.UsesRankSpellIDs(trigger))
+  return type(trigger) == "table" and (Display.UsesRankSpellIDs(trigger) or Display.UsesSpellList(trigger))
 end
 
 function Display.UsesExcludedSpellIDs(trigger)
@@ -271,10 +475,43 @@ end
 -- cooldown (borders, texts, glows, condition highlights). A Start animation
 -- only reaches the icon and cooldown Blizzard draws, so the holder fades in
 -- over the animation instead (BuildAuraAnimation).
+-- ForeverAuras: the frame a button's artwork is anchored to: its box
+-- (BuildButton), the same rectangle as the button unless a Grid member's own
+-- X/Y Offset moves it (SetBoxOffset); the button itself where there is no box
+-- (editor samples, SecretAuraPreview.lua).
+function Display.Box(native)
+  return native.box or native.button
+end
+
+-- ForeverAuras: moves a button's artwork by (x, y) inside the button, for a
+-- Grid member's own X/Y Offset: the client places the button in its cell and
+-- the artwork is drawn offset from it, so other members' cells do not move.
+-- Only on buttons built with a box; a locked box (made under aura
+-- restrictions) is left as it is. Returns true when the offset is in place
+-- (applied now, or already so), false when the client refused it, so the
+-- Grid's completion accounting sees a refused offset (dev.5 review).
+function Display.SetBoxOffset(native, x, y)
+  local box = native.box
+  if not box then return true end
+  x, y = tonumber(x) or 0, tonumber(y) or 0
+  if native.boxX == x and native.boxY == y then return true end
+  -- The memo is dropped before the anchors are touched and set only once
+  -- both points are in place: a refusal between the two leaves a box with
+  -- no anchors, which no earlier offset may be taken to describe (dev.6 review).
+  native.boxX, native.boxY = nil, nil
+  local ok = pcall(function()
+    box:ClearAllPoints()
+    box:SetPoint("TOPLEFT", native.button, "TOPLEFT", x, y)
+    box:SetPoint("BOTTOMRIGHT", native.button, "BOTTOMRIGHT", x, y)
+  end)
+  if ok then native.boxX, native.boxY = x, y end
+  return ok
+end
+
 function Display.ElementHolder(native)
   if not native.elements then
     native.elements = CreateFrame("Frame", nil, native.gateClip or native.button)
-    native.elements:SetAllPoints(native.button)
+    native.elements:SetAllPoints(Display.Box(native))
     native.elements:EnableMouse(false)
   end
   return native.elements
@@ -286,7 +523,7 @@ local function ElementFrame(native, key)
     -- Icons: every element lives in the Total Duration gate clip (SecretAuraSingle.lua).
     -- The icon's own frame hangs on the clip; the rest on the elements holder.
     local frame = CreateFrame("Frame", nil, key == "sharedBase" and (native.gateClip or native.button) or Display.ElementHolder(native))
-    frame:SetAllPoints(native.button)
+    frame:SetAllPoints(Display.Box(native))
     frame:EnableMouse(false)
     native.elementFrames[key] = frame
   end
@@ -528,7 +765,7 @@ function Display.Validate(data)
   if appearanceProblem then return appearanceProblem end
   local trigger = Display.GetTrigger(data, true)
   if Display.UsesSpellIDs(trigger) and #(trigger.auraspellids or {}) == 0 and not Display.UsesSpellList(trigger) then return L["Enter an exact spell ID, or untick Exact Spell IDs to show all matching auras."] end
-  if Display.UsesRankSpellIDs(trigger) and #(trigger.auraRankSpellIDs or {}) == 0 then return L["Enter a spell ID, or untick Spell ID(s) (All Ranks)."] end
+  if Display.UsesRankSpellIDs(trigger) and #(trigger.auraRankSpellIDs or {}) == 0 then return L["Enter an aura name or spell ID, or untick Name(s)."] end
   if Display.UsesExcludedSpellIDs(trigger) and #(trigger.excludedAuraSpellIDs or {}) == 0 then return L["Enter an ignored spell ID, or untick Ignored Exact Spell IDs."] end
   if not Display.units[trigger.unit] or (trigger.debuffType ~= "HELPFUL" and trigger.debuffType ~= "HARMFUL") then
     return L["Choose a supported unit and Buff or Debuff."]
@@ -539,13 +776,19 @@ function Display.Validate(data)
   if trigger.unit == "nameplate" and (not C_NamePlate or not C_NamePlate.GetNamePlateForUnit) then
     return L["This client does not expose nameplate frames."]
   end
-  for _, list in ipairs({trigger.auraspellids or {}, trigger.auraRankSpellIDs or {}, trigger.excludedAuraSpellIDs or {}}) do
+  for _, list in ipairs({trigger.auraspellids or {}, trigger.excludedAuraSpellIDs or {}}) do
     for _, value in ipairs(list) do
       local id = tonumber(value)
       if not id or id <= 0 or id == math.huge or id ~= math.floor(id) then
         return L["Each aura spell ID must be a positive whole number."]
       end
     end
+  end
+  -- ForeverAuras: Name(s) takes an aura name or a spell ID.
+  for _, value in ipairs(trigger.auraRankSpellIDs or {}) do
+    local id = tonumber(value)
+    if id and (id <= 0 or id == math.huge or id ~= math.floor(id)) then return L["Each aura spell ID must be a positive whole number."] end
+    if not id and (type(value) ~= "string" or value == "") then return L["Each aura spell ID must be a positive whole number."] end
   end
   for _, field in ipairs(Display.booleanFilters) do
     if trigger[field[1]] ~= nil and type(trigger[field[1]]) ~= "boolean" then return L["Invalid aura filter: %s"]:format(field[2]) end
@@ -739,7 +982,7 @@ local function SyncSounds(region)
     end
   end
   if not next(spellIDs) then
-    SoundWarning(data, L["Enable Spell ID(s) or Exact Spell ID(s) in Trigger and enter an ID that is not ignored to use aura sounds."])
+    SoundWarning(data, L["Enable Name(s) or Exact Spell ID(s) in the Trigger and enter a spell that is not ignored to use aura sounds."])
     return
   end
   local failure
@@ -917,8 +1160,276 @@ end
 -- the aura list was retried then, so a unit glow or list shadow locked at
 -- release time stayed enabled, bound to its unit and processed by the
 -- client for the rest of the session.
+-- ForeverAuras (dev.92, Dan's A icons; Astra's dev.90 review): EDITOR
+-- RETENTION. Opening the editor pauses every display (Private.Pause: the
+-- regions collapse, their OnHide quiets the containers) and closing it unloads
+-- them all and loads them again (Private.Resume: Release, then the load scan).
+-- Each of those disabled the live containers, and the client releases every
+-- aura's button of a disabled container and hands the buttons out again from
+-- a free list it walks in hash order - the cells of a chained member then
+-- show the same auras on other cells. Between Private.Pause and the end of
+-- Private.Resume a live container is RETAINED instead: kept enabled and
+-- bound, hidden by alpha, remembered here; when the editor is closed and the
+-- displays are loaded again, those loaded again take their container as it
+-- is (ApplyInstance keeps an unchanged configuration; RefreshUnits shows it
+-- again), and the retained containers of the displays NOT loaded again are
+-- quieted then, as a release would have. Restrictions take no part (a
+-- container under them is left to the ordinary path).
+local retainedInstances = {}   -- instance -> region, owned until the container is live again or quieted for good
+local editorRetaining = false
+-- (dev.95, Astra's dev.93 review 1) the region collapses with the pause, and
+-- the client answers a hidden ancestor with a full rebuild of the container
+-- (its own OnHide/OnShow) and drops its aura events while hidden: keeping it
+-- enabled under a hidden region keeps nothing. A retained container is moved
+-- under a shown holder of its own for the retention (alpha 0 hides it), and
+-- back under its parent when its display is live again (RefreshUnits).
+local retentionHolder
+-- Keep the physical stage and each accepted write, even when changing mode
+-- makes MissingStage return nil. A reused stage must not stay unbuffered.
+local function SetRetainedStages(instance, muted)
+  local stages = instance.mutedStages
+  if muted then
+    local stage = instance.single and instance.single.stage
+    if stage then
+      stages = stages or {}; instance.mutedStages = stages
+      stages[stage] = stages[stage] or {}
+    end
+  end
+  if not stages then return true end
+  local active = Display.MissingStage and Display.MissingStage(instance)
+  local accepted = true
+  for stage, state in pairs(stages) do
+    local ready = true
+    if not muted and stage ~= active then
+      -- The old stage is now unused. Hide it before restoring its buffer so
+      -- an empty, still-shown buffer cannot composite a black rectangle.
+      local ok, parent = pcall(instance.container.GetParent, instance.container)
+      if not ok or (issecretvalue and issecretvalue(parent)) or parent == stage then ready = false
+      else ready = pcall(stage.Hide, stage) end
+    end
+    local first, second = muted and "buffer" or "flatten", muted and "flatten" or "buffer"
+    local firstSetter = muted and stage.SetIsFrameBuffer or stage.SetFlattensRenderLayers
+    local secondSetter = muted and stage.SetFlattensRenderLayers or stage.SetIsFrameBuffer
+    local value = not muted
+    if ready and state[first] ~= value then
+      ready = pcall(firstSetter, stage, value)
+      if ready then state[first] = value end
+    end
+    if ready and state[second] ~= value then
+      ready = pcall(secondSetter, stage, value)
+      if ready then state[second] = value end
+    end
+    if ready and not muted then stages[stage] = nil
+    elseif not ready then accepted = false end
+  end
+  if next(stages) == nil then instance.mutedStages = nil end
+  return accepted
+end
+-- DISABLE-blend textures cannot rely on parent alpha to hide them. Block
+-- restyles before hiding/reparenting, including native records made later.
+local function MuteErasers(instance)
+  instance.eraserMuted, instance.eraserRestorePending = true, true
+  local accepted = true
+  for _, native in ipairs(instance.buttons or {}) do
+    if native.eraser and not pcall(native.eraser.Hide, native.eraser) then accepted = false end
+  end
+  if accepted then accepted = SetRetainedStages(instance, true) end
+  instance.eraserMuteFailed = not accepted or nil
+  return accepted
+end
+local function RestoreErasers(instance, data)
+  if not instance.eraserRestorePending then return true end
+  if not data or not Display.StyleEraser then return false end
+  -- Never re-enable a destructive eraser before its framebuffer exists and
+  -- the live container has actually returned to that framebuffer.
+  local ok, ready = pcall(function()
+    local trigger = Display.GetTrigger(data)
+    if Display.ErasedMissing and Display.ErasedMissing(data, trigger, Display.UnitPlacedMissing(data, trigger)) then
+      local stage = Display.MissingStage(instance)
+      local parent = instance.container:GetParent()
+      if issecretvalue and issecretvalue(parent) then return false end
+      return stage ~= nil and parent == stage
+    end
+    return true
+  end)
+  if not ok or (issecretvalue and issecretvalue(ready)) or not ready then return false end
+  if not SetRetainedStages(instance, false) then return false end
+  instance.eraserMuted = nil
+  local accepted = true
+  for _, native in ipairs(instance.buttons or {}) do
+    if native.eraser and not pcall(Display.StyleEraser, native, data) then accepted = false end
+  end
+  instance.eraserRestorePending = not accepted or nil
+  if accepted then instance.eraserMuteFailed = nil end
+  return accepted
+end
+local function RetainInstance(instance, region)
+  local container = instance.container
+  if not (container and container.faEnabled == true and instance.applied and not Locked(container)) then return false end
+  if not MuteErasers(instance) then
+    if region then lockedUnits[region] = true end
+    return false
+  end
+  if not pcall(container.SetAlpha, container, 0) then return false end
+  if not retentionHolder then
+    retentionHolder = CreateFrame("Frame", nil, UIParent)
+    retentionHolder:SetSize(1, 1)
+    retentionHolder:SetPoint("TOPLEFT", UIParent, "TOPLEFT")
+    retentionHolder:Show()
+  end
+  local okP = pcall(container.SetParent, container, retentionHolder)
+  if not okP then pcall(container.SetAlpha, container, instance.baseAlpha or 1); return false end
+  instance.appliedStrata, instance.appliedLevel = nil, nil
+  instance.retainedMuted = true
+  retainedInstances[instance] = region or true
+  return true
+end
+-- a retained container whose display is live again: back under its parent, as it is (no enable cycle)
+local function RestoreRetained(instance, parent)
+  local container = instance.container
+  if container:GetParent() ~= parent then
+    if not pcall(container.SetParent, container, parent) then return false end
+    instance.appliedStrata, instance.appliedLevel = nil, nil
+  end
+  retainedInstances[instance] = nil
+  instance.retainedMuted = nil
+  instance.visible = true
+  return true
+end
+-- a retained container whose display did not come back: quieted for good, the ownership kept until the
+-- disable AND the hide went through (Astra's dev.93 review 2); a locked one is quieted when restrictions end
+local function QuietRetained(instance)
+  local container = instance.container
+  local region = retainedInstances[instance]
+  if Locked(container) then
+    if type(region) == "table" then lockedHide[region] = true end
+    return false
+  end
+  local ok = pcall(function() container:SetEnabled(false); container:Hide() end)
+  if not ok then
+    if type(region) == "table" then lockedHide[region] = true end
+    return false
+  end
+  instance.visible = false
+  instance.retainedMuted = nil
+  retainedInstances[instance] = nil
+  return true
+end
+-- (dev.95, Dan's dev.94 lines) the resume LOADS the displays again after it
+-- returns (the paced drain, the next frames), so the retention cannot end
+-- when Private.Resume ends: the cleanup waits for each retained display to
+-- be loaded again (its binding pass restores the container) or to be left
+-- unloaded, and quiets only the latter; a bounded number of looks, then
+-- whatever is still retained and not live is quieted.
+-- (Astra's dev.94 results) the retained flag alone says only "not yet
+-- restored by a binding pass", never "not loaded": the verdict comes from the
+-- load lifecycle (Private.loaded, a pending or retried build, the live
+-- construction's own instance list), and each editor cycle is a generation of
+-- its own, so an older cycle's cleanup never touches a newly retained one.
+-- a display the load lifecycle brings back: the load scan loaded it (the core loaded map), or its build is
+-- pending or retried
+local function Returning(region)
+  if type(region) ~= "table" then return false end
+  if pending[region] ~= nil or retryAfterRestrictions[region] ~= nil then return true end
+  local native = region.blizzardAuraDisplay
+  local id = native and native.data and native.data.id
+  return id ~= nil and Private.loaded ~= nil and Private.loaded[id] == true
+end
+local reconcileLooks = 0
+local retentionGeneration = 0
+local function ReconcileRetained(generation)
+  if editorRetaining or generation ~= retentionGeneration then return end
+  reconcileLooks = reconcileLooks + 1
+  local again = false
+  for instance, region in pairs(retainedInstances) do
+    if not instance.retainedMuted then
+      retainedInstances[instance] = nil
+    else
+      local native = type(region) == "table" and region.blizzardAuraDisplay
+      -- loaded again (Private.loaded says so as soon as the load scan decided, before the paced build runs)
+      local loading = Returning(region)
+      -- the live construction: this instance still its own (it restores itself in its next binding pass),
+      -- or superseded by a fresh one (quieted now, loaded or not: the fresh construction owns the display)
+      local current, built = false, native and native.active and native.instances ~= nil
+      if built then
+        for _, live in ipairs(native.instances) do if live == instance then current = true; break end end
+      end
+      local superseded = built and not current
+      if superseded then
+        QuietRetained(instance)
+      elseif loading or (built and current) then
+        -- (1.2.0, Astra's audit 3) a display still loading or still owning this instance is never quieted
+        -- by the bound: the looks stop, the ownership stays, and its next binding pass restores it
+        if reconcileLooks < 30 then again = true end
+      else
+        QuietRetained(instance)
+      end
+    end
+  end
+  if again then C_Timer.After(0.1, function() ReconcileRetained(generation) end) end
+end
+-- (dev.97, Dan's dev.96 screenshots) the client rebuilds a container's aura
+-- assignments once it was hidden, even through an ancestor: a region hidden
+-- by the pause hides its container before the OnHide hook can move it, and
+-- the move under the shown holder then shows it again - a full rebuild, the
+-- auras handed out in another order. The live containers are moved under
+-- the holder BEFORE the pause hides anything (the region still shown: no
+-- visibility change for the container), and moved back only under a region
+-- that is visible again (RestoreRetained's caller, RefreshUnits).
+local function RetainLiveInstances()
+  if Restricted() or not Private.regions then return end
+  for _, entry in pairs(Private.regions) do
+    local region = entry and entry.region
+    local native = region and region.blizzardAuraDisplay
+    if native and native.active and native.instances and region:IsVisible() then
+      for _, instance in ipairs(native.instances) do
+        if not instance.retainedMuted and instance.visible ~= false and not Locked(instance.container) then
+          RetainInstance(instance, region)
+        end
+      end
+    end
+  end
+end
+function Display.EditorRetention(on)
+  if CombatBuildReport then CombatBuildReport(("editor retention %s"):format(on and "on" or "off")) end
+  retentionGeneration = retentionGeneration + 1   -- an older cycle's pending cleanup stops here
+  if on then editorRetaining = true; RetainLiveInstances(); return end
+  editorRetaining = false
+  reconcileLooks = 0
+  local generation = retentionGeneration
+  C_Timer.After(0, function() ReconcileRetained(generation) end)
+end
+-- the restriction-end handler and a later quiet revisit what could not be quieted
+function Display.QuietRetainedLater()
+  for instance, region in pairs(retainedInstances) do
+    if not editorRetaining and instance.retainedMuted then
+      -- (1.2.0, Astra's audit 3) the same eligibility as the reconciliation: a loading display, or a live
+      -- construction that still owns this instance, keeps its container
+      local native = type(region) == "table" and region.blizzardAuraDisplay
+      local current = false
+      if native and native.active and native.instances then
+        for _, live in ipairs(native.instances) do if live == instance then current = true; break end end
+      end
+      -- A live replacement supersedes this retained instance even while the display is loaded.
+      local superseded = native and native.active and native.instances ~= nil and not current
+      if superseded or (not current and not Returning(region)) then QuietRetained(instance) end
+    end
+  end
+end
+function Display.EditorRetaining() return editorRetaining end
+
 local function QuietInstance(region, instance)
   local locked = false
+  -- ForeverAuras 1.2.1 (dev.115): a quieted record's own glow binding (SecretAuraSingle.lua, the timed
+  -- chain's glow) stops with it; a refused disable keeps the owner for the next attempt
+  if Display.DisableGlowBinding then
+    for _, native in ipairs(instance.buttons or {}) do
+      if native.glowBinding then
+        if not Display.DisableGlowBinding(native, true) then locked = true end
+        if native.glowBinding.resumePending then instance.glowResumePending = true end
+      end
+    end
+  end
   -- ForeverAuras: a quieted instance is not visible, whatever the client
   -- lets us do to its frames right now: the per-unit rows of a Modern Aura
   -- Group grouped by frame (SecretAuraFlow.lua, RelinkFlowUnits) chain only
@@ -927,18 +1438,37 @@ local function QuietInstance(region, instance)
   instance.visible = false
   if Locked(instance.container) then
     locked = true
+  elseif (editorRetaining or (instance.retainedMuted and Returning(region))) and not Restricted()
+    and (instance.retainedMuted or RetainInstance(instance, region)) then
+    -- (dev.92) retained through the editor: enabled and bound, hidden by alpha, under the shown holder
+    -- (dev.96, Dan's dev.95 lines) and still retained when the region hides AFTER the retention ended for a
+    -- display the loads bring back (WeakAuras.Add collapses the region before its rebuild): its binding
+    -- pass restores the container; disabling here was the reset
   else
-    instance.container:SetEnabled(false)
-    instance.container:Hide()
+    -- (dev.94) said with "/fa cells debug on" for a chained member: the quiet that disables, and why it was not retained
+    if CombatBuildReport and instance.chained then
+      CombatBuildReport(("%s: list quieted (retaining %s, restricted %s, applied %s, enabled %s, retained %s)"):format(tostring(instance.data and instance.data.id),
+        tostring(editorRetaining), tostring(Restricted()), tostring(instance.applied), tostring(instance.container.faEnabled), tostring(instance.retainedMuted)))
+    end
+    if instance.retainedMuted then
+      -- (1.2.0, Astra's audit 2) a retained container quieted here goes through the protected cleanup:
+      -- the ownership is kept until its disable AND hide went through, a refusal is revisited later
+      if not QuietRetained(instance) then locked = true end
+    else
+      instance.container:SetEnabled(false)
+      instance.container:Hide()
+    end
   end
-  local shadow = instance.flowShadow
-  if shadow then
-    if Locked(shadow) then
-      locked = true
-    elseif shadow.faEnabled or shadow:IsShown() then
-      shadow.faEnabled = false
-      shadow:SetEnabled(false)
-      shadow:Hide()
+  for _, key in ipairs({"flowShadow", "flowMeasure"}) do   -- ForeverAuras (dev.78): the end measurement's container with the shadow's
+    local shadow = instance[key]
+    if shadow then
+      if Locked(shadow) then
+        locked = true
+      elseif shadow.faEnabled or shadow:IsShown() then
+        shadow.faEnabled = false
+        shadow:SetEnabled(false)
+        shadow:Hide()
+      end
     end
   end
   local glow = instance.unitGlow and instance.unitGlow.container
@@ -981,10 +1511,60 @@ function Display.Release(region)
   Display.HideUnitGlows(region)
   Display.Restore(region)
   pending[region] = nil
+  -- ForeverAuras (combat-reload probe): an unloaded display's retry is
+  -- cancelled; frames of a stopped build are cleaned when possible.
+  retryAfterRestrictions[region] = nil
+  chainDeferredRetry[region] = nil
+  chainOrderWaits[region] = nil
+  -- ForeverAuras (cell chain, dev.41 review): the cancelled job's latch goes
+  -- with it (a later request may queue again); the epoch's count and a stop
+  -- stay, so an unload does not hand out new attempts.
+  do
+    local record = region.blizzardAuraDisplay and region.blizzardAuraDisplay.reapplyRequests
+    if record then record.pending, record.wanted = nil, nil end
+    -- A commit still held by a batch is dropped with the display (an
+    -- activation of the same prepared construction asks again, Activate;
+    -- the next apply asks for its own).
+    local native = region.blizzardAuraDisplay
+    if native then native.chainCommitPending = nil end
+    -- ForeverAuras (cell chain, dev.47 review): a probe build the chain pass
+    -- has not accepted yet (its finishing held by a batch) is released as a
+    -- stopped build is: its instances retired with its allocations (below),
+    -- its accounting closed, nothing of it kept for a cheap reactivation (the
+    -- display is made new when it is shown again). No retry: it is unloaded.
+    if native and native.probeHeld then
+      native.probeHeld = nil
+      for _, instance in ipairs(native.instances) do
+        instance.finishing, instance.finishFailed = nil, nil
+        local missing = instance.single and instance.single.missing
+        if missing then missing.active = false end
+        RetainInstanceFrames(region, instance)
+        if Display.CancelPendingListAlpha then Display.CancelPendingListAlpha(instance) end
+      end
+      native.instances = {}
+      native.probeBuild = nil
+    end
+  end
+  RetainAllocations(region)
+  CleanAbandoned(region)
+  -- ForeverAuras (dev.68/69): an unloaded display's spine is let go ONLY
+  -- when its construction is gone with it (a held or stopped probe build:
+  -- no instances left). A healthy display keeps its instances for a cheap
+  -- reactivation (Activate), and keeps its prepared spine with them (Astra's
+  -- dev.68 review: a released spine under a kept instance was reactivated
+  -- as complete with nothing anchored).
+  do
+    local native = region.blizzardAuraDisplay
+    if native and Display.ReleaseChainSpine and #native.instances == 0 then Display.ReleaseChainSpine(native) end
+  end
   if Display.CancelEditorApply then Display.CancelEditorApply(region) end
   local native = region.blizzardAuraDisplay
   if native then
     native.active = false
+    -- ForeverAuras (dev.36/37 reviews): a reserve attempt released mid-way
+    -- leaves its unattached allocations to cleaning (ReconcileLedger). The
+    -- guard lets the review harnesses run this function as a slice.
+    if ReconcileLedger then ReconcileLedger(region, native.instanceQueue) end
     native.instanceQueue = nil
     for _, instance in ipairs(native.instances) do
       QuietInstance(region, instance)
@@ -993,6 +1573,10 @@ function Display.Release(region)
     -- A released display draws nothing, so no Missing or Remaining Time part can be failing.
     Private.AuraWarnings.UpdateWarning(native.data.uid, "blizzard_aura_single", nil)
     Private.AuraWarnings.UpdateWarning(native.data.uid, "blizzard_aura_dynamicgroup", nil)
+    -- ForeverAuras (cell chain): nor a row cell (PublishChainWarnings keys).
+    for _, key in ipairs({"blizzard_aura_chain_why", "blizzard_aura_chain", "blizzard_aura_chain_more"}) do
+      Private.AuraWarnings.UpdateWarning(native.data.uid, key, nil)
+    end
     activeRegions[region] = nil
     SyncSounds(region)
     -- The next display in a Modern Aura Group starts where this one did.
@@ -1013,7 +1597,8 @@ local function StyleText(text, native, settings, key, size, anchor, x, y)
   local point = settings[key .. "Anchor"] or anchor
   -- Preserve the original same-point anchors until a self point is chosen.
   local selfPoint = settings[key .. "SelfPoint"]
-  local target = button
+  -- Texts hang from the visual box (Display.Box): the button, or a Grid member's offset box.
+  local target = Display.Box(native)
   local area = point:sub(1, 6)
   if area == "INNER_" or area == "OUTER_" then
     target = area == "INNER_" and native.inner or native.outer
@@ -1101,10 +1686,10 @@ local function StyleGlow(native, data, unitGlow)
   local duration = math.max(0.1, settings.glowDuration or 1)
   entry.texture:ClearAllPoints()
   if unitGlow then
-    entry.texture:SetPoint("TOPLEFT", native.button, "TOPLEFT", (settings.glowX or 0) - settings.padding, (settings.glowY or 0) + settings.padding)
-    entry.texture:SetPoint("BOTTOMRIGHT", native.button, "BOTTOMRIGHT", (settings.glowX or 0) + settings.padding, (settings.glowY or 0) - settings.padding)
+    entry.texture:SetPoint("TOPLEFT", Display.Box(native), "TOPLEFT", (settings.glowX or 0) - settings.padding, (settings.glowY or 0) + settings.padding)
+    entry.texture:SetPoint("BOTTOMRIGHT", Display.Box(native), "BOTTOMRIGHT", (settings.glowX or 0) + settings.padding, (settings.glowY or 0) - settings.padding)
   else
-    entry.texture:SetPoint("CENTER", native.glowAnchor or native.button, "CENTER", settings.glowX or 0, settings.glowY or 0)
+    entry.texture:SetPoint("CENTER", native.glowAnchor or Display.Box(native), "CENTER", settings.glowX or 0, settings.glowY or 0)
     entry.texture:SetSize(math.max(4, native.glowWidth or data.width or data.fixedWidth or 200) * 1.4 * scale, math.max(4, native.glowHeight or data.height or data.fontSize or 18) * 1.4 * scale)
   end
   entry.texture:SetVertexColor(unpack(settings.useGlowColor ~= false and settings.glowColor or {1, 0.82, 0, 1}))
@@ -1288,7 +1873,7 @@ local function Style(native, data, region)
   Private.StopProfileSystem("aura (modern) - style: appearance")
   Private.StartProfileSystem("aura (modern) - style: conditions")
   Display.ApplyPresentConditions(native, data, region and region.secretAuraGates)
-  Display.ApplyConditionAppearance(native, region, data)
+  Display.ApplyConditionAppearance(native, region, data, true)
   Private.StopProfileSystem("aura (modern) - style: conditions")
   Private.StartProfileSystem("aura (modern) - style: eraser")
   if Display.StyleEraser then Display.StyleEraser(native, data) end
@@ -1352,8 +1937,12 @@ local function RefreshPreview(region)
   else
     -- The editor's boxes go back to their own places.
     Display.RestorePreviewRegion(region)
-    Display.RestoreGroupPreview(Display.FlowGroup(native.data))
+    -- ForeverAuras: the group's box follows the members still previewed;
+    -- arranged again rather than restored, which threw it away whenever one
+    -- member left the preview while the editor stayed open.
     Display.HidePreview(region)
+    local flowGroup = Display.FlowGroup(native.data)
+    if flowGroup and WeakAuras.IsOptionsOpen() then Display.ArrangeFlowPreview(flowGroup) else Display.RestoreGroupPreview(flowGroup) end
   end
   Suppress(region)
   if IsPreview() then UpdatePreviewNotice(region) end
@@ -1372,6 +1961,7 @@ local function ConfigureUnitGlow(instance, region, data)
   local trigger = Display.GetTrigger(data)
   if not native then
     native = {container = CreateFrame("AuraContainer", nil, region, "CustomAuraContainerTemplate")}
+    Display.NoteAllocation(region, native.container)
     instance.unitGlow = native
     native.container:SetEnabled(false)
     ConfigureProcessing(native.container, trigger)
@@ -1460,6 +2050,22 @@ local function AnchorWrappedList(container, region, data)
   container:SetPoint(point, region, point)
 end
 
+-- ForeverAuras: where a single-aura display's one slot button goes: the
+-- region's corner for the growth direction, or its centre. Used by Layout,
+-- and by Create for a slot button made under aura restrictions, which the
+-- client locks the moment it is made (seen in game: after a reload in
+-- combat the button, placed only here, had no position at all, so the
+-- countdown and the other texts on it never showed).
+local function PlaceSlotButton(button, region, data, width, height)
+  local direction = Display.Growth(data)
+  local anchor = direction == "LEFT" and "TOPRIGHT" or direction == "UP" and "BOTTOMLEFT" or "TOPLEFT"
+  local centered = direction == "CENTER_HORIZONTAL" or direction == "CENTER_VERTICAL"
+  button:SetSize(width, height)
+  button:ClearAllPoints()
+  if centered then button:SetPoint("CENTER", region, "CENTER")
+  else button:SetPoint(anchor, Display.ContentAnchor(region), anchor) end
+end
+
 local function Layout(native, region, data)
   local width, height = Display.Dimensions(data)
   local settings = data.blizzardAuraDisplay
@@ -1491,14 +2097,17 @@ local function Layout(native, region, data)
     -- stayed where the display used to be after the display moved.
     for _, entry in ipairs(native.buttons) do
       local button = entry.button
-      if not pcall(function()
-        button:SetSize(width, height)
-        button:ClearAllPoints()
-        if centered then button:SetPoint("CENTER", region, "CENTER")
-        else button:SetPoint(anchor, Display.ContentAnchor(region), anchor) end
-      end) then
-        -- Access denied (restricted): placed again by the next Apply.
-        native.slotLayoutPending = true
+      -- The placement Create gave the button, still current: nothing to write.
+      local placed = button.faSlotPlaced
+      button.faSlotPlaced = nil
+      if placed and placed.region == region and placed.data == data and placed.width == width and placed.height == height
+        and placed.growth == Display.Growth(data) then
+        -- kept as placed
+      elseif not pcall(PlaceSlotButton, button, region, data, width, height) then
+        -- Access denied (a button made under restrictions keeps the place
+        -- Create gave it): the display is applied again when the
+        -- restrictions end (SecretAuraSingle.lua, TakePendingRelayout).
+        if Display.NotePendingRelayout then Display.NotePendingRelayout(region) end
       end
     end
     return
@@ -1530,10 +2139,26 @@ local function Layout(native, region, data)
   container:SetAuraGroupMaxFrameCount("Auras", Display.MaxAuras(data))
 end
 
-local function BuildButton(container, button)
+local function BuildButton(container, button, withBox)
   local native = {container = container}
   native.button = button
   button:EnableMouse(false)
+  -- ForeverAuras: Grid buttons (withBox) get a box every piece of artwork
+  -- hangs from: the button's rectangle, unless the member's own X/Y Offset
+  -- moves it (Display.SetBoxOffset), so the artwork of a button the client
+  -- places in a grid cell can sit beside its cell. Other buttons have no box
+  -- and their artwork hangs from the button itself (Display.Box falls back to
+  -- it): no extra frame per button outside a Grid. Made here, inside the
+  -- client's initializeFrame, never later under restrictions.
+  if withBox then
+    -- ForeverAuras (dev.77): the box opts out of untrusted layout scripts
+    -- like the clip and the chain's frames (a Centered row hangs it, through
+    -- the chain, from the shadows' end: a secret-sized container)
+    native.box = CreateFrame("Frame", nil, button, "DisableUntrustedLayoutScriptsTemplate")
+    native.box:SetAllPoints(button)
+    native.box:EnableMouse(false)
+  end
+  local box = native.box or button
   -- Whether the button's box is rounded to whole pixels is decided per
   -- display in StyleAppearance: only inside a Modern Aura Group, whose row is
   -- laid out on the pixel grid. Elsewhere a rounded box (34x32 units at 1.2
@@ -1544,15 +2169,15 @@ local function BuildButton(container, button)
   -- clip while no gate is used.
   native.gateClip = CreateFrame("Frame", nil, button, "DisableUntrustedLayoutScriptsTemplate")
   Display.ClipChildren(native.gateClip)
-  native.gateClip:SetAllPoints(button)
+  native.gateClip:SetAllPoints(box)
   native.gateText = button:CreateFontString(nil, "BACKGROUND")
   for _, area in ipairs({"inner", "outer"}) do
     native[area] = CreateFrame("Frame", nil, button)
-    native[area]:SetPoint("CENTER", button, "CENTER")
+    native[area]:SetPoint("CENTER", box, "CENTER")
     native[area]:EnableMouse(false)
   end
   native.border = (native.gateClip or button):CreateTexture(nil, "BACKGROUND")
-  native.border:SetAllPoints(button)
+  native.border:SetAllPoints(box)
   -- Eraser for the Missing look (SecretAuraSingle.lua, Display.StyleEraser):
   -- drawn with blending disabled inside a frame buffer, it overwrites what is
   -- beneath the button with nothing while the button is shown. On the button
@@ -1571,10 +2196,23 @@ local function BuildButton(container, button)
   native.cooldown:SetAllPoints(native.icon)
   native.cooldown:SetDrawBling(false)
   native.cooldown:SetHideCountdownNumbers(true)
+  local numbers = native.cooldown:GetCountdownFontString()
+  if numbers then
+    -- Keep the digits independent of the swipe's frame level. The font string
+    -- changes parent before Blizzard adopts the cooldown; it stays on this
+    -- holder for the button's lifetime.
+    local holder = CreateFrame("Frame", nil, native.gateClip)
+    native.countdownTextHolder = holder
+    holder:SetAllPoints(box)
+    holder:EnableMouse(false)
+    holder:Hide()
+    numbers:SetParent(holder)
+    numbers:SetDrawLayer("OVERLAY", 0)
+  end
   button:SetDurationCooldown(native.cooldown)
   local overlay = CreateFrame("Frame", nil, Display.ElementHolder(native))
   native.overlay = overlay
-  overlay:SetAllPoints(button)
+  overlay:SetAllPoints(box)
   overlay:SetFrameLevel(native.cooldown:GetFrameLevel() + 1)
   return native
 end
@@ -1591,32 +2229,245 @@ local function WantsSlot(data, inFlow, container)
 end
 Display.WantsSlot = WantsSlot
 
+-- ForeverAuras (dev.34 review, reserve fix): the container is allocated
+-- first and the rest of the construction runs guarded, so a container whose
+-- setup fails part way is owned (retained for cleaning, disabled, hidden)
+-- before the error reaches the caller: nothing allocated is left untracked.
+local CreateBody
 local function Create(region, data)
   local display = {buttons = {}, data = data}
   local container, inFlow = Display.CreateAuraContainer(region, data)
   display.container = container
+  local ok, err = pcall(CreateBody, display, container, inFlow, region, data)
+  if not ok then
+    pcall(container.SetEnabled, container, false)
+    pcall(container.Hide, container)
+    RetainFrame(region, container)
+    error(err, 0)
+  end
+  return display
+end
+function CreateBody(display, container, inFlow, region, data)
+  -- ForeverAuras (dev.31 diagnostics): the build history notes the container.
+  if Display.NoteCarrierEvent then Display.NoteCarrierEvent(region, "container", inFlow and "flow" or "plain") end
   -- Made for a Modern Aura Group (SecretAuraFlow.lua); Apply replaces it on a change.
   display.flowContainer = inFlow
   container:SetEnabled(false)
   local trigger = Display.GetTrigger(data)
   ConfigureProcessing(container, trigger)
   container:SetPoint("TOPLEFT", region, "TOPLEFT")
+  -- ForeverAuras (combat-reload probe): a display first built while
+  -- restrictions are on (a reload in combat) styles each button here, in
+  -- the client's initializeFrame call, which runs before the client
+  -- restricts the button (Blizzard_AuraContainerFrameProviders.lua);
+  -- styled later, in ApplyInstance, the button was already forbidden (seen
+  -- in game, 1.1.0-dev.6). Failures are counted, not ignored, so an
+  -- incomplete build is not taken for a finished one (ApplyInstance).
+  -- Whether this is a probe build is decided once, when the build starts
+  -- (Apply, native.probeBuild), for its whole lifetime, reserve included.
+  -- ForeverAuras (dev.34, reserve fix): also for ANY container made while
+  -- restrictions are on, whatever the display's build was classed as when
+  -- it began: a background reserve created after a fight started (the
+  -- paced drain goes on in combat) had its buttons styled by ApplyInstance
+  -- after the callback, when the client had already locked them (seen in
+  -- game: ten "SetSize on bad self" after a combat reload; reproduced by
+  -- the reviewer on the actual source). Early styling per created instance
+  -- is separate from the whole-build probe ownership (native.probeBuild).
+  display.styleEarly = ((region.blizzardAuraDisplay and region.blizzardAuraDisplay.probeBuild) or Restricted()) or nil
+  display.earlyOK, display.earlyFailed = 0, 0
+  -- ForeverAuras (diagnostic, with the build report on): what the client's
+  -- callback finds, for the buttons it adds after the first batch: whether
+  -- the button and its container can be touched at all, before anything is
+  -- built on it (the probe that found the locked containers, rc.28; its
+  -- chat print is retired with the build reports).
+  display.creating = true
+  -- ForeverAuras (independent carriers, SecretAuraFlow.lua): a list in such
+  -- a row gets a box per button, placed at the row through the carrier
+  -- translation, here inside the client's callback. A refused placement is
+  -- counted like a refused style: the build is not taken for complete, and
+  -- the display says so in the editor.
+  -- The mode is fixed for the container's lifetime (the box exists or not
+  -- per button); a display whose mode changes gets new containers
+  -- (ApplyDisplay). The placement uses the display's current data, as a
+  -- later button's styling does; the editor warning comes from the row
+  -- layout (SetFlowEnd), which places every box again after this.
+  local independent = inFlow and Display.FlowIndependent ~= nil and Display.FlowIndependent(data) or false
+  display.independent = independent
+  -- ForeverAuras (cell chain, SecretAuraChain.lua): a filtered list in an
+  -- opted-in row gets a box per button too (its chain places it), and its
+  -- records are counted so an eleventh is handled (NoteChainOverflow).
+  local chained = inFlow and Display.FlowChain ~= nil and Display.FlowChain(data) ~= nil
+  display.chained = chained
+  local withBox = independent or chained
+  -- ForeverAuras: the client's callbacks on this container, for the
+  -- /fa carriers print: those made with the container and the later ones (a
+  -- raised count or a later batch), each as attempts, buttons built and
+  -- styled, and failures (with the last failed operation), and how many of
+  -- the later ones ran under aura restrictions. Later attempts are also
+  -- summed on the region, so a container made again (a rebuild, a mode
+  -- change) does not forget them; a reload does (dev.19 review).
+  -- Counts: "initial" callbacks are constructed here and styled later by
+  -- ApplyInstance, so they count as constructed (built, box placed), not
+  -- styled; a "later" callback is built only when constructed, styled and
+  -- placed. A callback fails once however many of its operations did
+  -- (operation failures are counted apart), and a later one is also counted
+  -- under restrictions as a success or a failure, so a mixed run can be read
+  -- (dev.20 review). The history on the region sums later callbacks across
+  -- replaced containers; it is history, not the current state.
+  display.callbacks = {
+    initial = {attempts = 0, constructed = 0, failed = 0, operations = 0},
+    later = {attempts = 0, built = 0, failed = 0, operations = 0, restricted = 0, restrictedBuilt = 0, restrictedFailed = 0},
+  }
+  local function History(field)
+    local owner = region.blizzardAuraDisplay
+    if not owner then return end
+    owner.carrierHistory = owner.carrierHistory or {attempts = 0, restricted = 0, failed = 0, built = 0, restrictedBuilt = 0, restrictedFailed = 0}
+    owner.carrierHistory[field] = owner.carrierHistory[field] + 1
+  end
+  local function PlaceBox(native)
+    if not independent then return true end  -- a chained list's box is placed by its chain link (StyleDurationGate)
+    local ok, result, why = pcall(Display.PlaceCarrierBox, native, region, display.data)
+    if ok and result == true then return true end
+    -- The current refusal, not the first one ever (dev.19 review).
+    display.carrierBoxError = ok and tostring(why) or tostring(result)
+    -- Said in the editor now, from the current state. The record is not in
+    -- the instance's list yet (appended once, at the end), so it is passed
+    -- along (dev.20 review: the first late refusal showed no warning).
+    if Display.PublishCarrierWarnings then pcall(Display.PublishCarrierWarnings, region, display.data, native) end
+    return false
+  end
   local function initializeFrame(button)
-    local native = BuildButton(container, button)
+    local native
+    local phase = display.creating and "initial" or "later"
+    local counter = display.callbacks[phase]
+    local restricted = phase == "later" and Restricted()
+    counter.attempts = counter.attempts + 1
+    if restricted then counter.restricted = counter.restricted + 1 end
+    if phase == "later" then History("attempts"); if restricted then History("restricted") end end
+    local callbackFailed = false
+    local function Count(_, field, failure)
+      -- An operation failed; the callback fails once.
+      counter.operations = counter.operations + 1
+      display.lastCallbackFailure = phase .. ": " .. tostring(failure)
+      if callbackFailed then return end
+      callbackFailed = true
+      counter.failed = counter.failed + 1
+      if phase == "later" then
+        History("failed")
+        if restricted then counter.restrictedFailed = counter.restrictedFailed + 1; History("restrictedFailed") end
+      end
+    end
+    if display.styleEarly then
+      -- A button that could not be built is counted; the failure stops the
+      -- build (Apply). Other builds raise as before.
+      local okBuild, built = pcall(BuildButton, container, button, withBox)
+      if not okBuild then
+        display.earlyFailed = display.earlyFailed + 1
+        display.styleError = display.styleError or tostring(built)
+        Count(phase, "failed", "build: " .. tostring(built))
+        return
+      end
+      native = built
+    elseif Restricted() then
+      -- ForeverAuras: a button the client adds under aura restrictions to a
+      -- display built before them (a container made for its reserve, or a
+      -- raised frame count) can already be locked when this runs (seen in
+      -- game with 48 displays loaded: "EnableMouse on bad self" from
+      -- BuildButton, ten times over). It is left as the client made it and
+      -- the display is applied again when the restrictions end, which
+      -- builds and styles it (SecretAuraSingle.lua, TakePendingRelayout).
+      local okBuild, built = pcall(BuildButton, container, button, withBox)
+      if not okBuild then
+        -- The client never offers this frame again, so the re-apply must
+        -- make new containers (ApplyDisplay, rebuildFresh): applied in
+        -- place it would keep the bare button, an empty slot in the list
+        -- (seen in game: holes in a buff list that lasted past the fight).
+        local owner = region.blizzardAuraDisplay
+        if owner then owner.rebuildFresh = true end
+        if Display.NotePendingRelayout then Display.NotePendingRelayout(region) end
+        Count(phase, "failed", "build: " .. tostring(built))
+        return
+      end
+      native = built
+    else
+      local okBuild, built = pcall(BuildButton, container, button, withBox)
+      if not okBuild then Count(phase, "failed", "build: " .. tostring(built)); error(built, 0) end
+      native = built
+    end
+    -- ForeverAuras (cell chain): the record knows its display, region and
+    -- index, so its styling can chain it to the previous record.
+    native.region, native.instance, native.record = region, display, #display.buttons + 1
+    -- ForeverAuras (independent carriers): the box goes on the row before the
+    -- button is styled, while nothing of the button's is restricted yet.
+    local boxPlaced = PlaceBox(native)
+    if not boxPlaced then Count(phase, "failed", "box: " .. tostring(display.carrierBoxError)) end
     -- The buttons made with the container are styled by ApplyInstance right
     -- after, once; only a button the client adds later (a raised frame count)
     -- is styled here. Styling twice was a fifth of every display's build.
-    if display.applied then Style(native, display.data, region) end
+    local styled = true
+    if display.styleEarly then
+      local ok, err = pcall(Style, native, display.data, region)
+      native.styledEarly = ok or nil
+      styled = ok
+      if ok and boxPlaced then display.earlyOK = display.earlyOK + 1
+      else
+        display.earlyFailed = display.earlyFailed + 1
+        display.styleError = display.styleError or (ok and display.carrierBoxError or tostring(err))
+      end
+      if not ok then Count(phase, "failed", "style: " .. tostring(err)) end
+    elseif display.applied then
+      if Restricted() then
+        -- As above: a refused styling is made good when the restrictions end.
+        local ok, err = pcall(Style, native, display.data, region)
+        styled = ok
+        if not ok then Count(phase, "failed", "style: " .. tostring(err)) end
+        if (not ok or not boxPlaced) and Display.NotePendingRelayout then Display.NotePendingRelayout(region) end
+      else
+        local ok, err = pcall(Style, native, display.data, region)
+        if not ok then Count(phase, "failed", "style: " .. tostring(err)); error(err, 0) end
+        if not boxPlaced and Display.NotePendingRelayout then Display.NotePendingRelayout(region) end
+      end
+    elseif not boxPlaced and Display.NotePendingRelayout then
+      Display.NotePendingRelayout(region)
+    end
+    if not callbackFailed and boxPlaced and styled then
+      if phase == "initial" then counter.constructed = counter.constructed + 1
+      else
+        counter.built = counter.built + 1
+        History("built")
+        if restricted then counter.restrictedBuilt = counter.restrictedBuilt + 1; History("restrictedBuilt") end
+      end
+    end
     display.buttons[#display.buttons + 1] = native
   end
   if WantsSlot(data, inFlow, container) then
+    local width, height = Display.Dimensions(data)
     local ok = pcall(container.AddAuraSlot, container, "Auras", FilterString(trigger), {
       candidateFilters = CandidateFilters(data),
       sortMethod = Display.SortOrder(data, trigger),
-      initializeFrame = initializeFrame,
+      initializeFrame = function(button)
+        -- ForeverAuras: placed here, before the client locks the button
+        -- (see PlaceSlotButton). The placement is remembered on the button,
+        -- so the Layout of this same build does not write it again (which
+        -- a locked button refuses, and which then queued a needless
+        -- rebuild after the fight, rc.15 review). In a build under
+        -- restrictions a failed placement is counted with the build's
+        -- failures (rc.17 review); Layout then places the button later.
+        local placed, err = true, nil
+        if display.styleEarly then placed, err = pcall(PlaceSlotButton, button, region, data, width, height)
+        else PlaceSlotButton(button, region, data, width, height) end
+        if placed then
+          button.faSlotPlaced = {region = region, data = data, width = width, height = height, growth = Display.Growth(data)}
+        else
+          display.earlyFailed = display.earlyFailed + 1
+          display.styleError = display.styleError or tostring(err)
+        end
+        initializeFrame(button)
+      end,
     })
     if ok and display.buttons[1] then
       display.slotMain = true
+      display.creating = nil
       return display
     end
     -- The client refused the slot: the group below draws instead.
@@ -1628,9 +2479,9 @@ local function Create(region, data)
     candidateFilters = CandidateFilters(data),
     initializeFrame = initializeFrame,
   })
+  display.creating = nil
   return display
 end
-
 -- Frames cannot be destroyed. Ones no longer used are hidden under a hidden
 -- holder, outside every display's frame tree.
 local retiredHolder
@@ -1729,13 +2580,23 @@ local function ApplyUnitStatus(instance, trigger)
   -- Settling after a unit change (see the binding below).
   if instance.settleUntil and GetTime() < instance.settleUntil then hidden = true end
   instance.statusHidden = hidden or nil
-  if not Locked(instance.container) then instance.container:SetAlpha(hidden and 0 or instance.baseAlpha or 1) end
+  -- (dev.90) a container muted for the editor stays at alpha 0 (RefreshUnits)
+  if not Locked(instance.container) then instance.container:SetAlpha((hidden or instance.previewMuted) and 0 or instance.baseAlpha or 1) end
 end
 
--- unitChanged: the event that asked for this refresh can have changed which
--- unit a token stands for (a new target, focus, mouseover, pet or group
--- member). The Missing look and the group shadow are refreshed on it; the
--- aura slot is not (see below).
+-- A protected layout can still accept the native content delegate. This is
+-- only a request: no aura state or secret geometry is read, and no frame
+-- configuration changes. Existing unit-refresh recovery owns any refusal.
+-- Return accepted/refused request counts; ineligible containers return 0, 0.
+function Display.RequestBoundAuraRefresh(container, boundUnit, unit, shown, force)
+  if not (container and force and shown and unit and boundUnit == unit and container.faEnabled == true) then return 0, 0 end
+  local ok = pcall(function() container:UpdateAllAuras() end)
+  if ok then Private.HitchCount("UpdateAllAuras"); return 1, 0 end
+  return 0, 1
+end
+
+-- unitChanged: the token may now name another unit. Every active part of
+-- the display must request content for that unit while retaining its layout.
 local function RefreshUnits(region, removedUnit, changedUnit, unitChanged)
   local native = region.blizzardAuraDisplay
   if not native or not native.active then return end
@@ -1760,6 +2621,24 @@ local function RefreshUnits(region, removedUnit, changedUnit, unitChanged)
     local unit = units[index]
     if Locked(container) then
       lockedUnits[region] = true
+      -- Re-read every active part for this token, not only its live picture:
+      -- Always/Missing clips and row measurements must observe the same unit.
+      -- Protected geometry remains deferred through lockedUnits above.
+      local accepted, refused = 0, 0
+      if (not changedUnit or unit == changedUnit) and unitChanged and instance.visible == true
+        and not instance.retainedMuted and not instance.previewMuted and not IsPreview() then
+        accepted, refused = Display.RequestBoundAuraRefresh(container, instance.boundUnit, unit, true, true)
+        local a, r = Display.RefreshSingleContent(instance, unit, true, true)
+        accepted, refused = accepted + a, refused + r
+        a, r = Display.RefreshFlowContent(instance, unit, true, true)
+        accepted, refused = accepted + a, refused + r
+        local glow = instance.unitGlow
+        if glow and glow.wanted and settings.unitGlow == true and not native.unitGlowsHidden then
+          a, r = Display.RequestBoundAuraRefresh(glow.container, glow.boundUnit, unit, true, true)
+          accepted, refused = accepted + a, refused + r
+        end
+      end
+      if unitChanged and CombatBuildReport then CombatBuildReport(("%s: container %d is locked: content refresh requests accepted %d, refused %d (the full refresh waits for restrictions to end)"):format(tostring(data.id), index, accepted, refused)) end
     elseif not changedUnit or unit == changedUnit then
       -- In a Modern Aura Group the group's mode decides (screen, unit frames or
       -- nameplates); the display's own anchor is not used for its auras.
@@ -1782,12 +2661,47 @@ local function RefreshUnits(region, removedUnit, changedUnit, unitChanged)
       if anchorFrame and anchorFrame:IsForbidden() then anchorFrame = nil end
       -- Live aura visibility must not affect the editor samples.
       Private.StartProfileSystem("aura (modern) - units: bind")
-      local shown = not IsPreview() and unit ~= nil and region:IsShown() and (not (unitFrames or nameplates) or anchorFrame ~= nil)
+      local wouldShow = unit ~= nil and region:IsShown() and (not (unitFrames or nameplates) or anchorFrame ~= nil)
         and not native.gridMember and Display.UnitEligible(trigger, unit)
+      local shown = not IsPreview() and wouldShow
+      -- ForeverAuras (dev.90, Dan's A icons; Astra's order-stability note): in
+      -- the editor a LIVE container that would be shown is not disabled (that
+      -- made the client release every aura's button and hand them out again in
+      -- another order when the editor closed); it is kept enabled and bound,
+      -- hidden by alpha alone while the editor's samples draw in its place,
+      -- and shown again as it is when the editor closes. Its unit events keep
+      -- it current meanwhile. Only a container that is already live on this
+      -- unit and parent qualifies; anything else takes the ordinary path.
       -- An erased Missing look (SecretAuraSingle.lua) draws the aura slot and
       -- the Missing look in one frame buffer: the slot's parent is that stage.
       local parent = unitFrames and data.anchorFrameParent ~= false and anchorFrame
         or (Display.MissingStage and Display.MissingStage(instance)) or region
+      local muted = IsPreview() and wouldShow and container.faEnabled == true and instance.boundUnit == unit
+        and container:GetParent() == parent and not Locked(container)
+      if muted then shown = true end
+      -- (dev.92) a container retained through the editor (QuietInstance) is live: shown again as it is when
+      -- its display is loaded again, or kept muted while the editor is open
+      -- (dev.93, Dan's dev.92 lines) the binding pass during the pause (the region hidden, the editor not yet
+      -- open) retains a live container the same way instead of disabling it
+      if editorRetaining and not shown and not instance.retainedMuted and container.faEnabled == true and not Restricted()
+        and instance.boundUnit == unit and container:GetParent() == parent and not Locked(container) then
+        RetainInstance(instance, region)
+      end
+      if instance.retainedMuted and container.faEnabled ~= true then
+        -- (dev.96) retained but disabled meanwhile (an ordinary quiet): the retention is over for it, the
+        -- ordinary path below parents it back and enables it
+        instance.retainedMuted = nil
+        retainedInstances[instance] = nil
+      end
+      if instance.retainedMuted and container.faEnabled == true then
+        -- (dev.97) and only under a parent that is visible: moved under a hidden one, the container would
+        -- hide and the client rebuild it when shown (the region's OnShow runs this pass again)
+        if not IsPreview() and wouldShow and not Restricted() and parent:IsVisible() then
+          -- live again: back under its parent as it is (RestoreRetained); refused, it stays retained
+          if not RestoreRetained(instance, parent) then muted = true end
+        else muted = true end   -- kept enabled and bound, hidden by alpha, until its display is live again
+        if muted then shown = true end
+      end
       -- Nothing about the container's content changes when it keeps its unit,
       -- parent, enabled state and visibility, and no nameplate was reassigned
       -- (removedUnit/changedUnit): Blizzard keeps a live container current from
@@ -1797,12 +2711,16 @@ local function RefreshUnits(region, removedUnit, changedUnit, unitChanged)
       -- unitChanged alone does not force this refresh: enabling and refreshing
       -- every aura slot on each target change was a visible stutter; a kept
       -- token's slot is re-read in place instead (below).
-      local unchanged = instance.boundUnit == unit and container:GetParent() == parent
-        and container.faEnabled == true and instance.visible == true and not removedUnit and not changedUnit
+      local unchanged = instance.boundUnit == unit and (container:GetParent() == parent or instance.retainedMuted)
+        and container.faEnabled == true and (instance.visible == true or instance.retainedMuted or instance.previewMuted) and not removedUnit and not changedUnit
       local reanchor = not unchanged or instance.anchoredTo ~= (anchorFrame or region) or not instance.anchored
-      instance.anchoredTo, instance.anchored = anchorFrame or region, true
+      -- ForeverAuras (dev.89, Astra's dev.88 review P2): "anchored" is committed only once the intended
+      -- placement went through (below); a refused one leaves it pending and the restriction-end refresh
+      -- (lockedUnits) tries again
+      instance.anchoredTo = anchorFrame or region
+      local placedOK = true
       -- Disabling clears native aura assignments and restarts their animations.
-      if instance.boundUnit ~= unit or container:GetParent() ~= parent then
+      if instance.boundUnit ~= unit or (container:GetParent() ~= parent and not instance.retainedMuted) then
         container:SetEnabled(false)
         if unit then container:SetUnit(unit); Private.HitchCount("container SetUnit") end
         instance.boundUnit = unit
@@ -1854,7 +2772,10 @@ local function RefreshUnits(region, removedUnit, changedUnit, unitChanged)
       else
         local direction = growth
         local anchor = direction == "LEFT" and "TOPRIGHT" or direction == "UP" and "BOTTOMLEFT" or "TOPLEFT"
-        container:ClearAllPoints()
+        -- ForeverAuras (dev.87, Dan's D after a combat reload): under restrictions the container is not cleared
+        -- before it is anchored again (the anchor below may be refused, and a container with no anchors has no
+        -- place: D's main list "left nil" after its combat build); a point set again replaces its anchor
+        if not Restricted() then container:ClearAllPoints() end
         if Display.IconsPerRow(data) then
           AnchorWrappedList(container, region, data)
         elseif direction == "CENTER_HORIZONTAL" or direction == "CENTER_VERTICAL" then
@@ -1868,8 +2789,12 @@ local function RefreshUnits(region, removedUnit, changedUnit, unitChanged)
             vertical and (direction == "UP" and -1 or 1) or 0)
         else
           -- In a Modern Aura Group the content starts where the previous display ends.
-          Display.AnchorToContent(container, anchor, region, anchor)
+          placedOK = Display.AnchorToContent(container, anchor, region, anchor) and true or false
         end
+      end
+      if reanchor then
+        instance.anchored = placedOK
+        if not placedOK then lockedUnits[region] = true end
       end
       Private.StopProfileSystem("aura (modern) - units: anchor")
       Private.StartProfileSystem("aura (modern) - units: status")
@@ -1908,27 +2833,57 @@ local function RefreshUnits(region, removedUnit, changedUnit, unitChanged)
       -- already disabled when its unit events are handled, and a shown one
       -- that kept unit, parent and anchors needs no full refresh.
       if container.faEnabled ~= shown or (shown and not unchanged) then
+        -- (dev.91) said with "/fa cells debug on" for a chained member: the write that resets the list's buttons
+        if CombatBuildReport and instance.chained then
+          CombatBuildReport(("%s: list %s (enabled %s -> %s, unchanged %s: unit %s/%s, parent %s, visible %s, removed %s, changed %s, preview %s, muted %s)"):format(tostring(data.id),
+            shown and "enabled and re-read" or "disabled", tostring(container.faEnabled), tostring(shown), tostring(unchanged), tostring(instance.boundUnit), tostring(unit),
+            tostring(container:GetParent() == parent), tostring(instance.visible), tostring(removedUnit), tostring(changedUnit), tostring(IsPreview()), tostring(muted)))
+        end
         container:SetEnabled(shown)
         if shown then container:UpdateAllAuras(); Private.HitchCount("UpdateAllAuras") end
+        if unitChanged and CombatBuildReport then CombatBuildReport(("%s: container %s (unit %s)"):format(tostring(data.id), shown and "enabled and re-read" or "disabled", tostring(unit))) end
       elseif shown and unitChanged then
+        if CombatBuildReport then CombatBuildReport(("%s: list re-read in place (unit changed; unit %s, bound %s)"):format(tostring(data.id), tostring(unit), tostring(instance.boundUnit))) end
         -- A new unit behind a kept token: the client only re-reads a container
         -- on UNIT_AURA for its unit or when it is shown or enabled again, so
         -- it would keep showing the previous unit's auras. Re-read in place,
         -- without the enable cycle (which clears and lays out again).
         container:UpdateAllAuras(); Private.HitchCount("UpdateAllAuras")
       end
+      if unitChanged and unchanged and not shown and CombatBuildReport then CombatBuildReport(("%s: unit changed but the container is not shown (unit %s, eligible %s)"):format(tostring(data.id), tostring(unit), tostring(wouldShow))) end
       Private.StopProfileSystem("aura (modern) - units: status")
+      -- (dev.90) the muted container hidden by alpha; shown again as it was when the editor closes
+      if muted then
+        local stage = instance.single and instance.single.stage
+        if not instance.previewMuted or instance.eraserMuteFailed
+          or (stage and not (instance.mutedStages and instance.mutedStages[stage])) then
+          -- (dev.92, Astra) committed only when the write went through; refused, the container is disabled
+          -- as before (the ordinary editor path), so no live artwork stays visible under the samples
+          if MuteErasers(instance) and pcall(container.SetAlpha, container, 0) then
+            instance.previewMuted = true
+          else container:SetEnabled(false); instance.visible = false; lockedUnits[region] = true end
+        end
+      elseif instance.previewMuted then
+        instance.previewMuted = nil
+        pcall(container.SetAlpha, container, instance.baseAlpha or 1)
+        ApplyUnitStatus(instance, Display.GetSavedTrigger(data))
+      end
+      if instance.eraserRestorePending and shown and not muted and not editorRetaining and not IsPreview()
+        and not instance.retainedMuted and not instance.previewMuted then
+        if not RestoreErasers(instance, data) then lockedUnits[region] = true end
+      end
       -- The Missing container follows the same unit and visibility as the aura
       -- slot, and is refreshed with it when the unit behind the token can have
       -- changed: left alone, it kept the previous target's state (the Missing
       -- look stayed closed after de-targeting, and flickered on re-targeting).
       Private.StartProfileSystem("aura (modern) - units: single")
-      Display.RefreshSingle(instance, unit, shown, unitChanged or not unchanged)
+      local singleReady = Display.RefreshSingle(instance, unit, shown and not muted, unitChanged or not unchanged)
       Private.StopProfileSystem("aura (modern) - units: single")
       -- So does a centred Modern Aura Group's half-size shadow.
       Private.StartProfileSystem("aura (modern) - units: shadow")
-      Display.RefreshFlowShadow(instance, unit, shown, unitChanged or not unchanged)
+      local flowReady = Display.RefreshFlowShadow(instance, unit, shown and not muted, unitChanged or not unchanged)
       Private.StopProfileSystem("aura (modern) - units: shadow")
+      if singleReady == false or flowReady == false then lockedUnits[region] = true end
       Private.StartProfileSystem("aura (modern) - units: glow")
       if instance.unitGlow then
         local glowContainer = instance.unitGlow.container
@@ -1959,6 +2914,22 @@ local function RefreshUnits(region, removedUnit, changedUnit, unitChanged)
         if glowShown then glowContainer:UpdateAllAuras() end
       end
       Private.StopProfileSystem("aura (modern) - units: glow")
+    end
+  end
+  -- A healthy activation reuses prepared records, so their private glow
+  -- bindings must resume without restyling or resetting native assignments.
+  -- Retained/editor-hidden instances wait until their live appearance returns.
+  if Display.ResumeGlowBinding and not IsPreview() and region:IsShown() then
+    for _, instance in ipairs(native.instances) do
+      if instance.glowResumePending and instance.visible and instance.container.faEnabled == true
+        and not instance.retainedMuted and not instance.previewMuted then
+        local waiting = false
+        for _, record in ipairs(instance.buttons or {}) do
+          if record.glowBinding and not Display.ResumeGlowBinding(record) then waiting = true end
+        end
+        instance.glowResumePending = waiting or nil
+        if waiting then lockedUnits[region] = true end
+      end
     end
   end
   -- Every display in the group relinks all of them, so the order in which
@@ -2021,7 +2992,7 @@ function Display.UnitFramesChanged()
     unitFrameRefreshPending = nil
     for region in pairs(activeRegions) do
       local data = region.blizzardAuraDisplay.data
-      if data.anchorFrameType == "UNITFRAME" or Display.FlowFrameMode(data) == "UNITFRAME" then RefreshUnits(region) end
+      if region:IsShown() and (data.anchorFrameType == "UNITFRAME" or Display.FlowFrameMode(data) == "UNITFRAME") then RefreshUnits(region) end
     end
   end)
 end
@@ -2038,28 +3009,107 @@ local function DynamicGroupWarning(data)
     inGroup and Display.dynamicGroupWarning or nil)
 end
 
+-- ForeverAuras (dev.90, Dan's A icons; Astra's order-stability note): what the
+-- container's aura group is configured with, as one key: a build whose key
+-- is the one already applied to a live container leaves the container alone
+-- (no disable, no processing policy, no sort/candidate setters), because each
+-- of those makes the client release every aura's button and hand the buttons
+-- out again from a free list it walks in hash order - the cells of a chained
+-- member then show the same auras in another order ("the A icons swap" after
+-- the editor closes). The key covers the group's mode, sort and direction, the
+-- filter string, the candidate filters (serialised whole) and the batch size;
+-- the enabled state of the list is kept apart (ConfigureSingle). The key is
+-- recorded only after the writes went through.
 local function ApplyInstance(region, data, index, instance)
   instance.data = data
   -- New settings may place the container elsewhere: RefreshUnits anchors again.
   instance.anchored = nil
-  instance.container:SetEnabled(false)
+  local trigger = Display.GetTrigger(data)
+  local function SerializeValue(value, depth)
+    depth = depth or 0
+    if type(value) ~= "table" then return tostring(value) end
+    if depth > 6 then return "{...}" end
+    local keys = {}
+    for k in pairs(value) do keys[#keys + 1] = k end
+    table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+    local parts = {}
+    for _, k in ipairs(keys) do parts[#parts + 1] = tostring(k) .. "=" .. SerializeValue(value[k], depth + 1) end
+    return "{" .. table.concat(parts, ",") .. "}"
+  end
+  local okM, maxAuras = pcall(Display.MaxAuras, data)
+  local method, direction = Display.SortOrder(data, trigger)
+  local filter, candidates = FilterString(trigger), CandidateFilters(data)
+  local config = table.concat({tostring(instance.slotMain), tostring(method), tostring(direction), tostring(filter),
+    SerializeValue(candidates), tostring(okM and maxAuras or "?")}, "|")
+  -- (dev.90) a live container applied again with the same configuration keeps its auras' buttons
+  local keep = instance.applied == true and instance.appliedConfig == config and instance.container.faEnabled == true
+    and not instance.styleEarly and not Restricted()
+  instance.keptConfig = keep
+  if Display.FlowChain and Display.FlowChain(data) then instance.container.faReportDisable = data.id end   -- (dev.94 diagnostic, SecretAuraFlow.lua TrackEnabled)
+  -- (dev.91) said with "/fa cells debug on", for a member of a row with cells: whether the list was kept or
+  -- configured again, and why (Dan: the A icons still move)
+  if CombatBuildReport and Display.FlowChain and Display.FlowChain(data) then
+    CombatBuildReport(("%s: list %s (%s)"):format(tostring(data.id), keep and "kept" or "configured again",
+      keep and "same configuration" or (not instance.applied and "first build" or instance.appliedConfig ~= config and ("configuration changed: " .. tostring(instance.appliedConfig) .. " -> " .. tostring(config))
+        or instance.container.faEnabled ~= true and "container not live" or instance.styleEarly and "styled early" or Restricted() and "restricted" or "?")))
+  end
+  if not keep then instance.container:SetEnabled(false) end
   -- Timed per phase for the profiler (see ApplyDisplay).
   Private.StartProfileSystem("aura (modern) - build: style buttons")
-  for _, button in ipairs(instance.buttons) do Style(button, data, region) end
+  -- ForeverAuras (combat-reload probe): a button styled early (Create) is
+  -- not styled again now; one that was not is styled under pcall while
+  -- restrictions are on, so the failure is counted and the build reported
+  -- incomplete (the caller queues the display for a rebuild when the
+  -- restrictions end) instead of counted as done.
+  local probe = instance.styleEarly
+  instance.lateFailed = 0
+  for _, button in ipairs(instance.buttons) do
+    if button.styledEarly then
+      button.styledEarly = nil
+    elseif probe then
+      local ok, err = pcall(Style, button, data, region)
+      if not ok then
+        instance.lateFailed = instance.lateFailed + 1
+        instance.styleError = instance.styleError or tostring(err)
+      end
+    else
+      Style(button, data, region)
+    end
+  end
   Private.StopProfileSystem("aura (modern) - build: style buttons")
+  -- ForeverAuras (cell chain): the member's end on the last record
+  -- (FinishChain checks every record's link first). In a probe build a
+  -- refusal or an incomplete link is counted with the build's failures
+  -- (NoteSlotFailure: the report below names it and the build stops); in
+  -- an ordinary build it takes the chain's failure contract
+  -- (NoteChainFailure: counted, said, a bounded re-apply; dev.40 review).
+  if instance.chained and Display.FinishChain then
+    local native = region.blizzardAuraDisplay
+    local okEnd, whyEnd = Display.FinishChain(region, instance, native and native.chainCalib)
+    if not okEnd then
+      if instance.styleEarly then
+        if Display.NoteSlotFailure then Display.NoteSlotFailure(instance, "chain end", whyEnd) end
+      elseif Display.NoteChainFailure then
+        Display.NoteChainFailure(region, instance, "end", whyEnd)
+      end
+    end
+  end
   Private.StartProfileSystem("aura (modern) - build: layout")
   Layout(instance, region, data)
   Private.StopProfileSystem("aura (modern) - build: layout")
-  local trigger = Display.GetTrigger(data)
-  ConfigureProcessing(instance.container, trigger)
-  if instance.slotMain then
-    instance.container:SetAuraSlotSortMethod("Auras", Display.SortOrder(data, trigger))
-    instance.container:SetAuraSlotFilterString("Auras", FilterString(trigger))
-    instance.container:SetAuraSlotCandidateFilters("Auras", CandidateFilters(data))
-  else
-    instance.container:SetAuraGroupSortMethod("Auras", Display.SortOrder(data, trigger))
-    instance.container:SetAuraGroupFilterString("Auras", FilterString(trigger))
-    instance.container:SetAuraGroupCandidateFilters("Auras", CandidateFilters(data))
+  if not keep then
+    instance.appliedConfig = nil
+    ConfigureProcessing(instance.container, trigger)
+    if instance.slotMain then
+      instance.container:SetAuraSlotSortMethod("Auras", Display.SortOrder(data, trigger))
+      instance.container:SetAuraSlotFilterString("Auras", FilterString(trigger))
+      instance.container:SetAuraSlotCandidateFilters("Auras", CandidateFilters(data))
+    else
+      instance.container:SetAuraGroupSortMethod("Auras", Display.SortOrder(data, trigger))
+      instance.container:SetAuraGroupFilterString("Auras", FilterString(trigger))
+      instance.container:SetAuraGroupCandidateFilters("Auras", CandidateFilters(data))
+    end
+    instance.appliedConfig = config
   end
   ConfigureUnitGlow(instance, region, data)
   Private.StartProfileSystem("aura (modern) - build: single")
@@ -2067,6 +3117,27 @@ local function ApplyInstance(region, data, index, instance)
   Private.StopProfileSystem("aura (modern) - build: single")
   -- From here on, buttons the client adds are styled as they are made (Create).
   instance.applied = true
+  -- ForeverAuras (combat-reload probe): the result of a probe build, with
+  -- the early styling, the later styling and the build errors counted
+  -- apart; printed by the caller, which stops the build on any failure.
+  if instance.styleEarly then
+    instance.styleEarly = nil
+    local failed = (instance.earlyFailed or 0) + (instance.lateFailed or 0)
+    CombatBuildReport(("%s: %d buttons, %d styled early, %d failed early, %d failed later%s"):format(
+      tostring(data.id), #instance.buttons, instance.earlyOK or 0, instance.earlyFailed or 0, instance.lateFailed or 0,
+      instance.styleError and (" (" .. instance.styleError .. ")") or ""))
+    -- The condition look recorded so far was painted with the early styling
+    -- (setup = true reaches the buttons); a value or reset that arrives while
+    -- the restrictions last marks the display dirty itself (SetConditionProperty,
+    -- ResetConditionProperty), so nothing is marked here. Marking every probe
+    -- build dirty repainted every button of every display built in combat in
+    -- the one frame the restrictions ended (seen in game: a 67 ms hitch with
+    -- 40 nameplate instances), for displays whose look was already right.
+    region.secretAuraConditionValues = region.secretAuraConditionValues or {}
+    instance.probeFailed = failed > 0
+    return failed == 0
+  end
+  return true
 end
 
 local EDITOR_INSTANCES_NOW, EDITOR_INSTANCES_PER_FRAME = 2, 4
@@ -2076,7 +3147,72 @@ local EDITOR_INSTANCES_NOW, EDITOR_INSTANCES_PER_FRAME = 2, 4
 -- addons' work in the same frames; a smaller slice per frame keeps those
 -- frames shorter and spreads the builds over a few more.
 local BACKGROUND_BUDGET = 2
+-- ForeverAuras: one build budget per frame, shared by the two drains
+-- (DrainPending and DrainInstanceQueues): each used to keep its own, and
+-- both timers can fire in the same frame (seen in game: a 17.9 ms timer
+-- frame made of a 4 ms drain overrunning on a heavy display plus the 2 ms
+-- background drain overrunning on another). The drain that comes second in
+-- a frame already spent finds nothing left and waits for the next one.
+-- GetTime() is constant within a frame, so it serves as the frame's stamp.
+local FRAME_BUDGET = 4
+local frameStamp, frameUsed = nil, 0
+local function FrameBudgetLeft()
+  local stamp = GetTime()
+  if stamp ~= frameStamp then frameStamp, frameUsed = stamp, 0 end
+  return FRAME_BUDGET - frameUsed
+end
+local function FrameBudgetSpend(ms)
+  frameUsed = frameUsed + ms
+end
 local instanceQueues = {}
+-- ForeverAuras (combat-reload probe): a probe build that failed is undone
+-- (its containers retired, as a re-created display's are) and the display
+-- is set aside until the restrictions end, when it is built again as new.
+-- Nothing of it is counted as finished meanwhile.
+local function AbandonProbeBuild(region, data, why)
+  local native = region.blizzardAuraDisplay
+  if native then
+    native.applying = nil -- ForeverAuras (cell chain): no longer being applied (RequestReapply)
+    for _, instance in ipairs(native.instances) do
+      local missing = instance.single and instance.single.missing
+      if missing then missing.active = false end
+      RetainInstanceFrames(region, instance)
+      if Display.CancelPendingListAlpha then Display.CancelPendingListAlpha(instance) end
+    end
+    native.instances = {}
+    -- (A probe build keeps its own allocation list, RetainAllocations below;
+    -- the ordinary-reserve ledger does not exist for it.)
+    native.instanceQueue, instanceQueues[region] = nil, nil
+    native.active = false
+  end
+  if native then native.probeBuild = nil end
+  -- ForeverAuras (dev.68): the stopped build's spine is let go (the retry prepares it again).
+  if native and Display.ReleaseChainSpine then Display.ReleaseChainSpine(native) end
+  RetainAllocations(region)
+  CleanAbandoned(region)
+  activeRegions[region] = nil
+  -- ForeverAuras (cell chain, dev.48 review): the settings the retry builds
+  -- are the display's CURRENT ones. A newer saved table already queued for
+  -- this display (a Modify made while this build was held or its reserve
+  -- still going, under restrictions) is that intent and is kept as the
+  -- retry; the failed build's own table is revived only when nothing newer
+  -- was asked for. Stale tables are dropped by the handoff as before.
+  local queued = pending[region]
+  pending[region] = nil
+  if queued and queued ~= data and WeakAuras.GetData(data.id) == queued then data = queued end
+  retryAfterRestrictions[region] = data
+  -- ForeverAuras: shown on the aura (cleared by Finish when the display is
+  -- built), so a display missing during a fight is explained in the editor.
+  -- Seen in game: Remaining Time (slot) displays, whose slot buttons the
+  -- client locks together with every frame under them once made in combat.
+  Warn(data, L["This display will be built when aura restrictions end."])
+  CombatBuildReport(("%s stopped (%s); built again when restrictions end."):format(tostring(data.id), tostring(why)))
+end
+-- Whether a display set aside must still wait (Apply, Activate).
+local function WaitingForRetry(region)
+  return retryAfterRestrictions[region] ~= nil and Restricted()
+end
+
 local instanceDraining = false
 
 -- The units a display needs right away, at login.
@@ -2099,70 +3235,523 @@ end
 
 local function FinishApply(region, data)
   local native = region.blizzardAuraDisplay
+  -- ForeverAuras (dev.31 diagnostics): the build history notes the finish.
+  if Display.NoteCarrierEvent then Display.NoteCarrierEvent(region, "finish", ("%d instances"):format(#native.instances)) end
   -- Where the next display in a Modern Aura Group starts, then the whole chain.
   local single = native.instances[1] and native.instances[1].single
   -- Timed per part for the profiler (see Style).
   Private.StartProfileSystem("aura (modern) - finish: flow")
+  -- ForeverAuras (dev.78): an ordinary member of a row with cells marks its end with a measurement chain
+  -- (before the shadows: a Centered shadow reuses its calibration, dev.79)
+  if Display.EnsureFlowMeasure then Display.EnsureFlowMeasure(region, data, native) end
   Display.EnsureFlowShadows(region, data)
   Display.EnsureFlowRemaining(region, data)
   Display.SetFlowEnd(region, data, single and single.missing and single.missing.active and single.missing.presenceActive and single.missing.presence)
   Private.StopProfileSystem("aura (modern) - finish: flow")
   Private.StartProfileSystem("aura (modern) - finish: rechain")
+  -- ForeverAuras (cell chain, dev.46 review): a chained display with a
+  -- prepared end asks this chain pass to take it and commit (CommitChain at
+  -- the end of RechainFlow; kept pending while a batch holds the pass).
+  local chainedInstance = native.instances[1]
+  if chainedInstance and chainedInstance.chained and native.flow and native.flow.chainEndReady then
+    native.chainCommitPending, native.chainCommitResult = {instance = chainedInstance}, nil
+  end
+  -- A refusal found by this pass asks for its re-apply as one made during
+  -- the apply (wanted): this finish drops pending[region] below and then
+  -- makes the request once (RequestReapply).
+  local wasApplying = native.applying
+  native.applying = true
   Display.RechainFlow(Display.FlowGroup(data))
+  native.applying = wasApplying
   Private.StopProfileSystem("aura (modern) - finish: rechain")
   Private.StartProfileSystem("aura (modern) - finish: units")
   RefreshUnits(region)
   Private.StopProfileSystem("aura (modern) - finish: units")
-  pending[region] = nil
+  -- ForeverAuras (cell chain, dev.49 review): this build's own request was
+  -- taken when it started (ApplyDisplay); a request made since (a Modify
+  -- while a reserve or a held probe finished in the background) is NEWER
+  -- and stays for the paced apply. (The stamp is read through a global
+  -- lookup where a review harness runs this function alone.)
+  if pending[region] and not (requestStamp and (requestStamp[region] or 0) ~= (native.buildStamp or 0)) then pending[region] = nil end
+  -- ForeverAuras (dev.82): a Centered row with cells under restrictions binds
+  -- its shadows' records once no member of it is queued any more (this build
+  -- may have been the last; ActivateShadows); the new containers take the
+  -- unit as this display's did above.
+  if Display.ActivateShadows and Restricted and Restricted() then
+    local activated = Display.ActivateShadows(Display.FlowGroup(data))
+    for _, other in ipairs(activated or {}) do RefreshUnits(other) end
+  end
   Private.StartProfileSystem("aura (modern) - finish: sounds and warnings")
   SyncSounds(region)
   Warn(data)
+  -- ForeverAuras (dev.36 review): a display whose reserve is stopped for
+  -- these settings keeps its explanation after a refresh of its working
+  -- instances (ReserveStopped / StoppedWarning, defined with the drain).
+  if Display.StoppedWarning then Display.StoppedWarning(region, data) end
+  -- ForeverAuras (cell chain, dev.40 review): the display's row-cell texts
+  -- follow its current state here too, so a display that left the row (no
+  -- flow: SetFlowEnd returned before publishing) drops them. The re-apply
+  -- this finish completes is no longer pending; a chain that went through
+  -- whole closes the record of refusals (a stopped one keeps it, with its
+  -- warning).
+  if Display.PublishChainWarnings and not (native and native.flow) then Display.PublishChainWarnings(region, data) end
+  local record = native and native.reapplyRequests
+  if record then
+    record.pending = nil
+    if native.chainFailure then
+      if record.wanted then record.wanted = nil; Display.RequestReapply(region, record.why) end
+    elseif not record.stopped and not native.chainCommitPending then
+      -- Verified (or no chain): the record is closed. A commit still held by
+      -- a batch keeps it until the flush's pass decides (dev.46 review).
+      native.reapplyRequests = nil
+    end
+  end
+  -- A whole chain needs no restricted hand-over of its own any more (dev.45
+  -- review: an apply that completed before the restriction-end handler ran
+  -- left it, and the handler built the display again); another refusal's
+  -- hand-over stays. Only once verified (not while the commit is held).
+  if native and not native.chainFailure and not native.chainCommitPending and Display.CancelPendingRelayout then Display.CancelPendingRelayout(region, "chain") end
   Private.StopProfileSystem("aura (modern) - finish: sounds and warnings")
+end
+
+-- ForeverAuras: a probe build's finishing, for the first pass (ApplyDisplay)
+-- and for a reserve finished in the background (DrainInstanceQueues) alike.
+-- The build's failure accounting stays open through it (the row measurement
+-- is made there): a slot setup, formatter or binding refused in it counts
+-- (NoteSlotFailure, instance.finishFailed) and stops the build like a failure
+-- in the buttons would (rc.51 and rc.52 reviews: the measurement was made
+-- after success had been reported, and the background pass skipped the
+-- check). Returns true when the build may be kept. A build stopped after the
+-- restrictions already ended is tried again next frame (AbandonProbeBuild
+-- otherwise waits for the restriction-end handler, which has passed).
+-- ForeverAuras (cell chain, dev.47 review): a chained probe build whose
+-- chain pass a batch holds (the paced drain's own hold, an outer load hold)
+-- is neither finished nor failed when its finish returns: the pass that
+-- verifies its place decides (CommitChain -> SettleProbeCommit). Until then
+-- the build keeps its failure accounting (instance.finishing) and its frame
+-- ownership (native.probeBuild, region.faProbeAllocations). Returns true, true.
+-- Stopped after the restrictions already ended: the restriction-end
+-- handler, which moves set-aside builds to the paced drain, has passed,
+-- so the same hand-over is made here (the drain's shared frame budget
+-- paces it with everything else; rc.53 review). The request is dropped
+-- by whatever completes the display first (FinishApply clears pending,
+-- a finished build clears the retry), so nothing is built twice.
+-- (The retry holds the current settings, dev.48 review: a newer table
+-- queued while the build was held is built, not this build's own.)
+-- (1.2.0, Astra's audit 4) shared by the finish-stage failure and the
+-- reserve-stage failures of a probe build: the latter only recorded the
+-- retry, which nothing serviced once restrictions had already ended.
+function Display.HandOverStoppedBuild(region)
+  local retry = retryAfterRestrictions[region]
+  if not Restricted() and CleanAbandoned(region) and retry and WeakAuras.GetData(retry.id) == retry then
+    retryAfterRestrictions[region] = nil
+    pending[region] = retry
+    if MarkRequest then MarkRequest(region) end
+    -- the drain runs a frame later (never a rebuild inside the reserve loop); one already scheduled sees it
+    if not draining then
+      draining = true
+      C_Timer.After(0, DrainPending)
+    end
+  end
+end
+local function FinishProbeBuild(region, data)
+  local native = region.blizzardAuraDisplay
+  for _, instance in ipairs(native.instances) do instance.finishing, instance.finishFailed = true, 0 end
+  native.probeHeld = nil
+  local okFinish, err = pcall(FinishApply, region, data)
+  if okFinish and native.chainCommitPending then
+    -- Held: nothing failed so far and the chain pass has not decided; the
+    -- accounting stays open for it (SettleProbeCommit closes it once).
+    local counted = 0
+    for _, instance in ipairs(native.instances) do counted = counted + (instance.finishFailed or 0) end
+    if counted == 0 then
+      native.probeHeld = data
+      return true, true
+    end
+  end
+  local finishFailed, finishError = 0, nil
+  for _, instance in ipairs(native.instances) do
+    finishFailed = finishFailed + (instance.finishFailed or 0)
+    finishError = finishError or (instance.finishFailed and instance.finishFailed > 0 and instance.styleError) or nil
+    instance.finishing, instance.finishFailed = nil, nil
+  end
+  if okFinish and finishFailed == 0 then return true end
+  if not okFinish then
+    AbandonProbeBuild(region, data, "finishing failed: " .. tostring(err))
+  else
+    CombatBuildReport(("%s: %d failed while finishing%s"):format(tostring(data.id), finishFailed, finishError and (" (" .. finishError .. ")") or ""))
+    AbandonProbeBuild(region, data, "the row measurement could not be made")
+  end
+  -- (HandOverStoppedBuild above, kept inline here: the finish is checked on its own by the harnesses.)
+  local retry = retryAfterRestrictions[region]
+  if not Restricted() and CleanAbandoned(region) and retry and WeakAuras.GetData(retry.id) == retry then
+    retryAfterRestrictions[region] = nil
+    pending[region] = retry
+    if MarkRequest then MarkRequest(region) end
+    if not draining then
+      draining = true
+      C_Timer.After(0, DrainPending)
+    end
+  end
+  return false
+end
+-- The held probe build's decision, made by the chain pass that verified its
+-- place (CommitChain, both outcomes): accepted when nothing was counted
+-- against it (the frames belong to the live display, unless its reserve is
+-- still being built), stopped and set aside otherwise (a refused placement
+-- or reveal was counted by NoteChainFailure into the open finishing), with
+-- the same hand-over as a finish that failed at once (above). Made exactly
+-- once; nothing to do for a build that was not held.
+function Display.SettleProbeCommit(region)
+  local native = region and region.blizzardAuraDisplay
+  local data = native and native.probeHeld
+  if not data then return end
+  native.probeHeld = nil
+  local finishFailed, finishError = 0, nil
+  for _, instance in ipairs(native.instances) do
+    finishFailed = finishFailed + (instance.finishFailed or 0)
+    finishError = finishError or (instance.finishFailed and instance.finishFailed > 0 and instance.styleError) or nil
+    instance.finishing, instance.finishFailed = nil, nil
+  end
+  if native.data ~= data then return end -- replaced meanwhile: the new apply owns the display
+  if finishFailed == 0 and native.chainCommitResult == true then
+    if not native.instanceQueue then region.faProbeAllocations, native.probeBuild = nil, nil end
+    retryAfterRestrictions[region] = nil
+    return
+  end
+  CombatBuildReport(("%s: %d failed while finishing%s"):format(tostring(data.id), math.max(1, finishFailed), finishError and (" (" .. finishError .. ")") or ""))
+  AbandonProbeBuild(region, data, "the row did not take the display's place")
+  -- (The retry holds the current settings, dev.48 review: a newer table
+  -- queued while the build was held is built, not this build's own.)
+  local retry = retryAfterRestrictions[region]
+  if not Restricted() and CleanAbandoned(region) and retry and WeakAuras.GetData(retry.id) == retry then
+    retryAfterRestrictions[region] = nil
+    pending[region] = retry
+    if MarkRequest then MarkRequest(region) end
+    if not draining then
+      draining = true
+      C_Timer.After(0, DrainPending)
+    end
+  end
+end
+
+-- ForeverAuras (dev.34, reserve fix): a reserve instance of an ordinary
+-- build that failed while restrictions were on (or whose container could
+-- not be made). The partial instance (if any) is removed from the display's
+-- list, quieted and its frames retained for cleaning (RetainInstanceFrames,
+-- as a stopped probe build does), the rest of the reserve is dropped, and
+-- the display is set aside for a new apply when restrictions end
+-- (retryAfterRestrictions; Apply then creates the missing instances afresh).
+-- Already unrestricted: handed to the paced drain at once, as FinishProbeBuild
+-- does after a late failure. The display's built instances keep working.
+local RESERVE_RETRIES = 2
+local function StoppedText(count, why)
+  return L["Blizzard refused the extra units of this display %d times (%s). They are left out until the display's settings change or the interface is reloaded."]:format(count, tostring(why))
+end
+-- ForeverAuras (dev.34-36 reviews, reserve fix): the failure handling of an
+-- ORDINARY build's background reserve, per ATTEMPT (one drain of one queue).
+--  - Ownership: queue.owned holds the instances THIS attempt created; only
+--    they can be retired. queue.ledger holds every FRAME allocated while the
+--    attempt runs (NoteAllocation through region.faAttemptAllocations, kept
+--    open through the creation, the setup of new and existing instances and
+--    the finish, closed on every exit): on failure, each ledger frame that no
+--    surviving instance took over (InstanceFrames) is retained for cleaning,
+--    so a sibling made and refused before it was attached (a presence or
+--    shadow container) never escapes; a kept instance's working frames are
+--    not touched.
+--  - RetireReserveInstance: a failed instance of this attempt is taken out of
+--    the display's list, quieted and its known frames retained.
+--  - FailReserveAttempt: ONE record per failed attempt on the display
+--    (native.reserveFailure: settings epoch, count, why); recovery once:
+--    under restrictions a retry when they end (not counted); unrestricted a
+--    paced retry at once, at most RESERVE_RETRIES times for the same settings
+--    epoch (Display.Modify counts it; activation and layout do not); then
+--    "stopped": no further reserve for these settings (ReserveStopped gates
+--    ApplyDisplay), the working instances stay, the editor says why
+--    (StoppedWarning, re-published after every finish while stopped).
+local function ReserveStopped(native)
+  local record = native and native.reserveFailure
+  return record ~= nil and record.stopped == true and record.epoch == (native.settingsEpoch or 0)
+end
+function Display.StoppedWarning(region, data)
+  local native = region and region.blizzardAuraDisplay
+  if native and ReserveStopped(native) and native.data == data then
+    Warn(data, StoppedText(native.reserveFailure.count, native.reserveFailure.why))
+  end
+end
+local function RetireReserveInstance(region, instance)
+  local native = region.blizzardAuraDisplay
+  if native then
+    for i = #native.instances, 1, -1 do if native.instances[i] == instance then table.remove(native.instances, i) end end
+  end
+  pcall(QuietInstance, region, instance)
+  RetainInstanceFrames(region, instance)
+  if Display.CancelPendingListAlpha then Display.CancelPendingListAlpha(instance) end
+end
+local function FailReserveAttempt(region, queue, failed, why)
+  local native = region.blizzardAuraDisplay
+  for _, instance in ipairs(failed or {}) do if queue.owned and queue.owned[instance] then RetireReserveInstance(region, instance) end end
+  ReconcileLedger(region, queue)
+  if native then native.instanceQueue = nil end
+  instanceQueues[region] = nil
+  local data = queue.data
+  if WeakAuras.GetData(data.id) ~= data then return end
+  local epoch = native and native.settingsEpoch or 0
+  local record = native and native.reserveFailure
+  if not (record and record.epoch == epoch) then record = {epoch = epoch, count = 0}; if native then native.reserveFailure = record end end
+  record.why, record.data = tostring(why), data
+  if Restricted() then
+    retryAfterRestrictions[region] = data
+    return
+  end
+  record.count = record.count + 1
+  if record.count > RESERVE_RETRIES then
+    record.stopped = true
+    Warn(data, StoppedText(record.count, record.why))
+    return
+  end
+  CleanAbandoned(region)
+  pending[region] = data
+  if MarkRequest then MarkRequest(region) end
+  if not draining then
+    draining = true
+    C_Timer.After(0, DrainPending)
+  end
+end
+
+-- ForeverAuras (cell chain, SecretAuraChain.lua; dev.40 review): a display
+-- asking to be applied again because a link or the end of its chain was
+-- refused (NoteChainFailure). One record per settings epoch
+-- (native.reapplyRequests), counted per JOB, not per refusal: while a
+-- re-apply is pending (record.pending, cleared by FinishApply) further
+-- requests join it. Under restrictions the request is the pending relayout
+-- their end applies (not counted, as a refused reserve); otherwise the
+-- paced drain, at most RESERVE_RETRIES times for the same epoch, then
+-- stopped: no further re-apply for these settings from any entry, the
+-- display keeps one spot in the row and the editor says why
+-- (PublishChainWarnings; a successful apply closes the record).
+function Display.RequestReapply(region, why)
+  local native = region and region.blizzardAuraDisplay
+  if not native or not (native.active or native.applying) or not native.data then return end
+  local data = native.data
+  if WeakAuras.GetData(data.id) ~= data then return end
+  local epoch = native.settingsEpoch or 0
+  local record = native.reapplyRequests
+  if not (record and record.epoch == epoch) then record = {epoch = epoch, count = 0}; native.reapplyRequests = record end
+  record.why = tostring(why)
+  if record.stopped then return end
+  -- Asked while the display is being applied (the pending job itself, or a
+  -- first apply): FinishApply drops this apply's pending entry at its end,
+  -- so it makes the request then, once.
+  if native.applying then record.wanted = true; return end
+  if record.pending then return end
+  record.pending = true
+  if Restricted() then
+    if Display.NotePendingRelayout then Display.NotePendingRelayout(region, "chain") end
+    return
+  end
+  record.count = record.count + 1
+  if record.count > RESERVE_RETRIES then
+    record.stopped, record.pending = true, nil
+    if Display.PublishChainWarnings then Display.PublishChainWarnings(region, data) end
+    return
+  end
+  pending[region] = data
+  record.stamp = MarkRequest and MarkRequest(region) or nil -- (guarded: review harnesses run this function alone)
+  if not draining then
+    draining = true
+    C_Timer.After(0, DrainPending)
+  end
+end
+-- ForeverAuras (cell chain, dev.43 review): a chain completed outside an
+-- apply (CompleteChain): the repair job it may have queued is cancelled (no
+-- duplicate repair) and the epoch's record closed, unless stopped.
+function Display.ChainRepaired(region)
+  local native = region and region.blizzardAuraDisplay
+  local record = native and native.reapplyRequests
+  if not record then return end
+  if record.pending then
+    -- Its own job only: a request made since (a Modify of the same saved
+    -- table under restrictions) is newer and stays (dev.49 review).
+    if pending[region] == native.data and (not requestStamp or record.stamp == requestStamp[region]) then pending[region] = nil end
+    -- The restricted hand-over too (its own reason; another refusal's stays).
+    if Display.CancelPendingRelayout then Display.CancelPendingRelayout(region, "chain") end
+  end
+  record.pending, record.wanted = nil, nil
+  if not record.stopped then native.reapplyRequests = nil end
+end
+-- Whether the chain's re-apply is stopped for the display's current settings.
+function Display.ReapplyStopped(native)
+  local record = native and native.reapplyRequests
+  return record ~= nil and record.stopped == true and record.epoch == (native.settingsEpoch or 0)
+end
+
+-- The finishing pass after an ordinary build's reserve, with the attempt's
+-- failure contract. EVERY instance is marked finishing, so a refused slot
+-- write during the finish (NoteSlotFailure) is counted wherever it lands:
+-- on an instance this attempt made, which is then retired, or on an
+-- existing one (its measurement is made again by the retry; the instance
+-- itself is kept). A finishing exception fails every new instance. Any
+-- failure is one failed attempt; success closes the record.
+local function FinishReserve(region, queue)
+  local native = region.blizzardAuraDisplay
+  for _, instance in ipairs(native.instances) do instance.finishing, instance.finishFailed = true, 0 end
+  local okFinish, err = pcall(FinishApply, region, queue.data)
+  local failed, any, why = {}, false, nil
+  for _, instance in ipairs(native.instances) do
+    local refused = (instance.finishFailed or 0) > 0
+    if refused then any = true; why = why or instance.styleError end
+    if queue.owned[instance] and (not okFinish or refused) then failed[#failed + 1] = instance end
+    instance.finishing, instance.finishFailed = nil, nil
+  end
+  if okFinish and not any then
+    -- Success too is reconciled: an allocation refused and left unattached
+    -- inside a handled path (EnsureMissing) is retained for cleaning.
+    ReconcileLedger(region, queue)
+    native.reserveFailure = nil
+    return true
+  end
+  if not okFinish then geterrorhandler()(err); why = "finishing failed: " .. tostring(err) end
+  FailReserveAttempt(region, queue, failed, why)
+  return false
 end
 
 local function DrainInstanceQueues()
   instanceDraining = false
-  local more = false
-  local deadline = debugprofilestop() + BACKGROUND_BUDGET
+  local more, abandoned = false, false
+  -- Nothing left of this frame's budget: the next frame (FrameBudgetLeft).
+  local left = FrameBudgetLeft()
+  if left <= 0 then
+    instanceDraining = true
+    C_Timer.After(0, DrainInstanceQueues)
+    return
+  end
+  local startedAt = debugprofilestop()
+  local deadline = startedAt + math.min(BACKGROUND_BUDGET, left)
   for region in pairs(instanceQueues) do
     local native = region.blizzardAuraDisplay
     local queue = native and native.instanceQueue
     if not queue or not native.active or native.data ~= queue.data then
+      -- ForeverAuras (dev.37 review): a stale or inactive attempt's ledger is
+      -- reconciled before the queue is forgotten.
+      ReconcileLedger(region, queue)
       instanceQueues[region] = nil
     elseif Restricted() and not queue.background then
       -- An editor rebuild waits for restrictions to end (Apply). The reserve
       -- of a display built in the background keeps growing in combat: its
       -- new containers hold no auras yet, and a nameplate display loaded
       -- during a fight needs them for the plates that appear in it.
+      ReconcileLedger(region, queue)
       native.instanceQueue, instanceQueues[region] = nil, nil
       pending[region] = queue.data
+      if MarkRequest then MarkRequest(region) end
     elseif debugprofilestop() > deadline then
       more = true
     else
       local last = queue.background and queue.total or math.min(queue.nextIndex + EDITOR_INSTANCES_PER_FRAME - 1, queue.total)
       local index = queue.nextIndex
+      -- ForeverAuras (combat-reload probe): a probe build that fails here
+      -- (a container not made, a button not styled, setup or finishing
+      -- failed) is stopped and set aside (AbandonProbeBuild); the other
+      -- displays in the queue go on.
+      local probeBuild = native.probeBuild
       while index <= last do
         local ok, instance = true, native.instances[index]
-        if not instance then ok, instance = pcall(Create, region, queue.data) end
+        local startedInstance = debugprofilestop()
+        -- ForeverAuras (dev.35/36 reviews): an ordinary build's attempt owns
+        -- what it makes: queue.owned takes the instances made here, and the
+        -- attempt ledger (queue.ledger, open for the whole attempt: creation,
+        -- setup of new and existing instances, finish) takes every frame
+        -- allocated meanwhile (NoteAllocation); reconciled by ReconcileLedger on exit.
+        if not probeBuild then
+          queue.owned = queue.owned or {}
+          queue.ledger = queue.ledger or {}
+          region.faAttemptAllocations = queue.ledger
+        end
+        if not instance then
+          ok, instance = pcall(Create, region, queue.data)
+          if ok and not probeBuild then queue.owned[instance] = true end
+        end
         if ok then
           native.instances[index] = instance
-          xpcall(ApplyInstance, geterrorhandler(), region, queue.data, index, instance)
+          local probe = instance.styleEarly
+          local okApply, complete = xpcall(ApplyInstance, geterrorhandler(), region, queue.data, index, instance)
+          -- ForeverAuras: a reserve instance built in the background is
+          -- named like a main build when it takes long (Display.Apply).
+          local tookInstance = debugprofilestop() - startedInstance
+          if tookInstance > 5 then CombatBuildReport(("%s reserve instance %d built in %.1f ms"):format(tostring(queue.data.id), index, tookInstance)) end
+          -- ForeverAuras (dev.34, reserve fix): a failed reserve of an
+          -- ORDINARY build (its buttons could not all be built or styled, or
+          -- its setup raised) is handled on its own: the instance is taken
+          -- out, quieted and its frames retained (never offered as a unit's
+          -- instance), the queue stops, and the display is set to be applied
+          -- again when restrictions end (or at once, paced, if they already
+          -- have). The healthy instances stay active. The probe-build path
+          -- below is unchanged (the whole build is its unit of failure).
+          if (not okApply or complete == false) and not probeBuild then
+            FailReserveAttempt(region, queue, {instance}, okApply and (instance.styleError or "a button could not be made or styled") or tostring(complete))
+            abandoned = true
+            break
+          elseif probe and (not okApply or complete == false) then
+            AbandonProbeBuild(region, queue.data, okApply and "a button could not be made or styled" or "setup failed")
+            if Display.HandOverStoppedBuild then Display.HandOverStoppedBuild(region) end   -- (1.2.0, Astra's audit 4)
+            abandoned = true
+            break
+          end
+        elseif probeBuild then
+          AbandonProbeBuild(region, queue.data, "container could not be made: " .. tostring(instance))
+          if Display.HandOverStoppedBuild then Display.HandOverStoppedBuild(region) end   -- (1.2.0, Astra's audit 4)
+          abandoned = true
+          break
         else
+          -- ForeverAuras (dev.34, reserve fix): a reserve container that
+          -- could not be made is a failure of this reserve, reported and
+          -- retried like a failed reserve instance, not the end of the queue
+          -- taken as done.
           geterrorhandler()(instance)
-          index = queue.total
+          FailReserveAttempt(region, queue, nil, "container could not be made: " .. tostring(instance))
+          abandoned = true
+          break
         end
         index = index + 1
         if queue.background and debugprofilestop() > deadline then break end
       end
+      -- The ledger stays on the queue between frames; the region-level hook is
+      -- closed whenever this pass leaves the queue (reopened by the next pass).
+      region.faAttemptAllocations = nil
+      if abandoned then
+        abandoned = false
+      else
       queue.nextIndex = index
       if index > queue.total then
         native.instanceQueue, instanceQueues[region] = nil, nil
-        if queue.background then FinishApply(region, queue.data) else RefreshUnits(region) end
+        if queue.background then
+          if probeBuild then
+            -- The same guarded finishing as the first pass (FinishProbeBuild);
+            -- a held chain pass keeps the ownership open (dev.47 review).
+            local okProbe, held = FinishProbeBuild(region, queue.data)
+            if okProbe and not held then region.faProbeAllocations, native.probeBuild = nil, nil end
+          else
+            -- ForeverAuras (dev.34-36 reviews): guarded and counted (FinishReserve),
+            -- with the attempt ledger open through the finish.
+            region.faAttemptAllocations = queue.ledger
+            FinishReserve(region, queue)
+            region.faAttemptAllocations = nil
+          end
+        else
+          -- ForeverAuras (dev.38 review, Astra's patch): the completed editor
+          -- queue is a terminal transition too: its attempt ledger is
+          -- reconciled before the units refresh.
+          ReconcileLedger(region, queue)
+          RefreshUnits(region)
+        end
       else
         more = true
       end
+      end
     end
   end
+  FrameBudgetSpend(debugprofilestop() - startedAt)
   if more and not instanceDraining then
     instanceDraining = true
     C_Timer.After(0, DrainInstanceQueues)
@@ -2173,8 +3762,9 @@ function Display.FlushInstanceQueue(region)
   local native = region.blizzardAuraDisplay
   local queue = native and native.instanceQueue
   if not queue or queue.background then return end
+  ReconcileLedger(region, queue)
   native.instanceQueue, instanceQueues[region] = nil, nil
-  if Restricted() then pending[region] = queue.data; return end
+  if Restricted() then pending[region] = queue.data; if MarkRequest then MarkRequest(region) end; return end
   if native.data ~= queue.data then return end
   for index = queue.nextIndex, queue.total do
     native.instances[index] = native.instances[index] or Create(region, queue.data)
@@ -2184,16 +3774,49 @@ end
 
 local ApplyDisplay
 function Display.Apply(region, data)
+  -- ForeverAuras (combat-reload probe): a build set aside is not tried
+  -- again before the restrictions end.
+  if WaitingForRetry(region) then retryAfterRestrictions[region] = data; return end
+  -- Frames of a stopped build still locked: the replacement waits too.
+  if abandonedFrames[region] and not CleanAbandoned(region) then retryAfterRestrictions[region] = data; return end
   if Display.ForgetAppearanceKey then Display.ForgetAppearanceKey(data) end
   local profile = Private.loadProfile
   if not profile or profile.done then
     Private.StartProfileSystem("aura (modern) - build")
-    ApplyDisplay(region, data)
+    -- ForeverAuras: with the build report on, a build over 5 ms is named,
+    -- so the one display behind a long frame can be found.
+    local startedBuild = debugprofilestop()
+    -- ForeverAuras (cell chain): an apply that raises (an unguarded write
+    -- in an ordinary build) is no longer being applied: the flag
+    -- RequestReapply reads is dropped before the error goes on to the
+    -- caller's handler with its message (which names where it happened;
+    -- the frames below this one are not in the handler's stack any more).
+    local okApply, errApply = pcall(ApplyDisplay, region, data)
+    if not okApply then
+      if region.blizzardAuraDisplay then region.blizzardAuraDisplay.applying = nil end
+      error(errApply, 0)
+    end
+    local tookBuild = debugprofilestop() - startedBuild
+    if tookBuild > 5 then
+      local native = region.blizzardAuraDisplay
+      -- (dev.81) a row member says whether its row's cells are on (the group opted in) and whether it is chained
+      local rowNote = ""
+      local group = Display.FlowGroup and Display.FlowGroup(data)
+      if group then
+        local cells = Display.FlowIndependentGroup and Display.FlowIndependentGroup(group)
+        rowNote = cells and (Display.FlowChain and Display.FlowChain(data) and "; cells on, chained" or "; cells on") or "; cells off"
+      end
+      CombatBuildReport(("%s built in %.1f ms (%d instances%s)"):format(tostring(data.id), tookBuild, native and #native.instances or 0, rowNote))
+    end
     Private.StopProfileSystem("aura (modern) - build")
     return
   end
   local started = debugprofilestop()
-  ApplyDisplay(region, data)
+  local okApply, errApply = pcall(ApplyDisplay, region, data) -- ForeverAuras (cell chain): as above
+  if not okApply then
+    if region.blizzardAuraDisplay then region.blizzardAuraDisplay.applying = nil end
+    error(errApply, 0)
+  end
   profile.modern[data.id] = (profile.modern[data.id] or 0) + debugprofilestop() - started
 end
 
@@ -2214,11 +3837,14 @@ function ApplyDisplay(region, data)
   else
     Display.HidePreview(region)
     Display.RestorePreviewRegion(region)
-    Display.RestoreGroupPreview(Display.FlowGroup(data))
+    -- ForeverAuras: as above, the group's box is arranged again, not restored.
+    local flowGroup = Display.FlowGroup(data)
+    if flowGroup and WeakAuras.IsOptionsOpen() then Display.ArrangeFlowPreview(flowGroup) else Display.RestoreGroupPreview(flowGroup) end
   end
   -- Built right after login, a few per frame, instead of during the loading screen.
   if not IsPreview() and not WeakAuras.IsLoginFinished() then
     pending[region] = data
+    if MarkRequest then MarkRequest(region) end
     return
   end
   -- ForeverAuras: only a display that already exists waits for restrictions
@@ -2230,7 +3856,23 @@ function ApplyDisplay(region, data)
   local existing = region.blizzardAuraDisplay
   if Restricted() and existing and #existing.instances > 0 then
     pending[region] = data
+    if MarkRequest then MarkRequest(region) end
     Warn(data, L["Display changes will apply when aura restrictions end."])
+    return
+  end
+  -- ForeverAuras: a first build under restrictions that arrives from a load
+  -- scan (an aura whose load conditions became true as the fight began) is
+  -- queued for the paced drain (DrainPending, a few milliseconds per frame)
+  -- instead of being built inside the scan's own frame. Seen in game: with
+  -- 48 extra displays the combat-start frame carried the load scan plus
+  -- 12 ms of Modern builds. The display appears a frame or two later.
+  if Restricted() and not (existing and #existing.instances > 0) and not drainingNow then
+    pending[region] = data
+    if MarkRequest then MarkRequest(region) end
+    if not draining then
+      draining = true
+      C_Timer.After(0, DrainPending)
+    end
     return
   end
   if not C_AddOns.IsAddOnLoaded("Blizzard_AuraContainer") then
@@ -2245,6 +3887,18 @@ function ApplyDisplay(region, data)
   -- ForeverAuras: the spell list this build reads (SecretAuraTrigger.lua,
   -- Display.ListSignature); a later publish compares against it.
   native.listSignature = Display.ListSignature and Display.ListSignature(data) or nil
+  -- ForeverAuras (combat-reload probe): a build that starts under
+  -- restrictions on an eligible display is a probe build for its whole
+  -- lifetime, its background reserve included, whatever combat does
+  -- meanwhile; its frames are noted from allocation (NoteAllocation) until
+  -- it finishes cleanly, when the list is dropped (both finishing paths).
+  -- A build starting while an earlier probe build's reserve is still going
+  -- drops that list: its frames are either kept by this build (live) or
+  -- retired by it; a failure of this build inventories the live instances
+  -- itself (RetainInstanceFrames).
+  region.faProbeAllocations = nil
+  native.probeBuild = (Restricted() and ProbeEligible(data)) or nil
+  if native.probeBuild then region.faProbeAllocations = {} end
   if not native.hooksInstalled then
     native.hooksInstalled = true
     TimedHookScript(region, "OnHide", function()
@@ -2261,7 +3915,56 @@ function ApplyDisplay(region, data)
       if native.active then RefreshUnits(region); SyncSounds(region) end
     end)
   end
+  -- ForeverAuras (dev.35 review): the record of refused reserves belongs
+  -- to a settings epoch (counted by Display.Modify); another epoch starts
+  -- afresh. Activation and layout do not change the epoch.
+  if native.reserveFailure and native.reserveFailure.epoch ~= (native.settingsEpoch or 0) then native.reserveFailure = nil end
+  -- ForeverAuras (cell chain): the chain's re-apply record belongs to an epoch too.
+  if native.reapplyRequests and native.reapplyRequests.epoch ~= (native.settingsEpoch or 0) then native.reapplyRequests = nil end
   native.data = data
+  -- ForeverAuras (cell chain): measured again by the first link of this
+  -- apply; this apply's refusals and records past the batch are counted
+  -- afresh (every record is styled again below). The display counts as
+  -- being applied (RequestReapply) until it is active.
+  native.chainCalib, native.chainFailure, native.chainOverflow = nil, nil, nil
+  -- ForeverAuras (dev.70; dev.74 wording): the optional combat fallback
+  -- ("/fa cells fallback on", off by default): a chained display applied
+  -- under aura restrictions is built as its ordinary construction (one
+  -- spot, the release's gates: FlowChain reads native.chainDeferred and
+  -- answers "deferred"), kept active, and built again as chained when the
+  -- restrictions end. The packed construction itself IS built in combat
+  -- (dev.72, Dan's combat reload: the spine and every connection are written
+  -- before any record is bound, the cells from the last back to the first,
+  -- the row from its last member back); this is a chosen one-spot mode, not
+  -- a necessity.
+  native.chainDeferred = nil
+  if Restricted() and type(ForeverAurasSaved) == "table" and ForeverAurasSaved.rowCellsFallback and Display.FlowChain and Display.FlowChain(data) then
+    native.chainDeferred = true
+    chainDeferredRetry[region] = data
+  end
+  -- ForeverAuras (cell chain, dev.46 review): an unrestricted build stages
+  -- its cells quiet; FinishApply asks the row to take the end and the chain
+  -- pass reveals them (CommitChain). A probe build (in combat) shows them
+  -- inline, where its records are still writable; its placement is verified
+  -- the same way and a refusal counts with the build's failures.
+  native.chainQuiet = (not native.probeBuild and Display.FlowChain and Display.FlowChain(data)) and {refused = 0} or nil
+  native.chainCommitPending, native.chainCommitResult = nil, nil
+  -- ForeverAuras (cell chain, dev.49 review): this build fulfils or
+  -- supersedes any request queued before it (the drain took its own; a
+  -- direct Modify builds the saved table a queued request asked for);
+  -- FinishApply acknowledges no request made after this point.
+  pending[region] = nil
+  if MarkRequest then native.buildStamp = requestStamp[region] or 0 end
+  -- A probe build still waiting for its held chain pass is replaced by this
+  -- apply: its open accounting closes with it (dev.47 review).
+  if native.probeHeld then
+    native.probeHeld = nil
+    for _, instance in ipairs(native.instances) do instance.finishing, instance.finishFailed = nil, nil end
+  end
+  native.applying = true
+  -- ForeverAuras (dev.31 diagnostics): the build history, recorded at the
+  -- event itself with the editor/combat/secret state of that moment.
+  if Display.NoteCarrierEvent then Display.NoteCarrierEvent(region, "apply", IsPreview() and "preview" or "live") end
   -- A Modern Aura Group child draws from its start frame (SecretAuraFlow.lua).
   Display.EnsureFlowStart(region, data)
   -- The samples were styled above; RefreshPreview keeps them.
@@ -2274,9 +3977,26 @@ function ApplyDisplay(region, data)
   -- or a gated display (a group): the slot or group is fixed at creation.
   local wantsFlow = Display.FlowGroup(data) ~= nil
   local first = native.instances[1]
-  if first and (first.flowContainer ~= wantsFlow
-    or (first.slotMain ~= nil and first.slotMain ~= WantsSlot(data, wantsFlow, first.container))) then
+  -- ForeverAuras: also when a button the client added under restrictions
+  -- could not be built (Create): only new containers get new, buildable
+  -- buttons. Never under restrictions (Apply waits for them to end).
+  local fresh = native.rebuildFresh and not Restricted()
+  if fresh then native.rebuildFresh = nil end
+  -- ForeverAuras (independent carriers): joining or leaving the experiment
+  -- changes how every button is built (its box), so the containers are
+  -- made again, as for a slot/group change.
+  local wantsIndependent = wantsFlow and Display.FlowIndependent ~= nil and Display.FlowIndependent(data) or false
+  -- ForeverAuras (cell chain): joining or leaving the chain changes the
+  -- buttons' construction (box) too.
+  local wantsChained = wantsFlow and Display.FlowChain ~= nil and Display.FlowChain(data) ~= nil or false
+  if first and (fresh or first.flowContainer ~= wantsFlow
+    or (first.slotMain ~= nil and first.slotMain ~= WantsSlot(data, wantsFlow, first.container))
+    or (first.independent or false) ~= wantsIndependent
+    or (first.chained or false) ~= wantsChained) then
+    -- (dev.91) said with "/fa cells debug on": the containers made new, and why
+    if wantsChained then CombatBuildReport(("%s: containers made new (%s)"):format(tostring(data.id), fresh and "a fresh rebuild was asked" or first.flowContainer ~= wantsFlow and "row membership changed" or (first.chained or false) ~= wantsChained and "chain mode changed" or "mode changed")) end
     for _, instance in ipairs(native.instances) do
+      RetireInstanceGlowBindings(region, instance)
       instance.container:SetEnabled(false)
       instance.container:Hide()
       Display.RefreshSingle(instance, nil, false)
@@ -2285,9 +4005,39 @@ function ApplyDisplay(region, data)
       -- whenever its parent, strata or level is set.
       Display.RetireFrame(instance.container)
       if instance.flowShadow then Display.RetireFrame(instance.flowShadow) end
+      if instance.flowMeasure then Display.RetireFrame(instance.flowMeasure) end
       if instance.unitGlow then Display.RetireFrame(instance.unitGlow.container) end
+      -- ForeverAuras (combat-reload probe): a discarded instance needs no alpha repair.
+      if Display.CancelPendingListAlpha then Display.CancelPendingListAlpha(instance) end
     end
     native.instances = {}
+    -- ForeverAuras (cell chain): the retired frames are hidden; nothing of an
+    -- old construction can stay drawn (chainReserve, chainBuilt; SetFlowEnd).
+    native.chainReserve, native.chainBuilt = nil, nil
+    -- ForeverAuras (dev.68): the spine of the retired construction is let go with it.
+    if Display.ReleaseChainSpine then Display.ReleaseChainSpine(native) end
+  end
+  -- ForeverAuras (dev.67/68): a chained display's calibration and spine are
+  -- made HERE, outside the client's record callbacks (SecretAuraChain.lua,
+  -- PrepareChain): the hypothesis this build tests is that under aura
+  -- restrictions a frame made inside a record's callback is locked with that
+  -- record afterwards, whatever its parent (Dan's combat reloads: "holder to
+  -- the previous cell: Attempt to access forbidden object" from record 6 on,
+  -- with the spans under the button and under the region alike). The
+  -- preparation is part of the build's contract (Astra's dev.67 review): a
+  -- probe build that cannot prepare is stopped and set aside like one whose
+  -- container could not be made; an ordinary build records the refusal as a
+  -- chain failure (one spot, explained, the bounded repair) and goes on - its
+  -- links then fail "not prepared" without allocating anything in a callback.
+  if Display.PrepareChain then
+    local prepared, why = Display.PrepareChain(region, data, native)
+    if not prepared then
+      if native.probeBuild then
+        AbandonProbeBuild(region, data, "the row cells could not be prepared: " .. tostring(why))
+        return
+      end
+      Display.NoteChainFailure(region, nil, "link", why)
+    end
   end
   -- Reserve containers before combat; roster and plate events only rebind existing ones.
   local trigger = Display.GetTrigger(data)
@@ -2303,21 +4053,71 @@ function ApplyDisplay(region, data)
   -- be read: container creation, per-instance styling, the finishing pass.
   Private.StartProfileSystem("aura (modern) - build: create")
   for index = 1, now do
-    if not native.instances[index] then native.instances[index] = Create(region, data) end
+    if not native.instances[index] then
+      if native.probeBuild then
+        local ok, created = pcall(Create, region, data)
+        if not ok then
+          Private.StopProfileSystem("aura (modern) - build: create")
+          AbandonProbeBuild(region, data, "container could not be made: " .. tostring(created))
+          return
+        end
+        native.instances[index] = created
+      else
+        native.instances[index] = Create(region, data)
+      end
+    end
   end
   Private.StopProfileSystem("aura (modern) - build: create")
   Display.ClearSingleWarning(data)
+  -- ForeverAuras (dev.37 review): a queue replaced by this apply has its
+  -- attempt ledger reconciled first (unattached leftovers retained).
+  if ReconcileLedger then ReconcileLedger(region, native.instanceQueue) end
   native.instanceQueue, instanceQueues[region] = nil, nil
-  if now < total then
-    native.instanceQueue = {data = data, nextIndex = now + 1, total = total, background = background}
+  -- ForeverAuras (dev.35 review): a display whose reserve was refused
+  -- repeatedly for these settings builds no further reserve (ReserveStopped);
+  -- its working instances are kept. New settings reopen it (Modify).
+  if now < total and not (ReserveStopped and ReserveStopped(native)) then
+    native.instanceQueue = {data = data, nextIndex = now + 1, total = total, background = background, owned = {}, ledger = {}}
     instanceQueues[region] = true
   end
-  for index = 1, now do ApplyInstance(region, data, index, native.instances[index]) end
+  -- ForeverAuras (combat-reload probe): a probe build whose buttons could
+  -- not all be made and styled, or whose setup failed, is stopped here and
+  -- built again when the restrictions end (AbandonProbeBuild), not left
+  -- half styled nor counted as finished.
+  for index = 1, now do
+    local instance = native.instances[index]
+    if instance.styleEarly then
+      local ok, complete = pcall(ApplyInstance, region, data, index, instance)
+      if not ok or complete == false then
+        AbandonProbeBuild(region, data, ok and "a button could not be made or styled" or ("setup failed: " .. tostring(complete)))
+        return
+      end
+    else
+      ApplyInstance(region, data, index, instance)
+    end
+  end
   native.active = true
+  native.applying = nil -- ForeverAuras (cell chain): applied; RequestReapply goes by active from here
   native.appliedTrigger = Display.GetSavedTrigger(data)
   activeRegions[region] = true
   Private.StartProfileSystem("aura (modern) - build: finish")
-  FinishApply(region, data)
+  if native.probeBuild then
+    local okProbe, held = FinishProbeBuild(region, data)
+    if not okProbe then
+      Private.StopProfileSystem("aura (modern) - build: finish")
+      return
+    end
+    -- Built: the frames belong to the live display now, unless a reserve is
+    -- still being built in the background (dropped when that finishes) or
+    -- the chain pass that verifies the display's place is held by a batch
+    -- (decided by SettleProbeCommit; dev.47 review).
+    if not native.instanceQueue and not held then region.faProbeAllocations, native.probeBuild = nil, nil end
+  else
+    FinishApply(region, data)
+  end
+  -- ForeverAuras: a finished build is not tried again (a retry noted by an
+  -- earlier stopped build would have rebuilt it once more).
+  retryAfterRestrictions[region] = nil
   Private.StopProfileSystem("aura (modern) - build: finish")
   if native.instanceQueue and not instanceDraining then
     instanceDraining = true
@@ -2350,9 +4150,33 @@ end
 
 function Display.Activate(region, data)
   if not Display.Enabled(data) then Display.Release(region); return end
+  if WaitingForRetry(region) then retryAfterRestrictions[region] = data; return end
   Install(region)
   local native = region.blizzardAuraDisplay
-  if native and native.data == data and not pending[region] and Display.Validate(data) == nil
+  -- ForeverAuras: a display holding a button it could not build (Create,
+  -- rebuildFresh) is not switched back on as it is; Apply makes it new.
+  -- ForeverAuras (cell chain, dev.43 review): a pending entry that is the
+  -- chain's own queued repair of these settings does not force a build now;
+  -- the display is reused quiet and the one budgeted job stays queued.
+  local ownRepair = native and native.data == data and pending[region] == data and native.reapplyRequests ~= nil and native.reapplyRequests.pending == true
+  -- ForeverAuras (dev.72, Astra's dev.70 review): a construction built as one
+  -- spot under restrictions (the combat fallback) keeps the intent to be
+  -- packed when it is shown again: under restrictions the restriction-end
+  -- request is restored, otherwise the repack is queued (the kept instance
+  -- shows meanwhile).
+  local repack = false
+  if native and native.chainDeferred and native.data == data then
+    if Restricted() then chainDeferredRetry[region] = data
+    else
+      if not pending[region] then
+        pending[region] = data
+        if MarkRequest then MarkRequest(region) end
+        if not draining then draining = true; C_Timer.After(0, DrainPending) end
+      end
+      repack = pending[region] == data   -- the kept one-spot instance is reused meanwhile
+    end
+  end
+  if native and native.data == data and (not pending[region] or ownRepair or repack) and not native.rebuildFresh and Display.Validate(data) == nil
     and #native.instances >= Capacity(Display.GetTrigger(data), data) then
     Display.FlushInstanceQueue(region)
     -- Reloading an existing display must restore its learning subscription too.
@@ -2361,6 +4185,35 @@ function Display.Activate(region, data)
     native.unitGlowsHidden = false
     native.active = true
     activeRegions[region] = true
+    -- ForeverAuras (cell chain, dev.41/42 reviews): a display whose chain is
+    -- incomplete (a refused link or end, chainFailure) is switched on as it
+    -- is (quiet, one spot) and its bounded PACED repair is asked for again
+    -- (RequestReapply: the paced drain, counted per job, within the epoch's
+    -- allowance; the unload dropped the earlier job's latch). A stopped one
+    -- is reused as it is, with its explanation published again (Release
+    -- cleared it). Nothing is built in this frame.
+    if native.chainFailure then
+      if Display.ReapplyStopped and Display.ReapplyStopped(native) then
+        if Display.PublishChainWarnings then Display.PublishChainWarnings(region, data) end
+      elseif Display.RequestReapply then
+        Display.RequestReapply(region, native.chainFailure.what)
+      end
+    elseif native.chainQuiet and native.instances[1] and native.instances[1].chained then
+      -- ForeverAuras (cell chain, dev.47 review): a healthy construction
+      -- staged quiet whose commit the unload cancelled while a batch held
+      -- it (Release): the same prepared frames ask this chain pass to take
+      -- them again (CommitChain reveals them once the row has verifiably
+      -- taken the end; held, they stay quiet and pending until the flush).
+      -- The current instance, not the cancelled request's; the epoch's
+      -- repair allowance is untouched (no refusal happened). A quiet display
+      -- without a prepared end has nothing to commit: its bounded repair is
+      -- asked for, as for a refused end.
+      if native.flow and native.flow.chainEndReady then
+        native.chainCommitPending, native.chainCommitResult = {instance = native.instances[1]}, nil
+      elseif Display.RequestReapply and not (Display.ReapplyStopped and Display.ReapplyStopped(native)) then
+        Display.RequestReapply(region, L["the member's end (%s)"]:format("the end is not in place"))
+      end
+    end
     Display.RechainFlow(Display.FlowGroup(data))
     RefreshUnits(region)
     SyncSounds(region)
@@ -2426,9 +4279,78 @@ function Display.CancelEditorApply(region)
   editorQueue[region] = nil
 end
 
+-- ForeverAuras: a Remaining Time window on an Icon shows one aura, the first
+-- the client picks by the sort order, and the window only opens and closes
+-- over that one (the client cannot filter by remaining time). With no spell
+-- selected it is whatever sorts first among all matching auras, usually not
+-- the one meant (seen in game: all player buffs with 55 s or less showed
+-- nothing, the slot holding an hour-long buff). Other filters can narrow
+-- the display to one aura without a spell list, so this warns, not forbids.
+local function RemainingSelectionProblem(data)
+  local trigger = Display.GetSavedTrigger(data)
+  if not trigger or data.regionType ~= "icon" or not Display.Enabled(data) then return end
+  if not Display.RemainingWindow(trigger) or Display.ShowOn(trigger) ~= "showOnActive" then return end
+  if #Display.GetSpellIDs(trigger, true) > 0 then return end
+  return L["Remaining Time shows one aura: the first that matches the trigger, and the time window applies to that one only. Select the spell(s) in the trigger so the window applies to the aura you mean."]
+end
+
 function Display.Modify(region, data)
+  -- ForeverAuras (dev.35 review): a settings change is a new epoch for the
+  -- display's refused-reserve record (FailReserveAttempt, ReserveStopped).
+  local native = region and region.blizzardAuraDisplay
+  if native then native.settingsEpoch = (native.settingsEpoch or 0) + 1 end
+  -- ForeverAuras: a member's settings change is a new attempt for a Grid
+  -- whose build the client refused (SecretAuraGrid.lua, GridSettingsChanged);
+  -- visibility and condition changes do not come through here.
+  -- Only a display that can take part in the Grid (a Modern trigger the
+  -- Grid accepts) reopens it; an ordinary display or clone made in the same
+  -- group does not (dev.9 review). A runtime trigger change
+  -- (SyncProgressSource) comes through here too and may legitimately reopen it.
+  -- A display that took part in the stopped attempt counts too, whatever it
+  -- is now (editing the failing member out of the Grid frees the rest).
+  if Display.GridSettingsChanged then
+    local group = Display.FlowGroup(data)
+    if group then
+      local eligible = Display.Enabled(data) and not (Display.GridProblem and Display.GridProblem(data))
+      if eligible or (Display.GridMemberAttempted and Display.GridMemberAttempted(group.id, data.id)) then
+        Display.GridSettingsChanged(group.id)
+      end
+    end
+  end
   local flowProblem = Display.FlowNormalProblem(data)
   Private.AuraWarnings.UpdateWarning(data.uid, "blizzard_aura_flow_member", flowProblem and "warning" or nil, flowProblem)
+  local selectionProblem = RemainingSelectionProblem(data)
+  Private.AuraWarnings.UpdateWarning(data.uid, "blizzard_aura_remaining_selection", selectionProblem and "warning" or nil, selectionProblem)
+  local afterGate = Display.FlowAfterGateProblem and Display.FlowAfterGateProblem(data)
+  Private.AuraWarnings.UpdateWarning(data.uid, "blizzard_aura_flow_after_gate", afterGate and "warning" or nil, afterGate)
+  -- ForeverAuras: the order of a Modern Aura Group decides that warning for
+  -- every member, and reordering changes the group, not the members: their
+  -- warnings are refreshed here (rc.29 review: a warning stayed after the
+  -- member was moved before the filtered one).
+  -- A member's own filters decide the warning for the other members too (a
+  -- second gated member of the row), so when a member's filters start or stop
+  -- gating it, its row's members are refreshed as well (not on every rebuild:
+  -- a large pack's load would check every member for every member).
+  local warnGroup = (data.regionType == "group" and data.blizzardFlow) and data or nil
+  if not warnGroup and Display.FlowGated then
+    local gated = Display.FlowGated(data)
+    if region.flowGatedWarned ~= nil and region.flowGatedWarned ~= gated then warnGroup = Display.FlowGroup(data) end
+    region.flowGatedWarned = gated
+  end
+  if warnGroup and Display.FlowAfterGateProblem then
+    for _, childID in ipairs(warnGroup.controlledChildren or {}) do
+      local child = childID ~= data.id and WeakAuras.GetData(childID)
+      if child then
+        local childProblem = Display.FlowAfterGateProblem(child)
+        Private.AuraWarnings.UpdateWarning(child.uid, "blizzard_aura_flow_after_gate", childProblem and "warning" or nil, childProblem)
+      end
+    end
+  end
+  -- ForeverAuras: a refused windowed countdown (SecretAuraAppearance.lua,
+  -- BindText) is reported again by the build that follows, if it is still
+  -- refused; a display whose Remaining Time filter was removed drops it here
+  -- (rc.19 review).
+  Private.AuraWarnings.UpdateWarning(data.uid, "blizzard_aura_countdown", nil)
   local trigger = Display.GetTrigger(data)
   local key = trigger and (data.progressSource and data.progressSource[1] or -1) or 0
   if key < 0 then key = (data.triggers.activeTriggerMode and data.triggers.activeTriggerMode > 0 and data.triggers.activeTriggerMode)
@@ -2549,7 +4471,8 @@ statusEvents:SetScript("OnEvent", function(_, event, unit)
     local native = region.blizzardAuraDisplay
     -- Read only: the saved trigger, without the copy GetTrigger may make.
     local trigger = Display.GetSavedTrigger(native.data)
-    if trigger and (trigger.ignoreDead or trigger.ignoreDisconnected or trigger.ignoreInvisible) then
+    -- ForeverAuras: hidden displays skip this too (see the event dispatch).
+    if region:IsShown() and trigger and (trigger.ignoreDead or trigger.ignoreDisconnected or trigger.ignoreInvisible) then
       -- ForeverAuras: a grid member draws in the grid's container, not its own.
       if native.gridMember and Display.RefreshGridStatus then Display.RefreshGridStatus(region, unit) end
       local single = #native.instances == 1
@@ -2572,40 +4495,156 @@ end)
 -- The budget covers only the Lua side; each rebuild also costs the client
 -- drawing time afterwards, so it is kept small.
 local PENDING_BUDGET = 4
-local draining = false
-local function DrainPending()
+draining = false
+-- ForeverAuras: Modern Aura Groups whose Grid must be built or rebuilt once
+-- restrictions allow it (SecretAuraGrid.lua, RebuildGrid), by id. Drained by
+-- DrainPending with the displays, under the same frame budget, one group per
+-- job and each job on its own error boundary; a request is taken from the
+-- set only when its job runs, and the group's data is looked up then, so a
+-- group deleted, replaced or turned back into a row meanwhile is not rebuilt
+-- from stale data. Started by the restriction-end handler (combat end, or
+-- aura restrictions ending on their own), never inside the event itself.
+local gridPending = {}
+-- ForeverAuras: true while DrainPending applies its batch (see ApplyDisplay).
+drainingNow = false
+DrainPending = function()
   -- Before login completes, the login callback starts the drain.
-  -- ForeverAuras: the whole queue waits for restrictions to end, first
-  -- builds included. Drained under restrictions (1.1.0-dev.6, a reload in
-  -- combat), the reserve builder's styling of a new container's buttons
-  -- failed (SetSize in StyleAppearance: "Attempt to access forbidden
-  -- object"), and the builder counted the instance as built regardless. The
-  -- client calls initializeFrame before it restricts a button, and the
-  -- styling runs after, so this is an initialisation-order question, not
-  -- proof that a first build can never be styled in combat; it is not yet
-  -- known whether the failing instances were new or previously allocated.
-  -- Both points are open: until they are settled, nothing is built here
-  -- under restrictions.
-  if Restricted() or not WeakAuras.IsLoginFinished() then draining = false; return end
+  if not WeakAuras.IsLoginFinished() then draining = false; return end
+  -- ForeverAuras (combat-reload probe): under restrictions (a reload in
+  -- combat) only a display that already has buttons waits, as Apply itself
+  -- decides; a first build goes ahead, its buttons styled in the client's
+  -- initializeFrame call before they are restricted (Create). A build that
+  -- still fails is queued again (DrainInstanceQueues) and waits.
+  local restricted = Restricted()
   local started = debugprofilestop()
+  -- The frame's shared budget (FrameBudgetLeft): none left, the next frame.
+  local budget = math.min(PENDING_BUDGET, FrameBudgetLeft())
+  if budget <= 0 then C_Timer.After(0, DrainPending); return end
   -- Modern Aura Groups re-anchor once per group after this batch, not once
   -- per rebuilt display (the same batching a load scan uses).
   if Display.BeginFlowLoad then Display.BeginFlowLoad() end
-  for region, data in pairs(pending) do
-    pending[region] = nil
-    if WeakAuras.GetData(data.id) == data and Private.regions[data.id] and Private.regions[data.id].region == region then
-      xpcall(Display.Apply, geterrorhandler(), region, data)
-      if debugprofilestop() - started > PENDING_BUDGET then break end
+  -- ForeverAuras: builds applied from here are not queued again (ApplyDisplay).
+  drainingNow = true
+  -- ForeverAuras (dev.70): under restrictions a chained member is built only
+  -- after the NEXT chained member of its row is whole (every record made):
+  -- a member's frames all hang from the previous member's end, which the
+  -- client guards once that member's records are bound, so the row is built
+  -- from its last member back to its first (ChainOrderWaits). A member
+  -- waited for too long (a build that never completes) is built anyway and
+  -- takes the ordinary refusal path.
+  local function ChainOrderWaits(region, data)
+    if not (restricted and Display.ChainOrderBlocker) then return false end
+    -- (dev.72, Astra's dev.70 review) counted off the display's native state: a
+    -- fresh combat load has none yet, and the order must hold there most of all;
+    -- the count is per queued request (cleared when the wait ends)
+    local waited = (chainOrderWaits[region] or 0)
+    if waited >= 180 then chainOrderWaits[region] = nil; return false end
+    local blocker = Display.ChainOrderBlocker(region, data, pending)
+    if blocker then
+      chainOrderWaits[region] = waited + 1
+      if waited == 0 then CombatBuildReport(("%s waits for %s (built from the row's last member back)"):format(tostring(data.id), tostring(blocker))) end
+      return true
+    end
+    if Display.FlowChain and Display.FlowChain(data) then CombatBuildReport(("%s builds now (no member after it is queued, no chained one incomplete; waited %d frame(s))"):format(tostring(data.id), waited)) end
+    chainOrderWaits[region] = nil
+    return false
+  end
+  -- ForeverAuras (dev.74, Astra's dev.72 review): the queue is walked from
+  -- where the last frame's walk stopped, not from its head: when the waiting
+  -- members at the head use up the frame's budget on their order scans, the
+  -- ready ones behind them are still reached on the next frames (a snapshot
+  -- of the queue; every entry is checked against the live queue and the
+  -- current data before it is built, as before).
+  local queue, count = {}, 0
+  for region, data in pairs(pending) do count = count + 1; queue[count] = region end
+  -- (dev.79, Astra's dev.77 review: the cursor advanced inside the walk AND
+  -- indexed by the step, a stride of two that starved every other entry)
+  local base, visited = drainCursor, 0
+  for step = 1, count do
+    local region = queue[((base + step - 1) % count) + 1]
+    local data = pending[region]
+    visited = step
+    if data then
+      local existing = region.blizzardAuraDisplay
+      -- (dev.72) the order scans are charged to the budget as the builds are;
+      -- an entry the budget stops before its scan is the next frame's first
+      if debugprofilestop() - started > budget then visited = step - 1; break end
+      visited = step
+      if not (restricted and (not ProbeEligible(data) or (existing and #existing.instances > 0))) and not ChainOrderWaits(region, data) then
+        pending[region] = nil
+        if WeakAuras.GetData(data.id) == data and Private.regions[data.id] and Private.regions[data.id].region == region then
+          xpcall(Display.Apply, geterrorhandler(), region, data)
+          if debugprofilestop() - started > budget then break end
+        end
+      end
     end
   end
+  drainCursor = count > 0 and ((base + visited) % count) or 0
+  drainingNow = false
+  -- ForeverAuras: the groups' re-chains run here, so they are charged to the
+  -- frame's budget with the builds (rc.50 review: charged before them, the
+  -- reserve drain could start more work in a frame already past its budget).
   if Display.EndFlowLoad then Display.EndFlowLoad() end
+  -- ForeverAuras: Grid rebuilds set aside under restrictions, one group per
+  -- job within the same budget (dev.4 review: they ran all at once inside
+  -- the combat-end event, and one error there lost the rest). After the
+  -- displays' batch is closed, so each job's rechain runs and is measured
+  -- here, not merely queued for the batch flush (dev.5 review).
+  -- While an outer hold is open (the editor's batched pick, OptionsFrame),
+  -- a rechain would only join that batch and be flushed with every other
+  -- one at once, outside this measured sequence: the requests wait for the
+  -- hold to end, which restarts the drain (SecretAuraFlow.lua, EndFlowLoad).
+  local held = Display.FlowLoadHeld and Display.FlowLoadHeld()
+  if not restricted and not held then
+    for id in pairs(gridPending) do
+      if debugprofilestop() - started > budget then break end
+      gridPending[id] = nil
+      local data = WeakAuras.GetData(id)
+      if data and Display.FlowGrid(data) and Private.regions[id] then
+        xpcall(Display.RechainFlow, geterrorhandler(), data)
+      end
+    end
+  end
+  FrameBudgetSpend(debugprofilestop() - started)
   local profile = Private.loadProfile
   if profile and profile.done and not profile.deferredDone then
     profile.deferred = (profile.deferred or 0) + debugprofilestop() - started
     profile.deferredFrames = (profile.deferredFrames or 0) + 1
     if not next(pending) then profile.deferredDone = true end
   end
-  if next(pending) then C_Timer.After(0, DrainPending) else draining = false end
+  -- Only waiting displays left under restrictions: the restriction-end
+  -- handler restarts the drain, rather than polling every frame.
+  local again = false
+  for region, data in pairs(pending) do
+    local existing = region.blizzardAuraDisplay
+    if not (restricted and (not ProbeEligible(data) or (existing and #existing.instances > 0))) then again = true; break end
+  end
+  if not restricted and not held and next(gridPending) then again = true end
+  if again then C_Timer.After(0, DrainPending) else draining = false end
+end
+-- ForeverAuras: called when an outer flow hold ends (EndFlowLoad): Grid
+-- rebuilds that waited for it are drained from the next frame on.
+function Display.ResumeGridDrain()
+  if next(gridPending) and not draining and WeakAuras.IsLoginFinished() and not Restricted() then
+    draining = true
+    C_Timer.After(0, DrainPending)
+  end
+end
+
+-- ForeverAuras: asks for a group's Grid to be rebuilt by the paced drain once
+-- restrictions allow it (SecretAuraGrid.lua). Out of restrictions the drain
+-- starts on the next frame; under them, the restriction-end handler starts it.
+function Display.QueueGridRebuild(id)
+  if not id then return end
+  gridPending[id] = true
+  if not draining and WeakAuras.IsLoginFinished() and not Restricted() then
+    draining = true
+    C_Timer.After(0, DrainPending)
+  end
+end
+-- Drops a group's queued Grid rebuild (the group was deleted or turned into a row).
+function Display.CancelGridRebuild(id)
+  if id then gridPending[id] = nil end
 end
 
 Private.callbacks:RegisterCallback("WEAKAURAS_LOGIN_COMPLETE", function()
@@ -2617,7 +4656,7 @@ end)
 
 events:SetScript("OnEvent", function(_, event, unit)
   if event == "UI_SCALE_CHANGED" or event == "DISPLAY_SIZE_CHANGED" then
-    for region in pairs(activeRegions) do pending[region] = region.blizzardAuraDisplay.data end
+    for region in pairs(activeRegions) do pending[region] = region.blizzardAuraDisplay.data; if MarkRequest then MarkRequest(region) end end
     if not draining then
       draining = true
       DrainPending()
@@ -2632,7 +4671,14 @@ events:SetScript("OnEvent", function(_, event, unit)
   for region in pairs(activeRegions) do
     local trigger = Display.GetSavedTrigger(region.blizzardAuraDisplay.data)
     local mode = trigger and trigger.unit
-    if event == "UNIT_FACTION" then
+    -- ForeverAuras: a hidden display (unloaded, or prepared ahead of its
+    -- first load, PrewarmRegions) does no unit work on events; its OnShow
+    -- refreshes its units and sounds when it is shown again (rc.50 review:
+    -- hidden target displays rebound on every target change).
+    if not region:IsShown() then
+      -- nothing
+      if event == "PLAYER_TARGET_CHANGED" and mode == "target" then CombatBuildReport(("%s: target changed, display hidden (no unit work)"):format(tostring(region.id))) end
+    elseif event == "UNIT_FACTION" then
       -- A plate's side changed (PvP flag, mind control): re-check its hostility.
       if mode == "nameplate" then
         if type(unit) == "string" and not issecretvalue(unit) and unit:match("^nameplate%d+$") and Display.UsesHostility(trigger) then
@@ -2652,10 +4698,15 @@ events:SetScript("OnEvent", function(_, event, unit)
       end
     elseif pending[region] and not Restricted() then
       -- Rebuilt below; refreshing it first would be wasted.
+      -- ForeverAuras 1.2.1 (Dan's stale target countdown, Astra's trace): said under /fa cells debug
+      if event == "PLAYER_TARGET_CHANGED" and mode == "target" then CombatBuildReport(("%s: target changed, a rebuild is pending (no refresh now)"):format(tostring(region.id))) end
     elseif NeedsUnitRefresh(mode, event, unit, trigger) then
+      if event == "PLAYER_TARGET_CHANGED" and mode == "target" then CombatBuildReport(("%s: target changed, refreshing its units (restricted %s)"):format(tostring(region.id), tostring(Restricted()))) end
       RefreshUnits(region, nil, nil, true)
     end
-    if trigger and (event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ROLES_ASSIGNED"
+    if not region:IsShown() then
+      -- As above.
+    elseif trigger and (event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ROLES_ASSIGNED"
       or (event == "UNIT_NAME_UPDATE" and (trigger.useUnitNames or trigger.useUnitClass))) and unitEvents.GROUP_ROSTER_UPDATE[mode] then
       SyncSounds(region)
     elseif trigger and Display.UsesUnitEligibility(trigger)
@@ -2686,9 +4737,47 @@ events:SetScript("OnEvent", function(_, event, unit)
     lockedUnits[region] = nil
     if region.blizzardAuraDisplay and region.blizzardAuraDisplay.active then RefreshUnits(region, nil, nil, true) end
   end
-  if next(pending) and not draining then
+  -- ForeverAuras (dev.95): retained containers that could not be quieted when the editor closed
+  if Display.QuietRetainedLater then Display.QuietRetainedLater() end
+  -- ForeverAuras (combat-reload probe): list alphas a build in combat
+  -- could not set (SecretAuraSingle.lua, ApplyPendingListAlpha).
+  if Display.ApplyPendingListAlpha then Display.ApplyPendingListAlpha() end
+  -- ForeverAuras (combat-reload probe): a display whose aura slot buttons
+  -- refused their layout during a build in combat (SecretAuraSingle.lua,
+  -- SlotWrite) is applied again now that they can be reached; only the
+  -- displays noted there are visited.
+  for _, region in ipairs((Display.TakePendingRelayout and Display.TakePendingRelayout()) or {}) do
+    local native = region.blizzardAuraDisplay
+    -- ForeverAuras (dev.72): a display whose build was set aside (a retry
+    -- waiting for its abandoned frames to be cleaned) is not queued by a
+    -- relayout: the retry below rebuilds it, with the current settings, once
+    -- those frames are released
+    if native and native.data and activeRegions[region] and not pending[region] and not retryAfterRestrictions[region] and not abandonedFrames[region] then pending[region] = native.data; if MarkRequest then MarkRequest(region) end end
+  end
+  -- ForeverAuras (combat-reload probe): the builds set aside are tried
+  -- again, as new, their leftover frames cleaned first.
+  for region in pairs(abandonedFrames) do CleanAbandoned(region) end
+  for region, data in pairs(retryAfterRestrictions) do
+    if not abandonedFrames[region] then
+      retryAfterRestrictions[region] = nil
+      if WeakAuras.GetData(data.id) == data then pending[region] = data; if MarkRequest then MarkRequest(region) end end
+    end
+  end
+  -- ForeverAuras (dev.70): chained displays built as one spot under the restrictions are built again, chained.
+  for region, data in pairs(chainDeferredRetry) do
+    chainDeferredRetry[region] = nil
+    local current = WeakAuras.GetData(data.id)
+    if current and Private.regions[data.id] and Private.regions[data.id].region == region and not pending[region] then
+      pending[region] = current; if MarkRequest then MarkRequest(region) end
+    end
+  end
+  -- ForeverAuras: drained from the next frame on, not inside this handler:
+  -- the restriction-end event already carries the game's own work and the
+  -- condition refresh above (seen in game: a 19 ms frame with the queued
+  -- rebuilds applied here).
+  if (next(pending) or next(gridPending)) and not draining then
     draining = true
-    DrainPending()
+    C_Timer.After(0, DrainPending)
   end
   if next(instanceQueues) and not instanceDraining then
     instanceDraining = true

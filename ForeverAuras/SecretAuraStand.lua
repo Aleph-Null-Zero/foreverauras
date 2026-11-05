@@ -420,7 +420,12 @@ local function PlaceProxy(proxy)
   local ok, left, bottom, width, height = pcall(frame.GetRect, frame)
   if not ok or type(left) ~= "number" or type(bottom) ~= "number" or type(width) ~= "number" or type(height) ~= "number" then return end
   if issecretvalue(left) or issecretvalue(bottom) or issecretvalue(width) or issecretvalue(height) then return end
-  local scale = frame:GetEffectiveScale() / UIParent:GetEffectiveScale()
+  -- ForeverAuras: a chain frame the client has restricted (one hanging from
+  -- a container made in combat, after a reload in combat) refuses even its
+  -- scale; the proxy keeps its last place until the frame is reachable.
+  local okScale, frameScale = pcall(frame.GetEffectiveScale, frame)
+  if not okScale or type(frameScale) ~= "number" or issecretvalue(frameScale) then return end
+  local scale = frameScale / UIParent:GetEffectiveScale()
   if proxy.placedScale ~= scale then proxy:SetScale(scale); proxy.placedScale = scale end
   if proxy.placedLeft == left and proxy.placedBottom == bottom and proxy.placedWidth == width and proxy.placedHeight == height then return end
   proxy.placedLeft, proxy.placedBottom, proxy.placedWidth, proxy.placedHeight = left, bottom, width, height
@@ -438,8 +443,13 @@ local function ProxyUpdate(self, elapsed)
   self.elapsed = (self.elapsed or 0) + elapsed
   if self.elapsed < 0.1 then return end
   self.elapsed = 0
-  local shown = self.standFrame and self.standFrame:IsVisible()
-  if not issecretvalue(shown) and not shown then self:SetScript("OnUpdate", nil); return end
+  -- ForeverAuras: a restricted chain frame (see PlaceProxy) refuses the
+  -- question; the proxy keeps following and asks again next time (seen in
+  -- game after a reload in combat: the question raised every 0.1 s).
+  local frame = self.standFrame
+  if not frame then self:SetScript("OnUpdate", nil); return end
+  local ok, shown = pcall(frame.IsVisible, frame)
+  if ok and not issecretvalue(shown) and not shown then self:SetScript("OnUpdate", nil); return end
   PlaceProxy(self)
 end
 
