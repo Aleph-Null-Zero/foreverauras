@@ -2289,3 +2289,14 @@ function Private.UnloadConditions(uid)
   CancelTimers(uid)
   Private.UnregisterForGlobalConditions(uid);
 end
+
+-- ForeverAuras 1.2.4 (Dan's session-long growth): the file's own tables are memory scan roots (/fa memscan), resolved to the CURRENT table only when the scan runs (Astra's dev.1 review: a saved reference would pin a table a reset has replaced)
+Private.memoryRootAccessors = Private.memoryRootAccessors or {}
+Private.memoryRootAccessors["Conditions: dynamicConditions"] = function() return dynamicConditions end
+Private.memoryRootAccessors["Conditions: globalDynamicConditionFuncs"] = function() return globalDynamicConditionFuncs end
+Private.memoryRootAccessors["Conditions: checkConditions"] = function() return checkConditions end
+Private.memoryRootAccessors["Conditions: conditionChecksTimers"] = function() return conditionChecksTimers end
+Private.memoryRootAccessors["Conditions: PowerCurve"] = function() return PowerCurve end
+Private.memoryRootAccessors["Conditions: knownMax"] = function() return knownMax end
+Private.memoryRootAccessors["Conditions: curves"] = function() return curves end
+Private.memoryRootAccessors["Conditions: registeredGlobalFunctions"] = function() return registeredGlobalFunctions end

@@ -2078,6 +2078,8 @@ WeakAuras.spec_types_specific = {}
 ---@type table<number, string>
 Private.spec_types_all = {}
 Private.specs_sorted = {}
+-- ForeverAuras 1.2.4: the class of each specialization id (NeverLoadableHere, ForeverAuras.lua)
+Private.spec_class = {}
 local function update_specs()
   for _, classFileName in pairs(WeakAuras.classes_sorted) do
     local classID = WeakAuras.class_ids[classFileName]
@@ -2089,6 +2091,7 @@ local function update_specs()
         tinsert(WeakAuras.spec_types_specific[classFileName], "|T"..(icon or "error")..":0|t "..(tabName or "error"));
         local classColor = WA_GetClassColor(classFileName)
         local specIcon = numSpecs > 1 and "|T"..(icon or "error")..":0|t " or " "
+        Private.spec_class[specId] = classFileName   -- ForeverAuras 1.2.4
         Private.spec_types_all[specId] = CreateAtlasMarkup(GetClassAtlas(classFileName:lower()))
         .. specIcon..(WrapTextInColorCode(tabName, classColor) or "error");
         tinsert(Private.specs_sorted, specId)

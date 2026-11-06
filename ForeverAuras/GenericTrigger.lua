@@ -76,6 +76,10 @@ local timer = WeakAuras.timer;
 local events = {}
 local loaded_events = {}
 local loaded_unit_events = {};
+-- ForeverAuras 1.2.4 (Astra's dev.3 review): the compiled trigger functions are memory scan roots (/fa memscan)
+Private.memoryRootAccessors = Private.memoryRootAccessors or {}
+Private.memoryRootAccessors["trigger functions (GenericTrigger)"] = function() return events end
+Private.memoryRootAccessors["loaded trigger events"] = function() return loaded_events end
 local watched_trigger_events = Private.watched_trigger_events
 local delayTimerEvents = {}
 local loaded_auras = {}; -- id to bool map
@@ -5756,3 +5760,23 @@ end
 WeakAuras.genericTriggerTypes = types
 
 WeakAuras.RegisterTriggerSystem(types, GenericTrigger);
+
+-- ForeverAuras 1.2.4 (Dan's session-long growth): the file's own tables are memory scan roots (/fa memscan), resolved to the CURRENT table only when the scan runs (Astra's dev.1 review: a saved reference would pin a table a reset has replaced)
+Private.memoryRootAccessors = Private.memoryRootAccessors or {}
+Private.memoryRootAccessors["GenericTrigger: GenericTrigger"] = function() return GenericTrigger end
+Private.memoryRootAccessors["GenericTrigger: events"] = function() return events end
+Private.memoryRootAccessors["GenericTrigger: loaded_events"] = function() return loaded_events end
+Private.memoryRootAccessors["GenericTrigger: loaded_unit_events"] = function() return loaded_unit_events end
+Private.memoryRootAccessors["GenericTrigger: delayTimerEvents"] = function() return delayTimerEvents end
+Private.memoryRootAccessors["GenericTrigger: loaded_auras"] = function() return loaded_auras end
+Private.memoryRootAccessors["GenericTrigger: loadedEventsByAura"] = function() return loadedEventsByAura end
+Private.memoryRootAccessors["GenericTrigger: nameplateExists"] = function() return nameplateExists end
+Private.memoryRootAccessors["GenericTrigger: triggerContexts"] = function() return triggerContexts end
+Private.memoryRootAccessors["GenericTrigger: onceAFrameSeen"] = function() return onceAFrameSeen end
+Private.memoryRootAccessors["GenericTrigger: genericTriggerRegisteredEvents"] = function() return genericTriggerRegisteredEvents end
+Private.memoryRootAccessors["GenericTrigger: genericTriggerRegisteredUnitEvents"] = function() return genericTriggerRegisteredUnitEvents end
+Private.memoryRootAccessors["GenericTrigger: eventsToRegister"] = function() return eventsToRegister end
+Private.memoryRootAccessors["GenericTrigger: unitEventsToRegister"] = function() return unitEventsToRegister end
+Private.memoryRootAccessors["GenericTrigger: totemSlots"] = function() return totemSlots end
+Private.memoryRootAccessors["GenericTrigger: knownTotemSlots"] = function() return knownTotemSlots end
+Private.memoryRootAccessors["GenericTrigger: types"] = function() return types end

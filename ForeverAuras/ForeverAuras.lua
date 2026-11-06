@@ -212,6 +212,8 @@ function Private.LoadOptions(msg)
 end
 
 function WeakAuras.OpenOptions(msg)
+  -- (the deferred displays are prepared by ShowOptions, ForeverAurasOptions.lua, once the login,
+  -- database and combat gates have let the editor open; Astra's dev.6 review)
   if Private.NeedToRepairDatabase() then
     StaticPopup_Show("WeakAuras_CONFIRM_REPAIR", nil, nil, {reason = "downgrade"})
   elseif (WeakAuras.IsLoginFinished() and Private.LoadOptions(msg)) then
@@ -230,6 +232,7 @@ function Private.PrintHelp()
   -- Listed with the other profiling commands; plain text, not localized yet.
   print("/wa unloadall - Unload every aura until the next /reload (nothing is saved)")
   print("/wa unloadgroup <text> - Unload every group or aura whose name contains text until the next /reload (nothing is saved)")
+  print(L["/wa memscan - Print where ForeverAuras' Lua memory sits (saved displays by field, aura environments, live displays, caches)"])
   print("/wa phitch [ms] - Toggle hitch capture: report every frame slower than ms (default 30) with the systems and auras that ran in it")
   print(L["/wa phitch login [ms] [seconds] - Run the hitch capture through the next reload and login, then print the load time and profile"])
   print(L["/wa repair - Repair tool"])
@@ -254,6 +257,9 @@ function SlashCmdList.WeakAuras(input)
     WeakAuras.StopProfile();
   elseif msg == "pprint" then
     WeakAuras.PrintProfile();
+  elseif msg == "memscan" then
+    -- ForeverAuras 1.2.4 (Dan's combat-drop hitches): where the addon's Lua memory sits
+    Private.MemoryScan()
   elseif msg == "pfocus" then
     -- ForeverAuras (dev.99): "/fa pfocus <aura name>" breaks one aura's time down in the next profile.
     WeakAuras.ProfileFocus(input:match("^%s*%S+%s+(.-)%s*$"))
@@ -312,7 +318,10 @@ function SlashCmdList.WeakAuras(input)
   elseif msg == "modern" then
     -- ForeverAuras: "/fa modern <aura id>" prints an Aura (Modern) display's
     -- state (its spell list, Missing clip and sample) for bug reports.
-    Private.BlizzardAuraDisplay.PrintDebug(input:match("^%s*%S+%s+(.-)%s*$"))
+    -- ForeverAuras 1.2.5 (Astra's dev.8 review): with no name, the bounded summary with the transition log
+    local which = input:match("^%s*%S+%s+(.-)%s*$")
+    if which and which ~= "" then Private.BlizzardAuraDisplay.PrintDebug(which)
+    elseif Private.BlizzardAuraDisplay.PrintSummary then Private.BlizzardAuraDisplay.PrintSummary() end
   elseif msg == "cdm" and input:match("^%s*%S+%s+%S") then
     -- ForeverAuras: "/fa cdm <aura id>" prints a CDM trigger's state and
     -- what Blizzard's viewer frames and the unit's auras say, for bug reports.
@@ -430,6 +439,72 @@ local in_loading_screen = false;
 local loadFuncs = {};
 -- Load functions for the Options window that ignore various load options
 local loadFuncsForOptions = {};
+-- ForeverAuras 1.2.4 (Astra's dev.3 review): the load functions are memory scan roots (/fa memscan)
+Private.memoryRootAccessors = Private.memoryRootAccessors or {}
+Private.memoryRootAccessors["load functions"] = function() return loadFuncs end
+Private.memoryRootAccessors["load functions (options)"] = function() return loadFuncsForOptions end
+-- ForeverAuras 1.2.4 (Dan's combat-drop hitches: the collector's cost grows with
+-- the live heap): a display whose load conditions name only other classes'
+-- specializations, other races, the other faction, or "Never" cannot load on
+-- this character in this session, so its trigger, condition, action and load
+-- functions are not prepared at login (pAdd). It stays saved data; the editor
+-- prepares every deferred display before it opens (PrepareDeferredDisplays,
+-- WeakAuras.OpenOptions and ShowOptions), so editing, importing and the
+-- options' own load view see it as before. A display saved while the editor
+-- is open is always prepared.
+-- (kept on Private: the file's main chunk is at Lua's limit of local variables)
+Private.deferredDisplays = {}
+Private.memoryRootAccessors["deferred displays"] = function() return Private.deferredDisplays end
+function Private.NeverLoadableHere(data)
+  local load = data.load
+  if type(load) ~= "table" then return false end
+  if load.use_never == true then return true end
+  -- a multiselect filters when use_x == false (the selection in x.multi); true is the single form, nil no filter
+  local function Excludes(useKey, valueKey, matches)
+    if load[useKey] ~= false then return false end
+    local value = load[valueKey]
+    local multi = type(value) == "table" and value.multi
+    if type(multi) ~= "table" then return false end
+    -- the load function tests every PRESENT key of these (non-tristate) selections, whatever its
+    -- value (ConstructFunction's singleTest); the editor removes a deselected key
+    for key in pairs(multi) do
+      if matches(key) then return false end
+    end
+    return true
+  end
+  local _, playerClass = UnitClass("player")
+  local _, playerRace = UnitRace("player")
+  local playerFaction = UnitFactionGroup("player")
+  if Private.spec_class and playerClass and Excludes("use_class_and_spec", "class_and_spec", function(specId)
+    local class = Private.spec_class[specId] or Private.spec_class[tonumber(specId)]
+    -- an unknown specialization id is not an exclusion
+    return class == nil or class == playerClass
+  end) then return true end
+  if playerRace and Excludes("use_race", "race", function(race) return race == playerRace end) then return true end
+  if playerFaction and Excludes("use_faction", "faction", function(faction) return faction == playerFaction end) then return true end
+  return false
+end
+function Private.IsDeferredDisplay(id) return Private.deferredDisplays[id] == true end
+function Private.CountDeferredDisplays() local n = 0 for _ in pairs(Private.deferredDisplays) do n = n + 1 end return n end
+-- Prepares every deferred display (before the editor opens; nothing to do when none is deferred)
+function Private.PrepareDeferredDisplays()
+  local deferred = Private.deferredDisplays
+  if next(deferred) == nil or not Private.pAddForDeferred then return end
+  local ids = {}
+  for id in pairs(deferred) do ids[#ids + 1] = id end
+  table.sort(ids)
+  wipe(deferred)
+  Private.preparingDeferred = true
+  -- no load scan per display: none of them can load here, and the editor's own pause and resume follow
+  local wasPaused = paused
+  paused = true
+  for _, id in ipairs(ids) do
+    local data = Private.db and Private.db.displays[id]
+    if data then xpcall(Private.pAddForDeferred, Private.GetErrorHandlerUid(data.uid, "pAdd"), data) end
+  end
+  paused = wasPaused
+  Private.preparingDeferred = nil
+end
 -- Mapping of events to ids, contains true if a aura should be checked for a certain event
 local loadEvents = {}
 
@@ -510,6 +585,9 @@ Private.triggerTypesOptions = {};
 --  spellId: spellId of the buff/debuff, used to set the tooltip
 
 local triggerState = {}
+-- ForeverAuras 1.2.4 (/fa memscan): the trigger states are one of the memory scan's roots
+Private.memoryRootAccessors = Private.memoryRootAccessors or {}
+Private.memoryRootAccessors["trigger states"] = function() return triggerState end
 function Private.GetActiveTriggerFor(id)
   local state = triggerState[id]
   if not state then return end
@@ -2717,6 +2795,7 @@ function WeakAuras.Delete(data)
   loaded[id] = nil;
   loadFuncs[id] = nil;
   loadFuncsForOptions[id] = nil;
+  Private.deferredDisplays[id] = nil   -- ForeverAuras 1.2.4
   for event, eventData in pairs(loadEvents) do
     eventData[id] = nil
   end
@@ -2791,6 +2870,7 @@ function WeakAuras.Rename(data, newid)
 
   loadFuncs[newid] = loadFuncs[oldid];
   loadFuncs[oldid] = nil;
+  Private.deferredDisplays[newid], Private.deferredDisplays[oldid] = Private.deferredDisplays[oldid], nil   -- ForeverAuras 1.2.4
 
   loadFuncsForOptions[newid] = loadFuncsForOptions[oldid]
   loadFuncsForOptions[oldid] = nil;
@@ -3831,6 +3911,24 @@ function pAdd(data, simpleChange)
       db.displays[id] = data
       cycleCheck(data)
 
+      -- ForeverAuras 1.2.4: not prepared on a character it can never load on (see NeverLoadableHere).
+      -- Only a display without prepared runtime state (a cold one: login, or deferred already); a
+      -- prepared display changed to such conditions takes the ordinary path, whose load scan
+      -- unloads it properly (Astra's dev.6 review)
+      if not Private.preparingDeferred and not WeakAuras.IsOptionsOpen() and not triggerState[id]
+        and Private.NeverLoadableHere(data) then
+        Private.deferredDisplays[id] = true
+        for event, eventData in pairs(loadEvents) do eventData[id] = nil end
+        loadFuncs[id] = nil
+        loadFuncsForOptions[id] = nil
+        clones[id] = clones[id] or {}
+        rebuildingDisplays[id] = nil
+        Private.UpdateSoundIcon(data)
+        Private.callbacks:Fire("Add", data.uid, data.id, data, simpleChange)
+        return
+      end
+      Private.deferredDisplays[id] = nil
+
       if (not data.triggers.activeTriggerMode or data.triggers.activeTriggerMode > #data.triggers) then
         data.triggers.activeTriggerMode = Private.trigger_modes.first_active;
       end
@@ -3911,6 +4009,8 @@ function pAdd(data, simpleChange)
     Private.callbacks:Fire("Add", data.uid, data.id, data, simpleChange)
   end
 end
+
+Private.pAddForDeferred = pAdd   -- ForeverAuras 1.2.4: PrepareDeferredDisplays runs the ordinary add
 
 function Private.Add(data, simpleChange)
   local oldSnapshot
@@ -7569,3 +7669,33 @@ do
     return data.regionType == "group" or data.regionType == "dynamicgroup"
   end
 end
+
+-- ForeverAuras 1.2.4 (Dan's session-long growth): the file's own tables are memory scan roots (/fa memscan), resolved to the CURRENT table only when the scan runs (Astra's dev.1 review: a saved reference would pin a table a reset has replaced)
+Private.memoryRootAccessors = Private.memoryRootAccessors or {}
+Private.memoryRootAccessors["ForeverAuras: loginQueue"] = function() return loginQueue end
+Private.memoryRootAccessors["ForeverAuras: loadFuncs"] = function() return loadFuncs end
+Private.memoryRootAccessors["ForeverAuras: loadFuncsForOptions"] = function() return loadFuncsForOptions end
+Private.memoryRootAccessors["ForeverAuras: loadEvents"] = function() return loadEvents end
+Private.memoryRootAccessors["ForeverAuras: runtimeActiveDisplays"] = function() return runtimeActiveDisplays end
+Private.memoryRootAccessors["ForeverAuras: runtimeActiveAuraEnvironments"] = function() return runtimeActiveAuraEnvironments end
+Private.memoryRootAccessors["ForeverAuras: loadingDisplays"] = function() return loadingDisplays end
+Private.memoryRootAccessors["ForeverAuras: rebuildingDisplays"] = function() return rebuildingDisplays end
+Private.memoryRootAccessors["ForeverAuras: clonePool"] = function() return clonePool end
+Private.memoryRootAccessors["ForeverAuras: securePool"] = function() return securePool end
+Private.memoryRootAccessors["ForeverAuras: triggerState"] = function() return triggerState end
+Private.memoryRootAccessors["ForeverAuras: fallbacksStates"] = function() return fallbacksStates end
+Private.memoryRootAccessors["ForeverAuras: triggerSystems"] = function() return triggerSystems end
+Private.memoryRootAccessors["ForeverAuras: triggerSystemNames"] = function() return triggerSystemNames end
+Private.memoryRootAccessors["ForeverAuras: timers"] = function() return timers end
+Private.memoryRootAccessors["ForeverAuras: toLoad"] = function() return toLoad end
+Private.memoryRootAccessors["ForeverAuras: toUnload"] = function() return toUnload end
+Private.memoryRootAccessors["ForeverAuras: sessionExcluded"] = function() return sessionExcluded end
+Private.memoryRootAccessors["ForeverAuras: loadFlags"] = function() return loadFlags end
+Private.memoryRootAccessors["ForeverAuras: UIDtoID"] = function() return UIDtoID end
+Private.memoryRootAccessors["ForeverAuras: triggerConditionCache"] = function() return triggerConditionCache end
+Private.memoryRootAccessors["ForeverAuras: FrameTimes"] = function() return FrameTimes end
+Private.memoryRootAccessors["ForeverAuras: DisplayTimes"] = function() return DisplayTimes end
+Private.memoryRootAccessors["ForeverAuras: emptyState"] = function() return emptyState end
+Private.memoryRootAccessors["ForeverAuras: delayed_watched_trigger"] = function() return delayed_watched_trigger end
+Private.memoryRootAccessors["ForeverAuras: postPonedAnchors"] = function() return postPonedAnchors end
+Private.memoryRootAccessors["ForeverAuras: anchorFrameDeferred"] = function() return anchorFrameDeferred end

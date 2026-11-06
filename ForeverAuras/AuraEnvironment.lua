@@ -305,6 +305,9 @@ local blockedTables = {
 }
 
 local aura_environments = {}
+-- ForeverAuras 1.2.4 (/fa memscan): the per-display environments are one of the memory scan's roots (resolved when the scan runs)
+Private.memoryRootAccessors = Private.memoryRootAccessors or {}
+Private.memoryRootAccessors["aura environments"] = function() return aura_environments end
 -- nil == Not initiliazed
 -- 1 == config initialized
 -- 2 == fully initialized
@@ -910,3 +913,13 @@ function Private.GetSanitizedFrame(key, requireFrame)
     return frame
   end
 end
+
+-- ForeverAuras 1.2.4 (Dan's session-long growth): the file's own tables are memory scan roots (/fa memscan), resolved to the CURRENT table only when the scan runs (Astra's dev.1 review: a saved reference would pin a table a reset has replaced)
+Private.memoryRootAccessors = Private.memoryRootAccessors or {}
+Private.memoryRootAccessors["AuraEnvironment: nameplateNameAnchors"] = function() return nameplateNameAnchors end
+Private.memoryRootAccessors["AuraEnvironment: aura_environments"] = function() return aura_environments end
+Private.memoryRootAccessors["AuraEnvironment: environment_initialized"] = function() return environment_initialized end
+Private.memoryRootAccessors["AuraEnvironment: getDataCallCounts"] = function() return getDataCallCounts end
+Private.memoryRootAccessors["AuraEnvironment: dataCopies"] = function() return dataCopies end
+Private.memoryRootAccessors["AuraEnvironment: aura_env_stack"] = function() return aura_env_stack end
+Private.memoryRootAccessors["AuraEnvironment: aura_uid_stack"] = function() return aura_uid_stack end

@@ -1204,3 +1204,10 @@ function Display.RefreshStand(region)
   local normal = region.flowNormal
   if normal and normal.active and normal.stand and normal.stand.active then xpcall(function() Display.EnsureStand(region, normal) end, geterrorhandler()) end
 end
+
+-- ForeverAuras 1.2.4 (Dan's session-long growth): the file's own tables are memory scan roots (/fa memscan), resolved to the CURRENT table only when the scan runs (Astra's dev.1 review: a saved reference would pin a table a reset has replaced)
+Private.memoryRootAccessors = Private.memoryRootAccessors or {}
+Private.memoryRootAccessors["SecretAuraStand: experimentalStandTypes"] = function() return experimentalStandTypes end
+Private.memoryRootAccessors["SecretAuraStand: BARTEXTURE"] = function() return BARTEXTURE end
+Private.memoryRootAccessors["SecretAuraStand: PROGRESSTEXTURE"] = function() return PROGRESSTEXTURE end
+Private.memoryRootAccessors["SecretAuraStand: pending"] = function() return pending end

@@ -1963,3 +1963,5 @@ L["This display's share of the centred row could not be measured (%s); it keeps 
 -- ForeverAuras.lua (/fa cells)
 L["Row cells are enabled automatically for supported Modern Aura Group rows."] = "Row cells are enabled automatically for supported Modern Aura Group rows."
 L["Row cells shadow chains (Centered rows) are %s (/fa cells shadows on|off; applies after /reload)."] = "Row cells shadow chains (Centered rows) are %s (/fa cells shadows on|off; applies after /reload)."
+L["/wa memscan - Print where ForeverAuras' Lua memory sits (saved displays by field, aura environments, live displays, caches)"] = "/wa memscan - Print where ForeverAuras' Lua memory sits (saved displays by field, aura environments, live displays, caches)"
+L["GC hold: the heap grew by more than 512 MB during this fight; the collector was restarted in combat."] = "GC hold: the heap grew by more than 512 MB during this fight; the collector was restarted in combat."

@@ -2281,6 +2281,7 @@ function CreateBody(display, container, inFlow, region, data)
   -- built on it (the probe that found the locked containers, rc.28; its
   -- chat print is retired with the build reports).
   display.creating = true
+  if type(Display.summaryCounts) == "table" then Display.summaryCounts.containersSetUp = (Display.summaryCounts.containersSetUp or 0) + 1 end   -- (1.2.5 summary: main containers reaching setup)
   -- ForeverAuras (independent carriers, SecretAuraFlow.lua): a list in such
   -- a row gets a box per button, placed at the row through the carrier
   -- translation, here inside the client's callback. A refused placement is
@@ -2487,6 +2488,7 @@ end
 local retiredHolder
 function Display.RetireFrame(frame)
   if not frame then return end
+  if type(Display.summaryCounts) == "table" then Display.summaryCounts.retirementAttempts = (Display.summaryCounts.retirementAttempts or 0) + 1 end   -- (1.2.5 summary: attempts, a refused one counts too)
   retiredHolder = retiredHolder or CreateFrame("Frame")
   retiredHolder:Hide()
   if frame.SetEnabled then frame:SetEnabled(false) end
@@ -3994,7 +3996,11 @@ function ApplyDisplay(region, data)
     or (first.independent or false) ~= wantsIndependent
     or (first.chained or false) ~= wantsChained) then
     -- (dev.91) said with "/fa cells debug on": the containers made new, and why
-    if wantsChained then CombatBuildReport(("%s: containers made new (%s)"):format(tostring(data.id), fresh and "a fresh rebuild was asked" or first.flowContainer ~= wantsFlow and "row membership changed" or (first.chained or false) ~= wantsChained and "chain mode changed" or "mode changed")) end
+    local why = fresh and "a fresh rebuild was asked" or first.flowContainer ~= wantsFlow and "row membership changed" or (first.chained or false) ~= wantsChained and "chain mode changed" or "mode changed"
+    if wantsChained then CombatBuildReport(("%s: containers made new (%s)"):format(tostring(data.id), why)) end
+    -- (1.2.5 summary) the containers made new, by reason
+    local reasons = type(Display.summaryCounts) == "table" and Display.summaryCounts.freshBuilds
+    if reasons then reasons[why] = (reasons[why] or 0) + 1 end
     for _, instance in ipairs(native.instances) do
       RetireInstanceGlowBindings(region, instance)
       instance.container:SetEnabled(false)
@@ -4788,3 +4794,115 @@ end)
 for _, frame in ipairs({events, statusEvents}) do
   frame:SetScript("OnEvent", Private.Profiled("aura (modern) - events", frame:GetScript("OnEvent")))
 end
+
+-- ForeverAuras 1.2.5 (Astra's dev.8 review: bounded counts across combat and
+-- death transitions, instead of frame polling or another heap scan): "/fa
+-- modern" with no name prints the Modern displays' resource counts, the
+-- builds made so far (fresh ones by reason, retired frames), the queues and
+-- ledgers, and the same counts recorded at the last transitions (combat
+-- start and end, death, resurrection), so growth across a series of fights
+-- shows as rising numbers between entries. Recorded only at those events.
+Display.summaryCounts = {freshBuilds = {}}
+local function CountKeys(t) local n = 0 for _ in pairs(t or {}) do n = n + 1 end return n end
+-- The counts are of the addon's own Lua structures (a subset: main instances and their addon-owned
+-- button lists, the secondary containers each instance owns, the queues and ledgers); not native
+-- record pools, not frames the client owns, and taken at the event, before paced repairs settle.
+local function SummaryCounts()
+  local c = Display.summaryCounts
+  local regions, instances, buttons, visibleInstances, secondary, retained, abandoned, abandonedEntries = 0, 0, 0, 0, 0, 0, 0, 0
+  for region in pairs(activeRegions) do
+    regions = regions + 1
+    local native = region.blizzardAuraDisplay
+    for _, instance in ipairs(native and native.instances or {}) do
+      instances = instances + 1
+      buttons = buttons + #(instance.buttons or {})
+      if instance.visible then visibleInstances = visibleInstances + 1 end
+      -- the secondary containers an instance owns: the row shadow, the end measurement, the unit-frame
+      -- glow's container, the Missing slot and the single display's Missing container
+      if instance.flowShadow then secondary = secondary + 1 end
+      if instance.flowMeasure then secondary = secondary + 1 end
+      if instance.unitGlow and instance.unitGlow.container then secondary = secondary + 1 end
+      if instance.missingSlot then secondary = secondary + 1 end
+      if instance.single and instance.single.missing then secondary = secondary + 1 end
+    end
+  end
+  for _ in pairs(retainedInstances) do retained = retained + 1 end
+  for _, list in pairs(abandonedFrames) do abandonedEntries = abandonedEntries + 1; abandoned = abandoned + #list end
+  -- (Astra's dev.1 review) the refused glow-binding owners inside every region's bucket, not the buckets
+  local bindingRegions, bindingOwners = 0, 0
+  for _, owners in pairs(abandonedGlowBindings) do bindingRegions = bindingRegions + 1; bindingOwners = bindingOwners + CountKeys(owners) end
+  local fresh = 0
+  for _, n in pairs(c.freshBuilds) do fresh = fresh + n end
+  return {
+    regions = regions, instances = instances, buttons = buttons, visibleInstances = visibleInstances, secondaryContainers = secondary,
+    containersSetUp = c.containersSetUp or 0, freshBuilds = fresh, retirementAttempts = c.retirementAttempts or 0,
+    pending = CountKeys(pending), orderWaits = CountKeys(chainOrderWaits), retryAfterRestrictions = CountKeys(retryAfterRestrictions),
+    deferredRetry = CountKeys(chainDeferredRetry), lockedUnits = CountKeys(lockedUnits), lockedHide = CountKeys(lockedHide),
+    retained = retained, abandonedLedgers = abandonedEntries, abandonedFrames = abandoned,
+    abandonedBindingRegions = bindingRegions, abandonedBindingOwners = bindingOwners,
+    queues = CountKeys(instanceQueues), editorQueue = CountKeys(editorQueue), gridPending = CountKeys(gridPending), pendingSounds = CountKeys(pendingSounds),
+    heapMB = collectgarbage("count") / 1024,
+  }
+end
+local summaryOrder = {"regions", "instances", "buttons", "visibleInstances", "secondaryContainers", "containersSetUp", "freshBuilds",
+  "retirementAttempts", "pending", "orderWaits", "retryAfterRestrictions", "deferredRetry", "lockedUnits", "lockedHide", "retained",
+  "abandonedLedgers", "abandonedFrames", "abandonedBindingRegions", "abandonedBindingOwners", "queues", "editorQueue", "gridPending", "pendingSounds"}
+local summaryLog, SUMMARY_LOG_MAX = {}, 24
+local function RecordSummary(label)
+  local entry = SummaryCounts()
+  entry.label, entry.at = label, GetTime()
+  summaryLog[#summaryLog + 1] = entry
+  while #summaryLog > SUMMARY_LOG_MAX do table.remove(summaryLog, 1) end
+end
+local summaryEvents = CreateFrame("Frame")
+Private.frames["Modern Summary Events"] = summaryEvents
+summaryEvents:RegisterEvent("PLAYER_REGEN_DISABLED")
+summaryEvents:RegisterEvent("PLAYER_REGEN_ENABLED")
+summaryEvents:RegisterEvent("PLAYER_DEAD")
+summaryEvents:RegisterEvent("PLAYER_ALIVE")
+summaryEvents:RegisterEvent("PLAYER_UNGHOST")
+local summaryLabels = {PLAYER_REGEN_DISABLED = "+combat", PLAYER_REGEN_ENABLED = "-combat", PLAYER_DEAD = "dead", PLAYER_ALIVE = "alive", PLAYER_UNGHOST = "unghost"}
+summaryEvents:SetScript("OnEvent", function(_, event) RecordSummary(summaryLabels[event] or event) end)
+function Display.PrintSummary()
+  local now = SummaryCounts()
+  local parts = {}
+  for _, key in ipairs(summaryOrder) do parts[#parts + 1] = key .. " " .. tostring(now[key]) end
+  WeakAuras.prettyPrint(("Modern displays now (heap %.0f MB; the addon's own structures, a subset, at this moment): %s"):format(now.heapMB, table.concat(parts, ", ")))
+  local reasons = {}
+  for why, n in pairs(Display.summaryCounts.freshBuilds) do reasons[#reasons + 1] = why .. " x" .. n end
+  table.sort(reasons)
+  if #reasons > 0 then print("  containers made new, by reason: " .. table.concat(reasons, "; ")) end
+  if #summaryLog == 0 then print("  no transition recorded yet (combat start/end, death, resurrection)") return end
+  print(("  the last %d transitions (each line: what changed since the line before it; a number only when it changed):"):format(#summaryLog))
+  local previous
+  for _, entry in ipairs(summaryLog) do
+    local changes = {}
+    for _, key in ipairs(summaryOrder) do
+      if previous and entry[key] ~= previous[key] then changes[#changes + 1] = ("%s %+d"):format(key, entry[key] - previous[key]) end
+    end
+    print(("    %s %.0fs ago, heap %.0f MB: %s"):format(entry.label, GetTime() - entry.at, entry.heapMB,
+      previous and (#changes > 0 and table.concat(changes, ", ") or "no change") or "first"))
+    previous = entry
+  end
+end
+
+-- ForeverAuras 1.2.4 (Dan's session-long growth): the file's own tables are memory scan roots (/fa memscan), resolved to the CURRENT table only when the scan runs (Astra's dev.1 review: a saved reference would pin a table a reset has replaced)
+Private.memoryRootAccessors = Private.memoryRootAccessors or {}
+Private.memoryRootAccessors["BlizzardAuraDisplay: Display"] = function() return Display end
+Private.memoryRootAccessors["BlizzardAuraDisplay: pending"] = function() return pending end
+Private.memoryRootAccessors["BlizzardAuraDisplay: requestStamp"] = function() return requestStamp end
+Private.memoryRootAccessors["BlizzardAuraDisplay: chainOrderWaits"] = function() return chainOrderWaits end
+Private.memoryRootAccessors["BlizzardAuraDisplay: retryAfterRestrictions"] = function() return retryAfterRestrictions end
+Private.memoryRootAccessors["BlizzardAuraDisplay: chainDeferredRetry"] = function() return chainDeferredRetry end
+Private.memoryRootAccessors["BlizzardAuraDisplay: abandonedFrames"] = function() return abandonedFrames end
+Private.memoryRootAccessors["BlizzardAuraDisplay: abandonedGlowBindings"] = function() return abandonedGlowBindings end
+Private.memoryRootAccessors["BlizzardAuraDisplay: lockedHide"] = function() return lockedHide end
+Private.memoryRootAccessors["BlizzardAuraDisplay: lockedUnits"] = function() return lockedUnits end
+Private.memoryRootAccessors["BlizzardAuraDisplay: pendingSounds"] = function() return pendingSounds end
+Private.memoryRootAccessors["BlizzardAuraDisplay: activeRegions"] = function() return activeRegions end
+Private.memoryRootAccessors["BlizzardAuraDisplay: retainedInstances"] = function() return retainedInstances end
+Private.memoryRootAccessors["BlizzardAuraDisplay: unitFrameGlowSizes"] = function() return unitFrameGlowSizes end
+Private.memoryRootAccessors["BlizzardAuraDisplay: instanceQueues"] = function() return instanceQueues end
+Private.memoryRootAccessors["BlizzardAuraDisplay: editorQueue"] = function() return editorQueue end
+Private.memoryRootAccessors["BlizzardAuraDisplay: glowStatusPending"] = function() return glowStatusPending end
+Private.memoryRootAccessors["BlizzardAuraDisplay: gridPending"] = function() return gridPending end

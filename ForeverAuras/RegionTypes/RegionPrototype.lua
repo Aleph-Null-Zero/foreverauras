@@ -216,6 +216,9 @@ local function SoundPlayHelper(self)
     return;
   end
 
+  -- ForeverAuras 1.2.4 (Dan's combat-drop hitches): counted for /fa phitch; a sound file's first play
+  -- loads it from disk, in the client, outside any Lua time
+  if Private.HitchCount then Private.HitchCount("sound played") end
   if options.sound == " Fojji" then
     local file, message = Private.ResolveFojjiRecordedSound(options.sound_fojji or "")
     local data = WeakAuras.GetData(self.id)
@@ -1761,3 +1764,11 @@ do
     end
   end
 end
+
+-- ForeverAuras 1.2.4 (Dan's session-long growth): the file's own tables are memory scan roots (/fa memscan), resolved to the CURRENT table only when the scan runs (Astra's dev.1 review: a saved reference would pin a table a reset has replaced)
+Private.memoryRootAccessors = Private.memoryRootAccessors or {}
+Private.memoryRootAccessors["RegionPrototype: secretRemaining"] = function() return secretRemaining end
+Private.memoryRootAccessors["RegionPrototype: remainingCurves"] = function() return remainingCurves end
+Private.memoryRootAccessors["RegionPrototype: pendingTick"] = function() return pendingTick end
+Private.memoryRootAccessors["RegionPrototype: deferredVisibility"] = function() return deferredVisibility end
+Private.memoryRootAccessors["RegionPrototype: combatHidePending"] = function() return combatHidePending end
