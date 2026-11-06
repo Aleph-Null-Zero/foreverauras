@@ -94,8 +94,9 @@ local function StartProfiling(map, id)
     map[id].elapsed = 0
     map[id].spike = 0
     map[id].calls = 1   -- ForeverAuras (dev.99): how often it ran (the focus report)
-    -- Hitch capture also attributes Lua allocation (see HitchAccumulate).
-    if hitchActive then map[id].memStart = collectgarbage("count") end
+    -- ForeverAuras 1.2.4 (Dan's collector hitches): Lua allocation is attributed too (entry.alloc, the
+    -- profile's allocation list; the hitch capture's per-frame buckets, HitchAccumulate)
+    map[id].memStart = collectgarbage("count")
     return
   end
 
@@ -103,7 +104,7 @@ local function StartProfiling(map, id)
     map[id].count = 1
     map[id].calls = (map[id].calls or 0) + 1
     map[id].start = debugprofilestop()
-    if hitchActive then map[id].memStart = collectgarbage("count") end
+    map[id].memStart = collectgarbage("count")
   else
     map[id].count = map[id].count + 1
   end
@@ -118,6 +119,12 @@ local function StopProfiling(map, id)
     map[id].elapsed = map[id].elapsed + elapsed
     if elapsed > map[id].spike then
       map[id].spike = elapsed
+    end
+    -- ForeverAuras 1.2.4: the allocation of this run (a collector step inside it can make the delta
+    -- negative; such a run counts as nothing)
+    if map[id].memStart then
+      local delta = collectgarbage("count") - map[id].memStart
+      if delta > 0 then map[id].alloc = (map[id].alloc or 0) + delta end
     end
   end
 end
@@ -146,6 +153,16 @@ local function HitchAccumulate(map, id, elapsed)
     hitch.touched[#hitch.touched + 1] = {entry = entry, name = id, aura = map == profileData.auras}
   end
   entry.frame = entry.frame + elapsed
+  if entry.memStart then
+    local total = collectgarbage("count") - entry.memStart
+    if total > 0 then entry.alloc = (entry.alloc or 0) + total end   -- ForeverAuras 1.2.4: the profile's allocation list
+  end
+  -- ForeverAuras 1.2.4 (Dan's combat-drop hitches): when in the frame the addon's code ran, so a
+  -- slow frame's untracked time can be placed before, between or after the addon's handlers
+  local now = debugprofilestop()
+  local start = now - elapsed
+  if not hitch.firstStart or start < hitch.firstStart then hitch.firstStart = start end
+  if not hitch.lastStop or now > hitch.lastStop then hitch.lastStop = now end
   if entry.memStart then
     local delta = collectgarbage("count") - entry.memStart
     if delta > 0 then entry.frameMem = (entry.frameMem or 0) + delta end
@@ -388,111 +405,135 @@ local function StopProfileUIDHitch(uid)
   if focus.id then FocusStop(id) end
 end
 
--- Summarises one frame interval (from one hitchFrame OnUpdate to the next):
--- its length, ForeverAuras time from the client's addon profiler (covers all
--- of the addon's code), the part covered by the ForeverAuras profiler, Lua
--- memory change, events of note and the most expensive systems and auras.
--- Returns the two report lines.
-local function SummariseInterval(frameMs, memDelta)
-  local addonMs
+-- ForeverAuras 1.2.4 (Astra's dev.6 review): one interval is the stretch
+-- between two hitchFrame OnUpdates, measured on ONE clock
+-- (debugprofilestop at those two points); the heap is read at the same
+-- points, so "heap" is the NET change of the whole Lua heap over the
+-- interval (allocation minus whatever the collector took back), not an
+-- allocation count. The client's own profiler counters (LastTime) are
+-- sampled there too, but WHEN the client publishes them relative to this
+-- interval is not validated on this client, so they are labelled as the
+-- client's samples. What no counter accounts for is reported as
+-- "unassigned": a remainder, not a measurement of any one activity.
+-- Each interval is kept as a bounded snapshot of numbers; the text is
+-- built only for a slow interval and the one before it.
+local function SnapshotInterval(frameMs, memDelta)
+  local snap = {frameMs = frameMs, memDelta = memDelta, systems = {}, auras = {}, events = {}, counts = {}, addons = {}}
   if C_AddOnProfiler and C_AddOnProfiler.GetAddOnMetric and Enum.AddOnProfilerMetric then
-    addonMs = C_AddOnProfiler.GetAddOnMetric(AddonName, Enum.AddOnProfilerMetric.LastTime)
-  end
-  local waEntry = profileData.systems.wa
-  local tracked = waEntry and waEntry.frame or 0
-  local systems, auras = {}, {}
-  for _, t in ipairs(hitch.touched) do
-    if t.name ~= "wa" and t.entry.frame >= 0.2 then
-      tinsert(t.aura and auras or systems, t)
+    local metric = Enum.AddOnProfilerMetric.LastTime
+    snap.addonMs = C_AddOnProfiler.GetAddOnMetric(AddonName, metric)
+    if C_AddOnProfiler.GetOverallMetric then
+      local all = C_AddOnProfiler.GetOverallMetric(metric)
+      if type(all) == "number" then snap.allMs = all end
+      local ok, container = pcall(C_AddOnProfiler.GetAddOnMetric, "Blizzard_AuraContainer", metric)
+      if ok and type(container) == "number" then snap.containerMs = container end
     end
-  end
-  local byTime = function(a, b) return a.entry.frame > b.entry.frame end
-  sort(systems, byTime)
-  sort(auras, byTime)
-  local parts = {}
-  for i = 1, math.min(14, #systems) do
-    parts[#parts + 1] = ("%s %.1f"):format(systems[i].name, systems[i].entry.frame)
-  end
-  for i = 1, math.min(3, #auras) do
-    parts[#parts + 1] = ("|cffffff99%s|r %.1f"):format(auras[i].name, auras[i].entry.frame)
-  end
-  -- The systems that allocated the most Lua memory in the interval.
-  local allocators = {}
-  for _, t in ipairs(hitch.touched) do
-    if t.name ~= "wa" and not t.aura and (t.entry.frameMem or 0) >= 16 then allocators[#allocators + 1] = t end
-  end
-  sort(allocators, function(a, b) return a.entry.frameMem > b.entry.frameMem end)
-  for i = 1, math.min(4, #allocators) do
-    parts[#parts + 1] = ("|cffcc99ff%s|r +%.0fKB"):format(allocators[i].name, allocators[i].entry.frameMem)
-  end
-  local events = {}
-  for event, count in pairs(hitch.events) do
-    events[#events + 1] = count > 1 and (event .. "x" .. count) or event
-  end
-  -- Lua time of all addons together and of Blizzard's aura container code
-  -- (which runs the native aura buttons of Modern displays), when the client
-  -- reports them.
-  local others = ""
-  if C_AddOnProfiler and C_AddOnProfiler.GetOverallMetric and Enum.AddOnProfilerMetric then
-    local metric = Enum.AddOnProfilerMetric.LastTime
-    local all = C_AddOnProfiler.GetOverallMetric(metric)
-    local ok, container = pcall(C_AddOnProfiler.GetAddOnMetric, "Blizzard_AuraContainer", metric)
-    others = (" | all addons %s | AuraContainer %s"):format(all and ("%.1fms"):format(all) or "?",
-      ok and type(container) == "number" and ("%.1fms"):format(container) or "?")
-  end
-  local header = ("%.0fms | FA %s | tracked %.1fms | mem %+.0fKB%s%s"):format(frameMs,
-    addonMs and ("%.1fms"):format(addonMs) or "?", tracked, memDelta, others,
-    #events > 0 and (" | " .. table.concat(events, " ")) or "")
-  -- Widget calls of the interval (Private.HitchCount), most frequent first.
-  local counts = {}
-  for name, count in pairs(hitch.counts) do counts[#counts + 1] = {name = name, count = count} end
-  sort(counts, function(a, b) return a.count > b.count end)
-  for i = 1, math.min(8, #counts) do
-    parts[#parts + 1] = ("|cff99ccff%s|r x%d"):format(counts[i].name, counts[i].count)
-  end
-  -- The other addons that took the most of the interval, so a slow frame
-  -- that is not ForeverAuras' can be told apart (the client's own profiler).
-  if frameMs >= hitch.threshold and C_AddOnProfiler and C_AddOnProfiler.GetAddOnMetric and Enum.AddOnProfilerMetric and C_AddOns and C_AddOns.GetNumAddOns then
-    local metric = Enum.AddOnProfilerMetric.LastTime
-    local addons = {}
-    for i = 1, C_AddOns.GetNumAddOns() do
-      local name = C_AddOns.GetAddOnInfo(i)
-      if name and name ~= AddonName and C_AddOns.IsAddOnLoaded(i) then
-        local ok, ms = pcall(C_AddOnProfiler.GetAddOnMetric, name, metric)
-        if ok and type(ms) == "number" and ms >= 1 then addons[#addons + 1] = {name = name, ms = ms} end
+    if C_AddOnProfiler.GetApplicationMetric then
+      local ok, ms = pcall(C_AddOnProfiler.GetApplicationMetric, metric)
+      if ok and type(ms) == "number" then snap.clientMs = ms end
+    end
+    -- the other addons' samples, only for a slow interval (a loop over every addon)
+    if frameMs >= hitch.threshold and C_AddOns and C_AddOns.GetNumAddOns then
+      for i = 1, C_AddOns.GetNumAddOns() do
+        local name = C_AddOns.GetAddOnInfo(i)
+        if name and name ~= AddonName and C_AddOns.IsAddOnLoaded(i) then
+          local ok, ms = pcall(C_AddOnProfiler.GetAddOnMetric, name, metric)
+          if ok and type(ms) == "number" and ms >= 1 then snap.addons[#snap.addons + 1] = {name = name, ms = ms} end
+        end
       end
     end
-    sort(addons, function(a, b) return a.ms > b.ms end)
-    for i = 1, math.min(5, #addons) do
-      parts[#parts + 1] = ("|cffff9966%s|r %.1fms"):format(addons[i].name, addons[i].ms)
+  end
+  local waEntry = profileData.systems.wa
+  snap.tracked = waEntry and waEntry.frame or 0
+  for _, t in ipairs(hitch.touched) do
+    if t.name ~= "wa" then
+      local list = t.aura and snap.auras or snap.systems
+      list[#list + 1] = {name = t.name, ms = t.entry.frame, kb = t.entry.frameMem or 0}
     end
   end
+  for event, count in pairs(hitch.events) do snap.events[#snap.events + 1] = {name = event, count = count} end
+  for name, count in pairs(hitch.counts) do snap.counts[#snap.counts + 1] = {name = name, count = count} end
+  if hitch.firstStart and hitch.stamp then
+    snap.codeFrom, snap.codeTo = hitch.firstStart - hitch.stamp, hitch.lastStop - hitch.stamp
+  end
+  return snap
+end
+
+-- The two report lines of a snapshot (built only when printed).
+local function SummariseInterval(snap)
+  local byTime = function(a, b) return a.ms > b.ms end
+  sort(snap.systems, byTime)
+  sort(snap.auras, byTime)
+  local parts = {}
+  local shown = 0
+  for _, row in ipairs(snap.systems) do
+    if row.ms >= 0.2 and shown < 14 then parts[#parts + 1] = ("%s %.1f"):format(row.name, row.ms); shown = shown + 1 end
+  end
+  shown = 0
+  for _, row in ipairs(snap.auras) do
+    if row.ms >= 0.2 and shown < 3 then parts[#parts + 1] = ("|cffffff99%s|r %.1f"):format(row.name, row.ms); shown = shown + 1 end
+  end
+  -- the systems whose runs saw the heap grow the most (net, per run; nested systems overlap)
+  local allocators = {}
+  for _, row in ipairs(snap.systems) do if row.kb >= 16 then allocators[#allocators + 1] = row end end
+  sort(allocators, function(a, b) return a.kb > b.kb end)
+  for i = 1, math.min(8, #allocators) do
+    parts[#parts + 1] = ("|cffcc99ff%s|r +%.0fKB"):format(allocators[i].name, allocators[i].kb)
+  end
+  sort(snap.counts, function(a, b) return a.count > b.count end)
+  for i = 1, math.min(8, #snap.counts) do
+    parts[#parts + 1] = ("|cff99ccff%s|r x%d"):format(snap.counts[i].name, snap.counts[i].count)
+  end
+  sort(snap.addons, function(a, b) return a.ms > b.ms end)
+  for i = 1, math.min(5, #snap.addons) do
+    parts[#parts + 1] = ("|cffff9966%s|r %.1fms"):format(snap.addons[i].name, snap.addons[i].ms)
+  end
+  local samples = ""
+  if snap.addonMs then
+    samples = (" | client's samples: FA %.1fms, all addons %s, AuraContainer %s, whole client %s"):format(snap.addonMs,
+      snap.allMs and ("%.1fms"):format(snap.allMs) or "?", snap.containerMs and ("%.1fms"):format(snap.containerMs) or "?",
+      snap.clientMs and ("%.1fms"):format(snap.clientMs) or "?")
+  end
+  local unassigned = ""
+  if snap.allMs then unassigned = (" | unassigned %.0fms"):format(math.max(0, snap.frameMs - snap.allMs)) end
+  local placement = ""
+  if snap.codeFrom then placement = (" | FA code +%.0f..+%.0fms"):format(snap.codeFrom, snap.codeTo) end
+  local events = {}
+  for i, e in ipairs(snap.events) do events[i] = e.count > 1 and (e.name .. "x" .. e.count) or e.name end
+  local header = ("%.0fms | tracked %.1fms | heap %+.0fKB net%s%s%s%s"):format(snap.frameMs, snap.tracked, snap.memDelta,
+    samples, unassigned, placement, #events > 0 and (" | " .. table.concat(events, " ")) or "")
   return header, #parts > 0 and ("   " .. table.concat(parts, ", ")) or nil
 end
 
 -- Runs at the start of every frame while hitch capture is active. Events are
 -- dispatched before OnUpdate, so the frame in which combat starts or ends is
 -- summarised one interval before the slow drawing it causes shows up. Each
--- interval's summary is therefore kept, and a slow interval is reported
+-- interval's snapshot is therefore kept, and a slow interval is reported
 -- together with the one before it.
 local hitchFrame = CreateFrame("Frame")
 hitchFrame:Hide()
-hitchFrame:SetScript("OnUpdate", function(_, elapsed)
+hitchFrame:SetScript("OnUpdate", function()
+  -- the interval boundary: one clock, the heap read at the same point
+  local now = debugprofilestop()
   local mem = collectgarbage("count")
-  local frameMs = elapsed * 1000
-  if hitch.lastMem then
-    local header, details = SummariseInterval(frameMs, mem - hitch.lastMem)
+  if hitch.stamp then
+    local frameMs = now - hitch.stamp
+    local snap = SnapshotInterval(frameMs, mem - hitch.lastMem)
     if frameMs >= hitch.threshold then
       if hitch.previous then
-        prettyPrint("Before hitch: " .. hitch.previous[1])
-        if hitch.previous[2] then print(hitch.previous[2]) end
+        local header, details = SummariseInterval(hitch.previous)
+        prettyPrint("Before hitch: " .. header)
+        if details then print(details) end
       end
+      local header, details = SummariseInterval(snap)
       prettyPrint("Hitch " .. header)
       if details then print(details) end
     end
-    hitch.previous = {header, details}
+    hitch.previous = snap
   end
   hitch.lastMem = mem
+  hitch.stamp = now
+  hitch.firstStart, hitch.lastStop = nil, nil
   for i, t in ipairs(hitch.touched) do
     t.entry.frame = 0
     t.entry.frameMem = 0
@@ -543,6 +584,7 @@ function WeakAuras.ToggleHitchCapture(threshold)
   hitch.active = true; hitchActive = true
   hitch.lastMem = nil
   hitch.previous = nil
+  hitch.stamp, hitch.firstStart, hitch.lastStop = nil, nil, nil   -- ForeverAuras 1.2.4 (the first boundary is the first OnUpdate)
   wipe(hitch.touched)
   wipe(hitch.events)
   wipe(hitch.counts)
@@ -812,6 +854,27 @@ function WeakAuras.PrintProfile()
     end
   end
 
+  -- ForeverAuras 1.2.4 (Dan's collector hitches): who makes the garbage. The collector's work, and
+  -- the frames it lands in, grow with what is allocated; these are the systems and auras that
+  -- allocated the most while profiling ran (a system inside another is counted in both).
+  popup:AddText("")
+  popup:AddText("|cff9900ffAllocation:|r net heap growth measured over each system's runs (positive runs summed; a collector step inside a run hides part of it; nested systems overlap), most first")
+  local function PrintAllocation(map, label)
+    local rows = {}
+    for k, v in pairs(map) do
+      if (v.alloc or 0) >= 64 and k ~= "wa" and k ~= "time" then rows[#rows + 1] = k end
+    end
+    sort(rows, function(a, b) return map[a].alloc > map[b].alloc end)
+    popup:AddText(label)
+    for i = 1, math.min(15, #rows) do
+      local v = map[rows[i]]
+      popup:AddText(("  %s |cff999999%.0f KB in %d runs (%.1f KB a run)|r"):format(rows[i], v.alloc, v.calls or 1, v.alloc / math.max(1, v.calls or 1)))
+    end
+    if #rows == 0 then popup:AddText("  (nothing above 64 KB)") end
+  end
+  PrintAllocation(profileData.auras, "Auras:")
+  PrintAllocation(profileData.systems, "Systems:")
+
   popup:AddText("")
   popup:AddText("|cff9900ffSystems:|r")
 
@@ -838,9 +901,9 @@ function WeakAuras.PrintProfile()
   end
 
   popup:AddText("")
-  popup:AddText("|cff9900ffLibGetFrame:|r")
+  popup:AddText("|cff9900ffLibGetFrame:|r (runs in brackets; the net heap growth over its runs, as above)")
   for id, map in pairs(LGF.GetProfileData()) do
-    PrintOneProfile(popup, id, map)
+    PrintOneProfile(popup, ("%s [%d] +%.0f KB"):format(id, map.calls or 0, map.alloc or 0), map)
   end
 
   popup:Show()
@@ -1256,3 +1319,169 @@ end
 function WeakAurasProfilingColumnDisplay_OnClick(self, columnIndex)
   self:GetParent():SortByColumnIndex(columnIndex)
 end
+
+-- ForeverAuras 1.2.4 (Dan's combat-drop hitches): "/fa memscan". The client's
+-- collector walks every live Lua object, so a slow combat-drop frame grows
+-- with the heap; this walks the addon's own tables and estimates how much
+-- each part holds (Lua 5.1, 64-bit: a table header 56 bytes, an array slot
+-- 16, a hash node 40, a string 25 plus its length, a function 64; frames
+-- themselves are not Lua memory). Every object is counted once, for the
+-- first root that reaches it, so the roots are walked from the most
+-- specific to the most general.
+local memScan = {}
+local function ScanValue(v, seen)
+  local t = type(v)
+  if t == "string" then
+    if seen[v] then return 0 end
+    seen[v] = true
+    return 25 + #v
+  elseif t == "function" then
+    if seen[v] then return 0 end
+    seen[v] = true
+    memScan.functions = memScan.functions + 1
+    return 64
+  elseif t ~= "table" then
+    return 0
+  end
+  if seen[v] then return 0 end
+  seen[v] = true
+  if issecretvalue and issecretvalue(v) then return 0 end
+  memScan.tables = memScan.tables + 1
+  local bytes = 56
+  local n = #v
+  bytes = bytes + n * 16
+  for k, x in pairs(v) do
+    if type(k) ~= "number" or k > n or k < 1 or k % 1 ~= 0 then bytes = bytes + 40 end
+    bytes = bytes + ScanValue(k, seen) + ScanValue(x, seen)
+  end
+  return bytes
+end
+local function MB(bytes) return ("%.1f MB"):format(bytes / 1048576) end
+function Private.MemoryScan()
+  memScan.tables, memScan.functions, memScan.refused = 0, 0, 0
+  local seen = {}
+  -- (Astra's dev.3 review) both readings are taken BEFORE the scan allocates its own tables, so they
+  -- are comparable; the scanner's own allocation is reported separately
+  local reported
+  if UpdateAddOnMemoryUsage and GetAddOnMemoryUsage then
+    UpdateAddOnMemoryUsage()
+    local ok, kb = pcall(GetAddOnMemoryUsage, AddonName)
+    if ok and type(kb) == "number" then reported = kb * 1024 end
+  end
+  local before = collectgarbage("count")
+  local started = debugprofilestop()
+  local lines = {}
+  local total = 0
+  -- the global table is never walked (a reference to it would pull in the whole UI)
+  seen[_G] = true
+  local function Root(name, value)
+    if value == nil then return 0 end
+    -- a part the client refuses to walk (secret contents) is reported as refused, the scan goes on
+    local ok, bytes = pcall(ScanValue, value, seen)
+    if not ok then memScan.refused = memScan.refused + 1; return 0 end
+    total = total + bytes
+    if bytes >= 65536 then lines[#lines + 1] = ("  %s: %s"):format(name, MB(bytes)) end
+    return bytes
+  end
+  local function Top(name, map, keyName)
+    local parts, entries = {}, 0
+    for key, value in pairs(map or {}) do
+      entries = entries + 1
+      local ok, bytes = pcall(ScanValue, value, seen)
+      if not ok then memScan.refused = memScan.refused + 1; bytes = 0 end
+      if bytes > 0 then parts[#parts + 1] = {name = key, bytes = bytes} end
+    end
+    sort(parts, function(a, b) return a.bytes > b.bytes end)
+    local sum = 0
+    for _, part in ipairs(parts) do sum = sum + part.bytes end
+    total = total + sum
+    -- (Astra's dev.3 review) all entries are counted; an entry reached by an earlier part first adds nothing here
+    lines[#lines + 1] = ("  %s: %s (%d %s, %d first reached here)"):format(name, MB(sum), entries, keyName, #parts)
+    for i = 1, math.min(6, #parts) do
+      lines[#lines + 1] = ("      %s %s"):format(MB(parts[i].bytes), tostring(parts[i].name))
+    end
+  end
+  -- 1. the saved displays, by field across all displays
+  local db = Private.db
+  if db and db.displays then
+    local fields, count = {}, 0
+    for _, data in pairs(db.displays) do
+      count = count + 1
+      if type(data) == "table" then
+        for key, value in pairs(data) do
+          local ok, bytes = pcall(ScanValue, value, seen)
+          if not ok then memScan.refused = memScan.refused + 1; bytes = 0 end
+          fields[key] = (fields[key] or 0) + bytes + ScanValue(key, seen)
+        end
+      end
+    end
+    local parts, sum = {}, 0
+    for key, bytes in pairs(fields) do parts[#parts + 1] = {name = key, bytes = bytes}; sum = sum + bytes end
+    sort(parts, function(a, b) return a.bytes > b.bytes end)
+    total = total + sum
+    lines[#lines + 1] = ("  saved displays: %s (%d displays), the largest fields:"):format(MB(sum), count)
+    for i = 1, math.min(10, #parts) do
+      lines[#lines + 1] = ("      %s %s"):format(MB(parts[i].bytes), tostring(parts[i].name))
+    end
+    seen[db.displays] = true
+    Root("saved data (other than displays)", db)
+  end
+  -- 2. per-display runtime tables
+  -- (Astra's dev.1 review) a root is an accessor returning the CURRENT table; resolved here only
+  local function RootTable(name)
+    local accessor = Private.memoryRootAccessors and Private.memoryRootAccessors[name]
+    if type(accessor) ~= "function" then return nil end
+    local ok, value = pcall(accessor)
+    if ok and type(value) == "table" then return value end
+    return nil
+  end
+  Top("aura environments (custom code's aura_env)", RootTable("aura environments"), "displays")
+  Root("custom action functions", Private.customActionsFunctions)
+  local regions = {}
+  for id, entry in pairs(Private.regions or {}) do regions[id] = entry.region end
+  Top("live displays (regions)", regions, "regions")
+  Root("clones", Private.clones)
+  Root("trigger states", RootTable("trigger states"))
+  Root("loaded displays list", Private.loaded)
+  -- (Astra's dev.3 review) the compiled runtime stores: the load functions and the trigger functions
+  Root("load functions", RootTable("load functions"))
+  Root("load functions (options)", RootTable("load functions (options)"))
+  Root("trigger functions (GenericTrigger)", RootTable("trigger functions (GenericTrigger)"))
+  Root("loaded trigger events", RootTable("loaded trigger events"))
+  -- 3. the options addon, when it has been opened this session
+  Root("spell cache (options)", WeakAuras.spellCache)
+  Root("options saved data", ForeverAurasOptionsSaved)
+  Root("options addon (everything reachable)", WASYNC_OPTIONS_PRIVATE)
+  -- 3b. (1.2.4, Dan's session-long growth; corrected per Astra's dev.1 review) additional local caches and
+  -- queues of the addon's files, registered as accessors at the end of each file and resolved to their
+  -- current tables here; not every closure-owned table, and never function upvalues or native memory
+  local handled = {["aura environments"] = true, ["trigger states"] = true, ["load functions"] = true,
+    ["load functions (options)"] = true, ["trigger functions (GenericTrigger)"] = true, ["loaded trigger events"] = true,
+    ["deferred displays"] = true}
+  local names = {}
+  for name in pairs(Private.memoryRootAccessors or {}) do if not handled[name] then names[#names + 1] = name end end
+  sort(names)
+  for _, name in ipairs(names) do Root(name, RootTable(name)) end
+  -- 4. the rest of the addon and its libraries
+  Root("the addon's other tables (Private)", Private)
+  Root("the addon's other tables (WeakAuras)", WeakAuras)
+  Root("libraries (LibStub)", LibStub and LibStub.libs)
+  Root("the ExecEnv", Private.ExecEnv)
+  local took = debugprofilestop() - started
+  local scanner = (collectgarbage("count") - before) * 1024
+  prettyPrint(("Memory scan: %s estimated for the tables and strings reached (%d tables, %d function objects%s); before the scan the client attributed %s to ForeverAuras and the whole Lua heap was %s. Scan took %.0f ms; the heap moved %s during it (net, the scan's own tables less what the collector took back)."):format(
+    MB(total), memScan.tables, memScan.functions, memScan.refused > 0 and (", %d refused"):format(memScan.refused) or "",
+    reported and MB(reported) or "?", MB(before * 1024), took, MB(scanner)))
+  for _, line in ipairs(lines) do print(line) end
+  if Private.CountDeferredDisplays then
+    print(("  displays not prepared on this character (never loadable here: other classes' specializations, races, faction, Never): %d"):format(Private.CountDeferredDisplays()))
+  end
+  print("  (estimates of reachable size, not ownership: fixed per-object overheads, no table capacity; a function's code, upvalues and environment are not walked; a shared object counts for the first part that reaches it; frames and textures are not Lua memory)")
+end
+
+-- ForeverAuras 1.2.4 (Dan's session-long growth): the file's own tables are memory scan roots (/fa memscan), resolved to the CURRENT table only when the scan runs (Astra's dev.1 review: a saved reference would pin a table a reset has replaced)
+Private.memoryRootAccessors = Private.memoryRootAccessors or {}
+Private.memoryRootAccessors["Profiling: profileData"] = function() return profileData end
+Private.memoryRootAccessors["Profiling: apiWrapped"] = function() return apiWrapped end
+Private.memoryRootAccessors["Profiling: focusEnrolled"] = function() return focusEnrolled end
+Private.memoryRootAccessors["Profiling: memScan"] = function() return memScan end

@@ -432,3 +432,11 @@ function Private.ValidateSpellCooldownSupport(data)
     Private.AuraWarnings.UpdateWarning(data.uid, "restricted_cooldown_options")
   end
 end
+
+-- ForeverAuras 1.2.4 (Dan's session-long growth): the file's own tables are memory scan roots (/fa memscan), resolved to the CURRENT table only when the scan runs (Astra's dev.1 review: a saved reference would pin a table a reset has replaced)
+Private.memoryRootAccessors = Private.memoryRootAccessors or {}
+Private.memoryRootAccessors["SpellCooldown: gcdStates"] = function() return gcdStates end
+Private.memoryRootAccessors["SpellCooldown: gcdStateSince"] = function() return gcdStateSince end
+Private.memoryRootAccessors["SpellCooldown: knownOnCooldown"] = function() return knownOnCooldown end
+Private.memoryRootAccessors["SpellCooldown: baseCache"] = function() return baseCache end
+Private.memoryRootAccessors["SpellCooldown: customStateScratch"] = function() return customStateScratch end

@@ -1488,8 +1488,11 @@ local function MeasureContainer(existing, region, data, g, layout, maxCount, fil
     container = Display.CreateAuraContainer(region, data)
     container:SetEnabled(false)
     container:SetAuraProcessingPolicy(CustomAuraContainerAuraProcessingPolicy.None)
-    -- Placed on the region first, like every aura container; chained later.
-    container:SetPoint("TOPLEFT", region, "TOPLEFT")
+    -- Placed on the region first, like every aura container; chained later. (1.2.9, Astra's dev.1
+    -- review) on the point the chain will use (g.start), recorded, so the chain replaces that point
+    -- instead of adding a second one
+    container:SetPoint(g.start, region, g.start)
+    container.faPoint = g.start
     local ok = pcall(container.AddAuraGroup, container, SHADOW_GROUP, filter, {
       candidateFilters = candidates, maxFrameCount = maxCount, layout = layout,
       initializeFrame = function(button)
@@ -2097,20 +2100,54 @@ end
 
 -- Chains one display's shadows from its shadow start; returns where the next
 -- display's shadows start.
+-- ForeverAuras 1.2.9 (Dan's "ClearAllPoints on bad self" when combat began as the editor closed;
+-- Astra's 1.2.7 review): a shadow is placed on its one point (sh.start) through Place, which replaces
+-- that point without clearing first, so no clear can leave a live layout anchorless; under
+-- restrictions a placement the record already holds is kept (Place), out of them it is written. A
+-- locked container is skipped by Place itself. (1.2.5 cleared the frame first out of combat; 1.2.7
+-- cleared it in combat too and then trusted the record: a reproduced anchor loss.)
+-- A shadow frame keeps ONE wanted anchor point, recorded in frame.faPoint, and a set of other
+-- points still installed on it (frame.faStalePoints), owed a removal. The same point is replaced
+-- by Place in one write. A changed point (a Centered growth edited from horizontal to vertical) is
+-- a staged replacement: the new point is placed first, so the frame is never without a resolvable
+-- anchor; the point it replaces joins the owed set; then every owed point is removed on its own
+-- (ClearPoint, the client's method for one point). A refused removal keeps the point owed, and a
+-- later growth change back keeps every owed point owed: ownership is only dropped by a removal
+-- that succeeded. The next pass through here (the regular rechains) tries again. (Astra's dev.1
+-- and dev.2 reviews.)
+local function Repoint(frame, point, rel, relPoint, x, y)
+  local ok = Place(frame, point, rel, relPoint, x, y)
+  if not ok then return false end
+  local held = frame.faPoint
+  if held and held ~= point then
+    frame.faStalePoints = frame.faStalePoints or {}
+    frame.faStalePoints[held] = true
+  end
+  frame.faPoint = point
+  local stale = frame.faStalePoints
+  if stale then
+    stale[point] = nil   -- wanted again: not owed a removal
+    if not Busy(frame) and frame.ClearPoint then
+      for old in pairs(stale) do
+        if pcall(frame.ClearPoint, frame, old) then stale[old] = nil end
+      end
+    end
+    if next(stale) == nil then frame.faStalePoints = nil end
+  end
+  return true
+end
 local function ChainShadows(flow)
   local sh = flow.growth.shadow
   if flow.shadowKind == "list" then
     for index, container in ipairs(flow.shadowList) do
-      if not InCombatLockdown() then container:ClearAllPoints() end
       local ok
       if index == 1 then
-        ok = Place(container, sh.start, flow.shadowStart, sh.start)
+        ok = Repoint(container, sh.start, flow.shadowStart, sh.start)
       else
-        ok = Place(container, sh.start, flow.shadowList[index - 1], sh.listEnd, sh.pixel[1], sh.pixel[2])
+        ok = Repoint(container, sh.start, flow.shadowList[index - 1], sh.listEnd, sh.pixel[1], sh.pixel[2])
       end
-      if not ok and not InCombatLockdown() then
-        container:ClearAllPoints()
-        container:SetPoint(sh.start, flow.region, sh.start)
+      if not ok then
+        Repoint(container, sh.start, flow.region, sh.start)
       end
     end
     return {flow.shadowList[#flow.shadowList], sh.listEnd, sh.pixel[1], sh.pixel[2]}
@@ -3923,8 +3960,8 @@ function Display.RechainFlow(group)
         local start = flow.shadowStart
         if combat then
           local placed
-          if shadowEnd then placed = Place(start, g.shadow.start, shadowEnd[1], shadowEnd[2], shadowEnd[3], shadowEnd[4])
-          else placed = Place(start, g.shadow.start, rowFrame, rowPoint, snapX, snapY) end
+          if shadowEnd then placed = Repoint(start, g.shadow.start, shadowEnd[1], shadowEnd[2], shadowEnd[3], shadowEnd[4])
+          else placed = Repoint(start, g.shadow.start, rowFrame, rowPoint, snapX, snapY) end
           -- ForeverAuras (dev.82, Astra's dev.81 review): a refused shadow placement is said (with
           -- "/fa cells debug on") instead of passing in silence; the row comes right when
           -- restrictions end (afterCombat), as every refused placement does
@@ -3934,12 +3971,16 @@ function Display.RechainFlow(group)
           local ok, chained = pcall(ChainShadows, flow)
           if ok then shadowEnd = chained end
         else
-          start:ClearAllPoints()
-          if not (shadowEnd and Place(start, g.shadow.start, shadowEnd[1], shadowEnd[2], shadowEnd[3], shadowEnd[4])) then
-            start:ClearAllPoints()
-            start:SetPoint(g.shadow.start, rowFrame, rowPoint, snapX, snapY)
+          -- (1.2.9) the start's one point is replaced through Place, never cleared first (Astra's
+          -- 1.2.7 review: a clear followed by a record-satisfied Place left the live layout anchorless)
+          if not (shadowEnd and Repoint(start, g.shadow.start, shadowEnd[1], shadowEnd[2], shadowEnd[3], shadowEnd[4])) then
+            local placed = Repoint(start, g.shadow.start, rowFrame, rowPoint, snapX, snapY)
+            if not placed and Display.BuildReport then
+              Display.BuildReport(("%s's shadow start could not be placed: %s"):format(tostring(FlowData(flow) and FlowData(flow).id), tostring(start.faPlaceError)))
+            end
           end
-          shadowEnd = ChainShadows(flow)
+          local ok, chained = pcall(ChainShadows, flow)
+          if ok then shadowEnd = chained end
         end
       end
     end
@@ -4174,3 +4215,13 @@ function Display.RechainFlow(group)
 end
 
 Display.RechainFlow = Private.Profiled("aura (modern) - group layout", Display.RechainFlow)
+
+-- ForeverAuras 1.2.4 (Dan's session-long growth): the file's own tables are memory scan roots (/fa memscan), resolved to the CURRENT table only when the scan runs (Astra's dev.1 review: a saved reference would pin a table a reset has replaced)
+Private.memoryRootAccessors = Private.memoryRootAccessors or {}
+Private.memoryRootAccessors["SecretAuraFlow: appearanceKeys"] = function() return appearanceKeys end
+Private.memoryRootAccessors["SecretAuraFlow: merged"] = function() return merged end
+Private.memoryRootAccessors["SecretAuraFlow: barOf"] = function() return barOf end
+Private.memoryRootAccessors["SecretAuraFlow: previewOrigins"] = function() return previewOrigins end
+Private.memoryRootAccessors["SecretAuraFlow: stretchRules"] = function() return stretchRules end
+Private.memoryRootAccessors["SecretAuraFlow: lastFlush"] = function() return lastFlush end
+Private.memoryRootAccessors["SecretAuraFlow: staleRebuilds"] = function() return staleRebuilds end

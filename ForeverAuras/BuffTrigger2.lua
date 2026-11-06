@@ -4617,3 +4617,35 @@ function BuffTrigger.CreateFakeStates(id, triggernum)
 end
 
 WeakAuras.RegisterTriggerSystem({"aura2"}, BuffTrigger)
+
+-- ForeverAuras 1.2.4 (Dan's session-long growth): the file's own tables are memory scan roots (/fa memscan), resolved to the CURRENT table only when the scan runs (Astra's dev.1 review: a saved reference would pin a table a reset has replaced)
+Private.memoryRootAccessors = Private.memoryRootAccessors or {}
+Private.memoryRootAccessors["BuffTrigger2: BuffTrigger"] = function() return BuffTrigger end
+Private.memoryRootAccessors["BuffTrigger2: triggerInfos"] = function() return triggerInfos end
+Private.memoryRootAccessors["BuffTrigger2: scanFuncName"] = function() return scanFuncName end
+Private.memoryRootAccessors["BuffTrigger2: scanFuncSpellId"] = function() return scanFuncSpellId end
+Private.memoryRootAccessors["BuffTrigger2: scanFuncGeneral"] = function() return scanFuncGeneral end
+Private.memoryRootAccessors["BuffTrigger2: scanFuncNameGroup"] = function() return scanFuncNameGroup end
+Private.memoryRootAccessors["BuffTrigger2: scanFuncSpellIdGroup"] = function() return scanFuncSpellIdGroup end
+Private.memoryRootAccessors["BuffTrigger2: scanFuncGeneralGroup"] = function() return scanFuncGeneralGroup end
+Private.memoryRootAccessors["BuffTrigger2: unitExistScanFunc"] = function() return unitExistScanFunc end
+Private.memoryRootAccessors["BuffTrigger2: existingUnits"] = function() return existingUnits end
+Private.memoryRootAccessors["BuffTrigger2: groupRoleScanFunc"] = function() return groupRoleScanFunc end
+Private.memoryRootAccessors["BuffTrigger2: groupScanFuncs"] = function() return groupScanFuncs end
+Private.memoryRootAccessors["BuffTrigger2: activeGroupScanFuncs"] = function() return activeGroupScanFuncs end
+Private.memoryRootAccessors["BuffTrigger2: raidMarkScanFuncs"] = function() return raidMarkScanFuncs end
+Private.memoryRootAccessors["BuffTrigger2: rangeScanFuncs"] = function() return rangeScanFuncs end
+Private.memoryRootAccessors["BuffTrigger2: scanFuncNameMulti"] = function() return scanFuncNameMulti end
+Private.memoryRootAccessors["BuffTrigger2: scanFuncSpellIdMulti"] = function() return scanFuncSpellIdMulti end
+Private.memoryRootAccessors["BuffTrigger2: cleanupTimerMulti"] = function() return cleanupTimerMulti end
+Private.memoryRootAccessors["BuffTrigger2: matchData"] = function() return matchData end
+Private.memoryRootAccessors["BuffTrigger2: matchDataUpToDate"] = function() return matchDataUpToDate end
+Private.memoryRootAccessors["BuffTrigger2: matchDataMulti"] = function() return matchDataMulti end
+Private.memoryRootAccessors["BuffTrigger2: matchDataByTrigger"] = function() return matchDataByTrigger end
+Private.memoryRootAccessors["BuffTrigger2: matchDataChanged"] = function() return matchDataChanged end
+Private.memoryRootAccessors["BuffTrigger2: nameplateExists"] = function() return nameplateExists end
+Private.memoryRootAccessors["BuffTrigger2: unitVisible"] = function() return unitVisible end
+Private.memoryRootAccessors["BuffTrigger2: settleDeferred"] = function() return settleDeferred end
+Private.memoryRootAccessors["BuffTrigger2: pendingTracks"] = function() return pendingTracks end
+Private.memoryRootAccessors["BuffTrigger2: unitToGuid"] = function() return unitToGuid end
+Private.memoryRootAccessors["BuffTrigger2: guidToUnit"] = function() return guidToUnit end

@@ -1084,3 +1084,14 @@ function Private.PrintCDMDebug(id)
   SayRegion("display", WeakAuras.GetRegion(id))
   for cloneId, region in pairs(Private.clones[id] or {}) do SayRegion("clone " .. string.format("%q", cloneId), region) end
 end
+
+-- ForeverAuras 1.2.4 (Dan's session-long growth): the file's own tables are memory scan roots (/fa memscan), resolved to the CURRENT table only when the scan runs (Astra's dev.1 review: a saved reference would pin a table a reset has replaced)
+Private.memoryRootAccessors = Private.memoryRootAccessors or {}
+Private.memoryRootAccessors["CooldownViewerCatalog: identities"] = function() return identities end
+Private.memoryRootAccessors["CooldownViewerCatalog: requestedItems"] = function() return requestedItems end
+Private.memoryRootAccessors["CooldownViewerCatalog: observed"] = function() return observed end
+Private.memoryRootAccessors["CooldownViewerCatalog: observedViewers"] = function() return observedViewers end
+Private.memoryRootAccessors["CooldownViewerCatalog: rememberedKnown"] = function() return rememberedKnown end
+Private.memoryRootAccessors["CooldownViewerCatalog: knownSources"] = function() return knownSources end
+Private.memoryRootAccessors["CooldownViewerCatalog: directHarmful"] = function() return directHarmful end
+Private.memoryRootAccessors["CooldownViewerCatalog: scanCache"] = function() return scanCache end

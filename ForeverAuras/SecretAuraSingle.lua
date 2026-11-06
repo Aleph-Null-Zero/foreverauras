@@ -479,38 +479,100 @@ end
 -- time left, which no aura provides). The Missing look of a Show On Always or
 -- Missing icon then draws its swipe and its %p text from that timer; both
 -- clear when it runs out.
-local function ApplyListTimer(missing, data)
+-- ForeverAuras 1.2.9 (Dan's quest: 3,443 "SetText on bad self" errors from this tick; Astra's 1.2.7,
+-- dev.1 and dev.2 reviews): a refused write suspends the timer instead of erroring every tick. The
+-- looks with pending work are owned here (suspendedListTimers: a look whose text, swipe or
+-- detachment the client refused) and serviced when restrictions end (PLAYER_REGEN_ENABLED and the
+-- restriction change, settleEvents below): a look still current on a live display whose list still
+-- carries a timer is armed again from the list's current data; one without a timer, or one whose
+-- countdown ended, has its old tick detached; a disabled, replaced or released look is dropped.
+-- Every write of the tick, of its setup and of its cleanup is guarded. Each installed tick carries
+-- the generation it was made for, and every shutdown (a suspension, a cancellation, the end of a
+-- countdown) advances the generation BEFORE trying to detach the tick, so an installed tick is
+-- inert from that moment whether or not the client let it be detached; a refused detachment
+-- stays owned until it succeeds.
+local suspendedListTimers = setmetatable({}, {__mode = "k"})
+local function TryWrite(frame, method, ...)
+  if frame == nil or Locked(frame) then return false end
+  return pcall(frame[method], frame, ...)
+end
+-- The one shutdown: the installed tick is made inert (a new generation), then detached when the
+-- client lets it. kind "resume": the look is owed a new timer from current data; "cleanup": only
+-- the detachment is owed. Returns true when nothing is owed any more.
+local function ShutdownListTimer(missing, kind, data, region, single)
+  local button = missing.native and missing.native.button
+  if button then button.listTimerGeneration = (button.listTimerGeneration or 0) + 1 end
+  local detached = button == nil or TryWrite(button, "SetScript", "OnUpdate", nil)
+  if kind == "resume" or not detached then
+    suspendedListTimers[missing] = {data = data, region = region, single = single, cancelled = kind ~= "resume" or nil}
+    return false
+  end
+  suspendedListTimers[missing] = nil
+  return true
+end
+local function CancelListTimer(missing, data, region, single) return ShutdownListTimer(missing, "cleanup", data, region, single) end
+Display.CancelListTimer = CancelListTimer
+local function ApplyListTimer(missing, data, region, single)
   local native = missing.native
   local button = native.button
   local list = Display.SpellList(Display.GetTrigger(data))
   local expires, duration = list and list.expirationTime, list and list.duration
   if not (expires and duration and data.regionType == "icon") then
-    button:SetScript("OnUpdate", nil)
+    CancelListTimer(missing, data, region, single)   -- no timer: the old tick is inert at once
     return
   end
   local element
   for _, sub in ipairs(data.subRegions or {}) do
     if sub.type == "subtext" and sub.text_visible ~= false and Display.TextKind(sub.text_text) == "duration" then element = sub; break end
   end
+  local pending = false
   local cooldown = data.cooldown ~= false and native.cooldown or nil
   if cooldown then
-    cooldown:SetCooldown(expires - duration, duration)
-    cooldown:Show()
+    -- a refused swipe setup is owned: set again from the list's current data at the next opportunity
+    if not (TryWrite(cooldown, "SetCooldown", expires - duration, duration) and TryWrite(cooldown, "Show")) then pending = true end
   end
+  local generation = (button.listTimerGeneration or 0) + 1
+  button.listTimerGeneration = generation
   local function Tick(self, elapsed)
+    if self.listTimerGeneration ~= generation then return end   -- an older, suspended or cancelled countdown: inert
     self.listElapsed = (self.listElapsed or 0) + (elapsed or 1)
     if self.listElapsed < 0.05 then return end
     self.listElapsed = 0
     local remaining = expires - GetTime()
-    for _, entry in ipairs(self.bindings.DurationText or {}) do entry.widget:SetText(ListTimerText(remaining, element)) end
+    local text = ListTimerText(remaining, element)
+    for _, entry in ipairs(self.bindings.DurationText or {}) do
+      if not TryWrite(entry.widget, "SetText", text) then ShutdownListTimer(missing, "resume", data, region, single); return end
+    end
     if remaining <= 0 then
-      if cooldown then cooldown:Clear(); cooldown:Hide() end
-      self:SetScript("OnUpdate", nil)
+      if cooldown and not (TryWrite(cooldown, "Clear") and TryWrite(cooldown, "Hide")) then ShutdownListTimer(missing, "resume", data, region, single); return end
+      ShutdownListTimer(missing, "cleanup", data, region, single)   -- done; a refused detachment stays owned
     end
   end
-  button:SetScript("OnUpdate", Tick)
+  if not TryWrite(button, "SetScript", "OnUpdate", Tick) then ShutdownListTimer(missing, "resume", data, region, single); return end
+  -- the new tick is installed: the look owes nothing unless this apply left something refused
+  suspendedListTimers[missing] = pending and {data = data, region = region, single = single} or nil
   Tick(button, 1)
 end
+-- A pending entry is serviced only for the look that is still the current one of its single
+-- display, on a display that is still live.
+local function LiveFor(missing, entry)
+  if not missing.active then return false end
+  if entry.single and entry.single.missing ~= missing then return false end
+  local native = entry.region and entry.region.blizzardAuraDisplay
+  if native and native.active == false then return false end
+  return true
+end
+function Display.ResumeListTimers()
+  for missing, entry in pairs(suspendedListTimers) do
+    if not LiveFor(missing, entry) or entry.cancelled then
+      -- a disabled, replaced or released look, or a cancellation: only the detachment is owed
+      CancelListTimer(missing, entry.data, entry.region, entry.single)
+    else
+      ApplyListTimer(missing, entry.data, entry.region, entry.single)
+    end
+  end
+end
+Display.SuspendedListTimerCount = function() local n = 0 for _ in pairs(suspendedListTimers) do n = n + 1 end return n end
 
 local function StyleMissing(missing, region, data)
   local native = missing.native
@@ -903,6 +965,7 @@ local function EnsureMissing(single, region, data, trigger, instance)
   local missing = single.missing
   local perUnit = instance ~= nil
   if missing and (missing.perUnit == true) ~= perUnit then
+    CancelListTimer(missing, data, region, single)   -- (1.2.9) a retired look's countdown never resumes
     for _, key in ipairs({"container", "clip", "presence", "flowShadow"}) do Display.RetireFrame(missing[key]) end
     single.missing, missing = nil, nil
   end
@@ -1053,7 +1116,7 @@ local function EnsureMissing(single, region, data, trigger, instance)
   StyleMissing(missing, region, data)
   missing.active = true
   -- A plain list timer runs the look's countdown; otherwise it has none.
-  ApplyListTimer(missing, data)
+  ApplyListTimer(missing, data, region, single)
   if missing.following then ClearFollowBars(missing.native) end
   missing.following = nil
   missing.foundMode = single.foundMode == true
@@ -1066,6 +1129,8 @@ local function DisableMissing(single)
   local missing = single.missing
   if not missing or not missing.active or Locked(missing.container) then return end
   missing.active = false
+  -- (1.2.9) a disabled look's countdown is cancelled: inert at once, detached when the client lets it
+  CancelListTimer(missing, nil, nil, single)
   for _, key in ipairs({"presence", "flowShadow"}) do
     if missing[key] then
       missing[key]:SetEnabled(false)
@@ -3281,11 +3346,17 @@ local settleEvents = CreateFrame("Frame")
 settleEvents:RegisterEvent("LOADING_SCREEN_ENABLED")
 settleEvents:RegisterEvent("PLAYER_ENTERING_WORLD")
 settleEvents:RegisterEvent("PLAYER_REGEN_ENABLED")
+settleEvents:RegisterEvent("ADDON_RESTRICTION_STATE_CHANGED")   -- (1.2.9) the suspended list timers
 settleEvents:SetScript("OnEvent", function(_, event)
+  if event == "ADDON_RESTRICTION_STATE_CHANGED" then
+    Display.ResumeListTimers()
+    return
+  end
   if event == "PLAYER_REGEN_ENABLED" then
     -- Clips locked in combat get their veil, or its lifting, now.
     settleRetries = 0
     Display.SettleMissing()
+    Display.ResumeListTimers()   -- (1.2.9)
     return
   end
   settleGeneration = settleGeneration + 1
@@ -3601,3 +3672,17 @@ function Display.PrintDebug(id)
   Walk(region, "region", 0)
   Say("texts with content:", count)
 end
+
+-- ForeverAuras 1.2.4 (Dan's session-long growth): the file's own tables are memory scan roots (/fa memscan), resolved to the CURRENT table only when the scan runs (Astra's dev.1 review: a saved reference would pin a table a reset has replaced)
+Private.memoryRootAccessors = Private.memoryRootAccessors or {}
+Private.memoryRootAccessors["SecretAuraSingle: alphaPending"] = function() return alphaPending end
+Private.memoryRootAccessors["SecretAuraSingle: relayoutPending"] = function() return relayoutPending end
+Private.memoryRootAccessors["SecretAuraSingle: neverSecret"] = function() return neverSecret end
+Private.memoryRootAccessors["SecretAuraSingle: watchedIDs"] = function() return watchedIDs end
+Private.memoryRootAccessors["SecretAuraSingle: waitingRegions"] = function() return waitingRegions end
+Private.memoryRootAccessors["SecretAuraSingle: describedDurations"] = function() return describedDurations end
+Private.memoryRootAccessors["SecretAuraSingle: pendingSpellData"] = function() return pendingSpellData end
+Private.memoryRootAccessors["SecretAuraSingle: loadAttempted"] = function() return loadAttempted end
+Private.memoryRootAccessors["SecretAuraSingle: learningRegions"] = function() return learningRegions end
+Private.memoryRootAccessors["SecretAuraSingle: reapplyAfterCombat"] = function() return reapplyAfterCombat end
+Private.memoryRootAccessors["SecretAuraSingle: gateFormatters"] = function() return gateFormatters end

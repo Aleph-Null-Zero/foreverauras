@@ -1650,3 +1650,19 @@ Private.CooldownViewerItemPrototype.events = function()
   result.events[#result.events + 1] = "ITEM_DATA_LOAD_RESULT"
   return result
 end
+
+-- ForeverAuras 1.2.4 (Dan's session-long growth): the file's own tables are memory scan roots (/fa memscan), resolved to the CURRENT table only when the scan runs (Astra's dev.1 review: a saved reference would pin a table a reset has replaced)
+Private.memoryRootAccessors = Private.memoryRootAccessors or {}
+Private.memoryRootAccessors["CooldownViewerTrigger: resolved"] = function() return resolved end
+Private.memoryRootAccessors["CooldownViewerTrigger: rememberedEntrySpells"] = function() return rememberedEntrySpells end
+Private.memoryRootAccessors["CooldownViewerTrigger: spellCooldowns"] = function() return spellCooldowns end
+Private.memoryRootAccessors["CooldownViewerTrigger: built"] = function() return built end
+Private.memoryRootAccessors["CooldownViewerTrigger: snapshots"] = function() return snapshots end
+Private.memoryRootAccessors["CooldownViewerTrigger: persistentOutputs"] = function() return persistentOutputs end
+Private.memoryRootAccessors["CooldownViewerTrigger: listOutputs"] = function() return listOutputs end
+Private.memoryRootAccessors["CooldownViewerTrigger: listClones"] = function() return listClones end
+Private.memoryRootAccessors["CooldownViewerTrigger: remainingWakeups"] = function() return remainingWakeups end
+Private.memoryRootAccessors["CooldownViewerTrigger: filterOutputs"] = function() return filterOutputs end
+Private.memoryRootAccessors["CooldownViewerTrigger: cooldownWakeups"] = function() return cooldownWakeups end
+Private.memoryRootAccessors["CooldownViewerTrigger: cooldownFilterOutputs"] = function() return cooldownFilterOutputs end
+Private.memoryRootAccessors["CooldownViewerTrigger: spellArgs"] = function() return spellArgs end

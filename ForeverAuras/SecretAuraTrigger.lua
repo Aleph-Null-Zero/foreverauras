@@ -439,3 +439,11 @@ end
 WeakAuras.RegisterTriggerSystem({"secretAura"}, Trigger)
 
 unitFrame:SetScript("OnEvent", Private.Profiled("aura (modern) - trigger", unitFrame:GetScript("OnEvent")))
+
+-- ForeverAuras 1.2.4 (Dan's session-long growth): the file's own tables are memory scan roots (/fa memscan), resolved to the CURRENT table only when the scan runs (Astra's dev.1 review: a saved reference would pin a table a reset has replaced)
+Private.memoryRootAccessors = Private.memoryRootAccessors or {}
+Private.memoryRootAccessors["SecretAuraTrigger: Trigger"] = function() return Trigger end
+Private.memoryRootAccessors["SecretAuraTrigger: displays"] = function() return displays end
+Private.memoryRootAccessors["SecretAuraTrigger: loaded"] = function() return loaded end
+Private.memoryRootAccessors["SecretAuraTrigger: drawable"] = function() return drawable end
+Private.memoryRootAccessors["SecretAuraTrigger: pendingListDisplays"] = function() return pendingListDisplays end

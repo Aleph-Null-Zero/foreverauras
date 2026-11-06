@@ -265,3 +265,7 @@ function Display.ShowPreview(region, data, StyleSample)
     button:Show()
   end
 end
+
+-- ForeverAuras 1.2.4 (Dan's session-long growth): the file's own tables are memory scan roots (/fa memscan), resolved to the CURRENT table only when the scan runs (Astra's dev.1 review: a saved reference would pin a table a reset has replaced)
+Private.memoryRootAccessors = Private.memoryRootAccessors or {}
+Private.memoryRootAccessors["SecretAuraPreview: protectedHides"] = function() return protectedHides end

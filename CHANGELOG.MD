@@ -1,5 +1,12 @@
 # Changelog
 ## VERSIONS
+## 1.2.9
+- Fixed all auras breaking when the editor closed because combat started while editing a Modern aura in a packed group.
+- Fixed a Missing icon with a countdown (such as a weapon enchant reminder) erroring repeatedly while the game had its text locked; it now pauses and resumes when the lock lifts, and a stopped countdown does no further work.
+- Fixed a Centered row's measurement frames keeping an old anchor after changing the row's direction in the editor.
+- CurseForge app: the addon is now marked Forever-only with its project ID.
+- Less stuttering with big aura collections: auras that can't load on your current character (other classes, other races, the other faction, or set to Never) are no longer loaded into memory at login. They stay in your list as normal. Opening the editor loads them for that session; a reload after editing brings the saving back.
+
 ## 1.2.2
 Major Features
 - Rows of Modern Aura Groups close up on their own: a buff list takes exactly as many spots as it has auras, a Missing icon takes one or none, and the next display starts where the previous one ends. No gaps during a fight, any growth direction, Centered rows too, and it survives reloads in combat. Nothing to switch on.
@@ -35,20 +42,20 @@ Fixes
 - /fa modern throwing on protected geometry; a false "count is not zero" profiler warning.
 
 ## 1.1.0
-- Modern Aura Groups now behave like Dynamic Groups. The row starts where you place the group, and each display’s X/Y Offset moves only that display. Groups you made before 1.1.0 keep their old layout automatically (a single “Use old row layout” checkbox in the group settings), so nothing you have changes.
+- Modern Aura Groups now behave like Dynamic Groups. The row starts where you place the group, and each display's X/Y Offset moves only that display. Groups you made before 1.1.0 keep their old layout automatically (a single “Use old row layout” checkbox in the group settings), so nothing you have changes.
 - Bars, progress textures and textures can now sit anywhere in a Modern Aura Group row, after a Modern list, and move with it, including in combat. Bars keep their overlays, ticks and texts; progress textures work in both their straight and circular forms.
-- The options preview now lays rows out the same way the live row does, including the display limit’s cut-off.
+- The options preview now lays rows out the same way the live row does, including the display limit's cut-off.
 - Fixed member offsets in Modern Aura Groups being measured from the wrong display, which pushed rows and neighboring icons sideways.
 - Fixed Centered growth rows not centering correctly, and ordinary displays landing in the wrong place in mixed rows.
 - Fixed the Grid preview showing members that the live grid leaves out, and the Lua error when switching a row group to Grid with the editor open.
 - Fixed an error after reloading during combat (“Auras cannot be accessed when secret”).
-- Cooldown Manager: entries are found more reliably, including on login and when Blizzard’s viewers load late, and no longer loop on failed lookups.
-- Spell Known triggers wait for spell data when it isn’t loaded yet instead of reporting the spell as unknown.
+- Cooldown Manager: entries are found more reliably, including on login and when Blizzard's viewers load late, and no longer loop on failed lookups.
+- Spell Known triggers wait for spell data when it isn't loaded yet instead of reporting the spell as unknown.
 - Many option tooltips and warnings rewritten to say exactly what the addon does; confusing or outdated ones removed.
 - Known limit: after a reload during combat, Modern displays appear when the fight ends.
 
 ## 1.0.2
-- The spell-data request behind non-exact ‘Spell Known’ now survives a result that arrives during login, stops after a failed load, and doesn’t get stuck if the request itself fails.
+- The spell-data request behind non-exact ‘Spell Known' now survives a result that arrives during login, stops after a failed load, and doesn't get stuck if the request itself fails.
 
 ## 1.0.1
 - A non-exact 'Spell Known' load condition naming a rank you don't have no longer fails at login while the client is still loading that spell's data; the aura loads as soon as it arrives.

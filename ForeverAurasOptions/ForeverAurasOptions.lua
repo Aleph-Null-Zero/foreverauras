@@ -904,6 +904,8 @@ end
 
 function WeakAuras.ShowOptions(msg)
   local firstLoad = not(frame);
+  -- ForeverAuras 1.2.4: displays deferred at login (never loadable here) are prepared before the editor sees them
+  if OptionsPrivate.Private.PrepareDeferredDisplays then OptionsPrivate.Private.PrepareDeferredDisplays() end
   OptionsPrivate.Private.Pause();
   OptionsPrivate.Private.SetFakeStates()
 
