@@ -1,5 +1,8 @@
 # Changelog
 ## VERSIONS
+## 1.30
+- Fixed memory leak
+
 ## 1.2.9
 - Fixed all auras breaking when the editor closed because combat started while editing a Modern aura in a packed group.
 - Fixed a Missing icon with a countdown (such as a weapon enchant reminder) erroring repeatedly while the game had its text locked; it now pauses and resumes when the lock lifts, and a stopped countdown does no further work.

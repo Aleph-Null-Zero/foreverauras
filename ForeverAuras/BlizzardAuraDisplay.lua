@@ -2583,7 +2583,18 @@ local function ApplyUnitStatus(instance, trigger)
   if instance.settleUntil and GetTime() < instance.settleUntil then hidden = true end
   instance.statusHidden = hidden or nil
   -- (dev.90) a container muted for the editor stays at alpha 0 (RefreshUnits)
-  if not Locked(instance.container) then instance.container:SetAlpha((hidden or instance.previewMuted) and 0 or instance.baseAlpha or 1) end
+  -- ForeverAuras 1.2.10 (Dan's reminders gone after a wipe until a reload): a container the client
+  -- has locked (a death in combat) takes no alpha; before, the status was still recorded as applied,
+  -- so a later event found nothing to do and the part stayed faded for the session. The write is
+  -- owed instead (statusAlphaPending) and made when restrictions end (statusEvents below).
+  -- ForeverAuras 1.2.10-dev.3 (Dan: reminders stuck in combat until combat drop since dev.2): alpha is
+  -- not a protected write, so a container that is merely protected in combat (Display.Busy) still takes
+  -- it, as it always did; only a forbidden or unparentable container (Display.Locked) owes the write.
+  if not (Display.Locked and Display.Locked(instance.container)) and pcall(instance.container.SetAlpha, instance.container, (hidden or instance.previewMuted) and 0 or instance.baseAlpha or 1) then
+    instance.statusAlphaPending = nil
+  else
+    instance.statusAlphaPending = true
+  end
 end
 
 -- A protected layout can still accept the native content delegate. This is
@@ -4456,14 +4467,33 @@ end
 -- Deaths, releases and disconnects only change the affected unit's alpha.
 local statusEvents = CreateFrame("Frame")
 for _, event in ipairs({"UNIT_CONNECTION", "UNIT_HEALTH", "UNIT_FLAGS", "PLAYER_FLAGS_CHANGED"}) do statusEvents:RegisterEvent(event) end
+-- ForeverAuras 1.2.10 (Dan's reminders gone after a death until a reload): Ignore Out of Range
+-- (ignoreInvisible) hides every member's part while the player is a ghost (nobody is visible from
+-- the graveyard), and nothing re-checked it: a member's own flags do not change when the PLAYER
+-- comes back. The player's own death, release and return re-check every bound unit's status.
+for _, event in ipairs({"PLAYER_DEAD", "PLAYER_ALIVE", "PLAYER_UNGHOST"}) do statusEvents:RegisterEvent(event) end
+local playerStatusEvents = {PLAYER_DEAD = true, PLAYER_ALIVE = true, PLAYER_UNGHOST = true}
 -- A group member coming into or leaving the client's view (UnitIsVisible), for
 -- Ignore out of checking range: the events Aura (Legacy) uses for it. (Not
 -- UNIT_IN_RANGE_UPDATE, which tracks UnitInRange and costs the client extra.)
 statusEvents:RegisterEvent("PARTY_MEMBER_ENABLE")
 statusEvents:RegisterEvent("PARTY_MEMBER_DISABLE")
 statusEvents:RegisterEvent("PLAYER_REGEN_ENABLED")
+statusEvents:RegisterEvent("ADDON_RESTRICTION_STATE_CHANGED")   -- (1.2.10) the owed status alphas
 statusEvents:SetScript("OnEvent", function(_, event, unit)
-  if event == "PLAYER_REGEN_ENABLED" then
+  if event == "PLAYER_REGEN_ENABLED" or event == "ADDON_RESTRICTION_STATE_CHANGED" then
+    -- (1.2.10) the status alphas the client refused in combat are written now, from the current status
+    for region in pairs(activeRegions) do
+      local native = region.blizzardAuraDisplay
+      local trigger = Display.GetSavedTrigger(native.data)
+      for _, instance in ipairs(native and native.instances or {}) do
+        if instance.statusAlphaPending and trigger then
+          ApplyUnitStatus(instance, trigger)
+          Display.RefreshSingleStatus(instance)
+        end
+      end
+    end
+    if event ~= "PLAYER_REGEN_ENABLED" then return end
     -- Glow status changes skipped in combat are replayed.
     for region in pairs(glowStatusPending) do
       glowStatusPending[region] = nil
@@ -4472,7 +4502,8 @@ statusEvents:SetScript("OnEvent", function(_, event, unit)
     end
     return
   end
-  if type(unit) ~= "string" then return end
+  local everyUnit = playerStatusEvents[event] == true   -- (1.2.10) the player's death, release or return
+  if not everyUnit and type(unit) ~= "string" then return end
   for region in pairs(activeRegions) do
     local native = region.blizzardAuraDisplay
     -- Read only: the saved trigger, without the copy GetTrigger may make.
@@ -4480,11 +4511,17 @@ statusEvents:SetScript("OnEvent", function(_, event, unit)
     -- ForeverAuras: hidden displays skip this too (see the event dispatch).
     if region:IsShown() and trigger and (trigger.ignoreDead or trigger.ignoreDisconnected or trigger.ignoreInvisible) then
       -- ForeverAuras: a grid member draws in the grid's container, not its own.
-      if native.gridMember and Display.RefreshGridStatus then Display.RefreshGridStatus(region, unit) end
+      if native.gridMember and Display.RefreshGridStatus then
+        if everyUnit then
+          for _, instance in ipairs(native.instances) do if instance.boundUnit then Display.RefreshGridStatus(region, instance.boundUnit) end end
+        else
+          Display.RefreshGridStatus(region, unit)
+        end
+      end
       local single = #native.instances == 1
       for _, instance in ipairs(native.instances) do
         local bound = instance.visible and instance.boundUnit
-        if bound and (bound == unit or (single and Private.ExecEnv.UnitIsUnit(bound, unit)))
+        if bound and (everyUnit or bound == unit or (single and Private.ExecEnv.UnitIsUnit(bound, unit)))
           and (UnitIgnored(trigger, bound) or nil) ~= instance.statusHidden then
           ApplyUnitStatus(instance, trigger)
           Display.RefreshSingleStatus(instance)
