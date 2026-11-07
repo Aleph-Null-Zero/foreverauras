@@ -1,6 +1,6 @@
 # Changelog
 ## VERSIONS
-## 1.30
+## 1.3.0
 - Fixed memory leak
 
 ## 1.2.9
